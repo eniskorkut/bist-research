@@ -1,13 +1,54 @@
 from __future__ import annotations
 
-from dataclasses import asdict
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
+from statistics import median
 
 from valuation.cache import evaluate_snapshot_quality, save_valuation_result
 from valuation.data_access import BorsapyFinancialClient
+from valuation.historical_multiples import get_historical_pe_median
 from valuation.profit_estimator import ProfitEstimationResult, estimate_net_income_auto
 from valuation.sector_analysis import compare_company_to_sector
+
+
+def _safe_div(a: float | None, b: float | None) -> float | None:
+    if a is None or b in (None, 0):
+        return None
+    return a / b
+
+
+def _mean(values: list[float]) -> float | None:
+    return (sum(values) / len(values)) if values else None
+
+
+def _filtered_mean(values: list[float]) -> float | None:
+    if not values:
+        return None
+    if len(values) < 4:
+        return _mean(values)
+    s = sorted(values)
+    q1 = s[len(s) // 4]
+    q3 = s[(len(s) * 3) // 4]
+    iqr = q3 - q1
+    low, high = q1 - 1.5 * iqr, q3 + 1.5 * iqr
+    filtered = [x for x in s if low <= x <= high]
+    return _mean(filtered) if filtered else _mean(values)
+
+
+@dataclass
+class ScenarioValuation:
+    scenario_key: str
+    period_label: str
+    net_income: float | None
+    net_income_source: str
+    historical_pe_median: float | None
+    target_prices: dict[str, float | None]
+    included_methods: list[str]
+    excluded_methods: list[str]
+    fair_value_median: float | None
+    fair_value_mean_filtered: float | None
+    upside_potential_pct: float | None
+    paid_capital_details: dict[str, float | None | str]
 
 
 @dataclass
@@ -16,16 +57,11 @@ class ValuationResult:
     price: float | None
     shares_outstanding: float | None
     paid_in_capital: float | None
-    estimated_net_income: float | None
     equity: float | None
     market_cap: float | None
     pe_ratio: float | None
     pb_ratio: float | None
-    target_prices: dict[str, float | None]
-    sector_target_prices: dict[str, float | None]
-    average_target_price: float | None
-    average_with_sector_price: float | None
-    upside_potential_pct: float | None
+    valuation_scenarios: dict[str, ScenarioValuation]
     estimation: ProfitEstimationResult
     sector_comparison: dict[str, float | str | list[str] | None]
     source: str
@@ -35,10 +71,87 @@ class ValuationResult:
     missing_fields: list[str]
 
 
-def _safe_div(a: float | None, b: float | None) -> float | None:
-    if a is None or b in (None, 0):
-        return None
-    return a / b
+def _build_scenario(
+    *,
+    scenario_key: str,
+    period_label: str,
+    net_income: float | None,
+    net_income_source: str,
+    price: float | None,
+    shares: float | None,
+    paid_in_capital: float | None,
+    equity: float | None,
+    pe: float | None,
+    pb: float | None,
+    historical_pe_median: float | None,
+) -> ScenarioValuation:
+    eps = _safe_div(net_income, shares)
+    paid_cap_eps = _safe_div(net_income, paid_in_capital)
+
+    cari_fk = _safe_div((net_income * pe) if net_income is not None and net_income > 0 and (pe or 0) > 0 else None, shares)
+    pd_dd = _safe_div((equity * pb) if (equity or 0) > 0 and (pb or 0) > 0 else None, shares)
+
+    odenmis_sermaye_x10 = (paid_cap_eps * 10) if paid_cap_eps is not None and paid_cap_eps > 0 else None
+    odenmis_sermaye_historical_pe = (
+        paid_cap_eps * historical_pe_median
+        if paid_cap_eps is not None and paid_cap_eps > 0 and (historical_pe_median or 0) > 0
+        else None
+    )
+    paid_cap_values = [x for x in [odenmis_sermaye_x10, odenmis_sermaye_historical_pe] if x is not None]
+    odenmis_sermaye_final = _mean(paid_cap_values) if paid_cap_values else None
+
+    implied_caps = []
+    if net_income is not None and net_income > 0 and (pe or 0) > 0:
+        implied_caps.append(net_income * pe)
+    if (equity or 0) > 0 and (pb or 0) > 0:
+        implied_caps.append(equity * pb)
+    potansiyel_piyasa_degeri = _safe_div(_mean(implied_caps), shares)
+
+    estimated_roe = _safe_div(net_income, equity) if (net_income or 0) > 0 and (equity or 0) > 0 else None
+    ozsermaye_karliligi = _safe_div(
+        (estimated_roe * equity * pb) if estimated_roe is not None and (pb or 0) > 0 and (equity or 0) > 0 else None,
+        shares,
+    )
+
+    target_prices = {
+        "cari_fk": cari_fk,
+        "pd_dd": pd_dd,
+        "odenmis_sermaye_x10": odenmis_sermaye_x10,
+        "odenmis_sermaye_historical_pe": odenmis_sermaye_historical_pe,
+        "odenmis_sermaye_final": odenmis_sermaye_final,
+        "potansiyel_piyasa_degeri": potansiyel_piyasa_degeri,
+        "ozsermaye_karliligi": ozsermaye_karliligi,
+    }
+    included_methods = [k for k, v in target_prices.items() if v is not None and k != "odenmis_sermaye_x10"]
+    excluded_methods = [k for k, v in target_prices.items() if v is None or k == "odenmis_sermaye_x10"]
+    fair_values = [target_prices[k] for k in included_methods if target_prices[k] is not None]
+    fair_value_median = median(fair_values) if fair_values else None
+    fair_value_mean_filtered = _filtered_mean([float(v) for v in fair_values if v is not None])
+    upside_potential_pct = (
+        ((fair_value_median - price) / price) * 100 if fair_value_median is not None and price not in (None, 0) else None
+    )
+
+    return ScenarioValuation(
+        scenario_key=scenario_key,
+        period_label=period_label,
+        net_income=net_income,
+        net_income_source=net_income_source,
+        historical_pe_median=historical_pe_median,
+        target_prices=target_prices,
+        included_methods=included_methods,
+        excluded_methods=excluded_methods,
+        fair_value_median=fair_value_median,
+        fair_value_mean_filtered=fair_value_mean_filtered,
+        upside_potential_pct=upside_potential_pct,
+        paid_capital_details={
+            "eps": paid_cap_eps,
+            "x10": odenmis_sermaye_x10,
+            "historical_pe_median": historical_pe_median,
+            "historical_pe_value": odenmis_sermaye_historical_pe,
+            "final": odenmis_sermaye_final,
+            "final_method": "x10_only" if odenmis_sermaye_historical_pe is None and odenmis_sermaye_x10 is not None else "average_x10_historical_pe",
+        },
+    )
 
 
 def run_valuation(
@@ -50,124 +163,90 @@ def run_valuation(
     financial_client = client or BorsapyFinancialClient()
     snapshot = financial_client.load_snapshot(symbol)
     estimation = estimate_net_income_auto(symbol=symbol, client=financial_client)
+    historical_pe_median = get_historical_pe_median(symbol)
 
-    estimated_net_income = estimation.estimated_net_income
-    shares = snapshot.shares_outstanding
-    price = snapshot.price
-    market_cap = snapshot.market_cap
-    equity = snapshot.equity
-    pe = snapshot.pe_ratio
-    pb = snapshot.pb_ratio
-    paid_in_capital = snapshot.paid_in_capital
-
-    price_by_pe = _safe_div(
-        (estimated_net_income * pe) if estimated_net_income is not None and estimated_net_income > 0 and pe is not None and pe > 0 else None,
-        shares,
+    ttm_scenario = _build_scenario(
+        scenario_key="ttm",
+        period_label="Son 12 Ay / TTM",
+        net_income=snapshot.net_income_ttm,
+        net_income_source=snapshot.net_income_source,
+        price=snapshot.price,
+        shares=snapshot.shares_outstanding,
+        paid_in_capital=snapshot.paid_in_capital,
+        equity=snapshot.equity,
+        pe=snapshot.pe_ratio,
+        pb=snapshot.pb_ratio,
+        historical_pe_median=historical_pe_median,
     )
-    price_by_pb = _safe_div(
-        (equity * pb) if equity is not None and equity > 0 and pb is not None and pb > 0 else None,
-        shares,
-    )
-
-    # Paid-in capital method: estimate fair value from market-cap to paid-cap ratio carried to estimated profitability.
-    capital_ratio = _safe_div(market_cap, paid_in_capital)
-    price_by_paid_in_capital = _safe_div(
-        (estimated_net_income * capital_ratio)
-        if estimated_net_income is not None and estimated_net_income > 0 and capital_ratio is not None and capital_ratio > 0
-        else None,
-        shares,
-    )
-
-    # Potential market value: use average of valid implied market caps from PE/PB methods.
-    implied_caps = []
-    if estimated_net_income is not None and estimated_net_income > 0 and pe is not None and pe > 0:
-        implied_caps.append(estimated_net_income * pe)
-    if equity is not None and equity > 0 and pb is not None and pb > 0:
-        implied_caps.append(equity * pb)
-    potential_market_cap = sum(implied_caps) / len(implied_caps) if implied_caps else None
-    price_by_potential_market_value = _safe_div(potential_market_cap, shares)
-
-    # ROE method: fair price = (estimated ROE * equity * current P/B) / shares.
-    estimated_roe = _safe_div(estimated_net_income, equity) if (estimated_net_income or 0) > 0 and (equity or 0) > 0 else None
-    price_by_roe = _safe_div(
-        (estimated_roe * equity * pb) if estimated_roe is not None and equity is not None and pb is not None else None,
-        shares,
+    year_end_scenario = _build_scenario(
+        scenario_key="year_end",
+        period_label=snapshot.period_label or "Yil Sonu Tahmini",
+        net_income=estimation.estimated_net_income,
+        net_income_source=estimation.selected_method,
+        price=snapshot.price,
+        shares=snapshot.shares_outstanding,
+        paid_in_capital=snapshot.paid_in_capital,
+        equity=snapshot.equity,
+        pe=snapshot.pe_ratio,
+        pb=snapshot.pb_ratio,
+        historical_pe_median=historical_pe_median,
     )
 
-    target_prices = {
-        "cari_fk": price_by_pe,
-        "pd_dd": price_by_pb,
-        "odenmis_sermaye": price_by_paid_in_capital,
-        "potansiyel_piyasa_degeri": price_by_potential_market_value,
-        "ozsermaye_karliligi": price_by_roe,
-    }
-    sector_target_prices = {"sektor_fk_hedef": None, "sektor_pd_dd_hedef": None}
-    sector_comparison: dict[str, float | str | list[str] | None] = {}
-    if sector_metrics:
-        sector_pe = sector_metrics.get("pe_median") or sector_metrics.get("pe_aggregate")
-        sector_pb = sector_metrics.get("pb_median") or sector_metrics.get("pb_aggregate")
-        estimated_eps = _safe_div(estimated_net_income, shares)
-        book_value_per_share = _safe_div(equity, shares)
-        if estimated_eps is not None and sector_pe and sector_pe > 0 and estimated_eps > 0:
-            sector_target_prices["sektor_fk_hedef"] = estimated_eps * float(sector_pe)
-        if book_value_per_share is not None and sector_pb and sector_pb > 0 and book_value_per_share > 0:
-            sector_target_prices["sektor_pd_dd_hedef"] = book_value_per_share * float(sector_pb)
-
-        company_snapshot = {
-            "pe_ratio": pe,
-            "pb_ratio": pb,
+    estimated_roe = _safe_div(estimation.estimated_net_income, snapshot.equity) if (estimation.estimated_net_income or 0) > 0 and (snapshot.equity or 0) > 0 else None
+    sector_comparison = compare_company_to_sector(
+        {
+            "pe_ratio": snapshot.pe_ratio,
+            "pb_ratio": snapshot.pb_ratio,
             "roe": estimated_roe,
-            "estimated_net_income": estimated_net_income,
-            "equity": equity,
-        }
-        sector_comparison = compare_company_to_sector(company_snapshot, sector_metrics)
-
-    valid_targets = [value for value in target_prices.values() if value is not None]
-    average_target_price = sum(valid_targets) / len(valid_targets) if valid_targets else None
-    all_targets = valid_targets + [value for value in sector_target_prices.values() if value is not None]
-    average_with_sector_price = sum(all_targets) / len(all_targets) if all_targets else None
-    upside_potential_pct = (
-        ((average_target_price - price) / price) * 100
-        if average_target_price is not None and price not in (None, 0)
-        else None
-    )
+            "estimated_net_income": estimation.estimated_net_income,
+            "equity": snapshot.equity,
+        },
+        sector_metrics or {},
+    ) if sector_metrics else {}
 
     missing = list(snapshot.missing_fields)
-    if estimated_net_income is None:
-        missing.append("estimated_net_income")
+    quality_status, _ = evaluate_snapshot_quality(
+        {
+            "price": snapshot.price,
+            "market_cap": snapshot.market_cap,
+            "shares_outstanding": snapshot.shares_outstanding,
+            "paid_in_capital": snapshot.paid_in_capital,
+            "equity": snapshot.equity,
+            "estimated_net_income": estimation.estimated_net_income,
+        }
+    )
+
     result = ValuationResult(
         symbol=snapshot.symbol,
-        price=price,
-        shares_outstanding=shares,
-        paid_in_capital=paid_in_capital,
-        estimated_net_income=estimated_net_income,
-        equity=equity,
-        market_cap=market_cap,
-        pe_ratio=pe,
-        pb_ratio=pb,
-        target_prices=target_prices,
-        sector_target_prices=sector_target_prices,
-        average_target_price=average_target_price,
-        average_with_sector_price=average_with_sector_price,
-        upside_potential_pct=upside_potential_pct,
+        price=snapshot.price,
+        shares_outstanding=snapshot.shares_outstanding,
+        paid_in_capital=snapshot.paid_in_capital,
+        equity=snapshot.equity,
+        market_cap=snapshot.market_cap,
+        pe_ratio=snapshot.pe_ratio,
+        pb_ratio=snapshot.pb_ratio,
+        valuation_scenarios={"ttm": ttm_scenario, "year_end": year_end_scenario},
         estimation=estimation,
         sector_comparison=sector_comparison,
         source=snapshot.source,
         net_income_source=snapshot.net_income_source,
         equity_source=snapshot.equity_source,
-        data_quality_status="usable",
+        data_quality_status=quality_status,
         missing_fields=missing,
     )
-    if db_path and quality_status != "unusable":
+    if db_path:
         save_valuation_result(
             db_path,
             {
                 "symbol": result.symbol,
                 "valuation_date": datetime.now(UTC).date().isoformat(),
                 "price": result.price,
-                "fair_value": result.average_target_price,
-                "upside_percent": result.upside_potential_pct,
-                "target_prices_json": {**result.target_prices, **result.sector_target_prices},
+                "fair_value": result.valuation_scenarios["year_end"].fair_value_median,
+                "upside_percent": result.valuation_scenarios["year_end"].upside_potential_pct,
+                "target_prices_json": {
+                    "ttm": result.valuation_scenarios["ttm"].target_prices,
+                    "year_end": result.valuation_scenarios["year_end"].target_prices,
+                },
                 "estimation_json": asdict(result.estimation),
                 "sector_comparison_json": result.sector_comparison,
                 "confidence_score": max(0.0, 1.0 - (len(set(result.missing_fields)) / 12)),
@@ -181,156 +260,94 @@ def run_valuation_from_snapshot(
     sector_metrics: dict | None = None,
     db_path: str | None = None,
 ) -> ValuationResult:
-    """Run valuation using a cached company_snapshot dict.
-
-    This function never calls borsapy.  All numeric inputs come from the
-    *snapshot* dictionary (as stored in the ``company_snapshot`` SQLite table).
-    """
     symbol = snapshot["symbol"]
-    quality_status = snapshot.get("data_quality_status")
-    quality_errors = snapshot.get("data_quality_errors_json") or []
-    if not quality_status:
-        quality_status, quality_errors = evaluate_snapshot_quality(snapshot)
-    estimated_net_income = snapshot.get("estimated_net_income")
-    shares = snapshot.get("shares_outstanding")
-    price = snapshot.get("price")
-    market_cap = snapshot.get("market_cap")
-    equity = snapshot.get("equity")
-    pe = snapshot.get("pe_ratio")
-    pb = snapshot.get("pb_ratio")
-    paid_in_capital = snapshot.get("paid_in_capital")
-
-    # Build a lightweight ProfitEstimationResult from the cached values.
-    missing_fields_raw = snapshot.get("missing_fields_json") or []
-    if isinstance(missing_fields_raw, str):
-        import json
-        missing_fields_raw = json.loads(missing_fields_raw)
-    if isinstance(quality_errors, str):
-        import json
-        quality_errors = json.loads(quality_errors)
+    quality_status, quality_errors = evaluate_snapshot_quality(snapshot)
+    historical_pe_median = get_historical_pe_median(symbol)
 
     estimation = ProfitEstimationResult(
         symbol=symbol,
         selected_method="cache",
-        estimated_net_income=estimated_net_income,
+        estimated_net_income=snapshot.get("estimated_net_income"),
         method_values={},
         period_type=snapshot.get("period_type") or "unknown",
         period_label=snapshot.get("financial_period") or "unknown",
-        missing_fields=list(missing_fields_raw),
+        missing_fields=list(snapshot.get("missing_fields_json") or []),
     )
 
-    # ---------- target prices (same formulas as run_valuation) ----------
-    price_by_pe = _safe_div(
-        (estimated_net_income * pe) if estimated_net_income is not None and estimated_net_income > 0 and pe is not None and pe > 0 else None,
-        shares,
+    ttm_scenario = _build_scenario(
+        scenario_key="ttm",
+        period_label="Son 12 Ay / TTM",
+        net_income=snapshot.get("net_income_ttm"),
+        net_income_source=snapshot.get("net_income_source", "unknown"),
+        price=snapshot.get("price"),
+        shares=snapshot.get("shares_outstanding"),
+        paid_in_capital=snapshot.get("paid_in_capital"),
+        equity=snapshot.get("equity"),
+        pe=snapshot.get("pe_ratio"),
+        pb=snapshot.get("pb_ratio"),
+        historical_pe_median=historical_pe_median,
     )
-    price_by_pb = _safe_div(
-        (equity * pb) if equity is not None and equity > 0 and pb is not None and pb > 0 else None,
-        shares,
-    )
-
-    capital_ratio = _safe_div(market_cap, paid_in_capital)
-    price_by_paid_in_capital = _safe_div(
-        (estimated_net_income * capital_ratio)
-        if estimated_net_income is not None and estimated_net_income > 0 and capital_ratio is not None and capital_ratio > 0
-        else None,
-        shares,
-    )
-
-    implied_caps = []
-    if estimated_net_income is not None and estimated_net_income > 0 and pe is not None and pe > 0:
-        implied_caps.append(estimated_net_income * pe)
-    if equity is not None and equity > 0 and pb is not None and pb > 0:
-        implied_caps.append(equity * pb)
-    potential_market_cap = sum(implied_caps) / len(implied_caps) if implied_caps else None
-    price_by_potential_market_value = _safe_div(potential_market_cap, shares)
-
-    estimated_roe = _safe_div(estimated_net_income, equity) if (estimated_net_income or 0) > 0 and (equity or 0) > 0 else None
-    price_by_roe = _safe_div(
-        (estimated_roe * equity * pb) if estimated_roe is not None and equity is not None and pb is not None else None,
-        shares,
+    year_end_scenario = _build_scenario(
+        scenario_key="year_end",
+        period_label=snapshot.get("financial_period") or "Yil Sonu Tahmini",
+        net_income=snapshot.get("estimated_net_income"),
+        net_income_source=snapshot.get("net_income_source", "unknown"),
+        price=snapshot.get("price"),
+        shares=snapshot.get("shares_outstanding"),
+        paid_in_capital=snapshot.get("paid_in_capital"),
+        equity=snapshot.get("equity"),
+        pe=snapshot.get("pe_ratio"),
+        pb=snapshot.get("pb_ratio"),
+        historical_pe_median=historical_pe_median,
     )
 
-    target_prices = {
-        "cari_fk": price_by_pe,
-        "pd_dd": price_by_pb,
-        "odenmis_sermaye": price_by_paid_in_capital,
-        "potansiyel_piyasa_degeri": price_by_potential_market_value,
-        "ozsermaye_karliligi": price_by_roe,
-    }
-
-    # ---------- sector target prices ----------
-    sector_target_prices = {"sektor_fk_hedef": None, "sektor_pd_dd_hedef": None}
-    sector_comparison: dict[str, float | str | list[str] | None] = {}
-    if sector_metrics:
-        sector_pe = sector_metrics.get("pe_median") or sector_metrics.get("pe_aggregate")
-        sector_pb = sector_metrics.get("pb_median") or sector_metrics.get("pb_aggregate")
-        estimated_eps = _safe_div(estimated_net_income, shares)
-        book_value_per_share = _safe_div(equity, shares)
-        if estimated_eps is not None and sector_pe and sector_pe > 0 and estimated_eps > 0:
-            sector_target_prices["sektor_fk_hedef"] = estimated_eps * float(sector_pe)
-        if book_value_per_share is not None and sector_pb and sector_pb > 0 and book_value_per_share > 0:
-            sector_target_prices["sektor_pd_dd_hedef"] = book_value_per_share * float(sector_pb)
-
-        company_snapshot_for_compare = {
-            "pe_ratio": pe,
-            "pb_ratio": pb,
+    estimated_roe = _safe_div(snapshot.get("estimated_net_income"), snapshot.get("equity")) if (snapshot.get("estimated_net_income") or 0) > 0 and (snapshot.get("equity") or 0) > 0 else None
+    sector_comparison = compare_company_to_sector(
+        {
+            "pe_ratio": snapshot.get("pe_ratio"),
+            "pb_ratio": snapshot.get("pb_ratio"),
             "roe": estimated_roe,
-            "estimated_net_income": estimated_net_income,
-            "equity": equity,
-        }
-        sector_comparison = compare_company_to_sector(company_snapshot_for_compare, sector_metrics)
+            "estimated_net_income": snapshot.get("estimated_net_income"),
+            "equity": snapshot.get("equity"),
+        },
+        sector_metrics or {},
+    ) if sector_metrics else {}
 
-    # ---------- averages & upside ----------
-    valid_targets = [value for value in target_prices.values() if value is not None]
-    average_target_price = sum(valid_targets) / len(valid_targets) if valid_targets else None
-    all_targets = valid_targets + [value for value in sector_target_prices.values() if value is not None]
-    average_with_sector_price = sum(all_targets) / len(all_targets) if all_targets else None
-    upside_potential_pct = (
-        ((average_target_price - price) / price) * 100
-        if average_target_price is not None and price not in (None, 0)
-        else None
-    )
-
-    missing = list(missing_fields_raw)
-    if estimated_net_income is None and "estimated_net_income" not in missing:
-        missing.append("estimated_net_income")
-
+    missing = list(snapshot.get("missing_fields_json") or [])
     if quality_status == "unusable":
-        missing = sorted(set(list(missing_fields_raw) + list(quality_errors) + ["snapshot_unusable"]))
+        missing = sorted(set(missing + list(quality_errors) + ["snapshot_unusable"]))
+
     result = ValuationResult(
         symbol=symbol,
-        price=price,
-        shares_outstanding=shares,
-        paid_in_capital=paid_in_capital,
-        estimated_net_income=estimated_net_income,
-        equity=equity,
-        market_cap=market_cap,
-        pe_ratio=pe,
-        pb_ratio=pb,
-        target_prices=target_prices,
-        sector_target_prices=sector_target_prices,
-        average_target_price=average_target_price,
-        average_with_sector_price=average_with_sector_price,
-        upside_potential_pct=upside_potential_pct,
+        price=snapshot.get("price"),
+        shares_outstanding=snapshot.get("shares_outstanding"),
+        paid_in_capital=snapshot.get("paid_in_capital"),
+        equity=snapshot.get("equity"),
+        market_cap=snapshot.get("market_cap"),
+        pe_ratio=snapshot.get("pe_ratio"),
+        pb_ratio=snapshot.get("pb_ratio"),
+        valuation_scenarios={"ttm": ttm_scenario, "year_end": year_end_scenario},
         estimation=estimation,
         sector_comparison=sector_comparison,
         source="cache",
         net_income_source=snapshot.get("net_income_source", "unknown"),
         equity_source=snapshot.get("equity_source", "unknown"),
-        data_quality_status=quality_status or "unknown",
+        data_quality_status=quality_status,
         missing_fields=missing,
     )
-    if db_path:
+    if db_path and quality_status != "unusable":
         save_valuation_result(
             db_path,
             {
                 "symbol": result.symbol,
                 "valuation_date": datetime.now(UTC).date().isoformat(),
                 "price": result.price,
-                "fair_value": result.average_target_price,
-                "upside_percent": result.upside_potential_pct,
-                "target_prices_json": {**result.target_prices, **result.sector_target_prices},
+                "fair_value": result.valuation_scenarios["year_end"].fair_value_median,
+                "upside_percent": result.valuation_scenarios["year_end"].upside_potential_pct,
+                "target_prices_json": {
+                    "ttm": result.valuation_scenarios["ttm"].target_prices,
+                    "year_end": result.valuation_scenarios["year_end"].target_prices,
+                },
                 "estimation_json": asdict(result.estimation),
                 "sector_comparison_json": result.sector_comparison,
                 "confidence_score": max(0.0, 1.0 - (len(set(result.missing_fields)) / 12)),

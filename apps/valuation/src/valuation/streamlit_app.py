@@ -34,6 +34,35 @@ def _fmt(value: float | None) -> str:
     return f"{value:,.2f}"
 
 
+def _render_scenario_block(title: str, scenario) -> None:
+    st.header(title)
+    st.write(f"Kullanilan donem: `{scenario.period_label}`")
+    st.write(f"Kullanilan net kar: `{_fmt(scenario.net_income)}`")
+    st.write(f"Net kar kaynagi: `{scenario.net_income_source}`")
+
+    st.subheader("Hedef Fiyat Tablosu")
+    st.table(
+        {
+            "Yontem": list(scenario.target_prices.keys()),
+            "Hedef Fiyat": [_fmt(v) for v in scenario.target_prices.values()],
+        }
+    )
+    st.write(f"Dahil edilen yontemler: `{', '.join(scenario.included_methods) if scenario.included_methods else 'yok'}`")
+    st.write(f"Haric tutulan yontemler: `{', '.join(scenario.excluded_methods) if scenario.excluded_methods else 'yok'}`")
+    st.write(f"Medyan adil deger: `{_fmt(scenario.fair_value_median)}`")
+    st.write(f"Filtreli ortalama adil deger: `{_fmt(scenario.fair_value_mean_filtered)}`")
+    st.write(f"Prim potansiyeli (%): `{_fmt(scenario.upside_potential_pct)}`")
+
+    st.subheader("Odenmis Sermaye Hesabi")
+    st.write(f"EPS (net_income / paid_in_capital): `{_fmt(scenario.paid_capital_details.get('eps'))}`")
+    st.write(f"Kurs formulu (EPS x 10): `{_fmt(scenario.paid_capital_details.get('x10'))}`")
+    st.write(f"Gecmis F/K medyan: `{_fmt(scenario.paid_capital_details.get('historical_pe_median'))}`")
+    st.write(f"EPS x gecmis F/K: `{_fmt(scenario.paid_capital_details.get('historical_pe_value'))}`")
+    st.write(f"Odenmis sermaye final: `{_fmt(scenario.paid_capital_details.get('final'))}`")
+    if scenario.paid_capital_details.get("historical_pe_median") is None:
+        st.warning("Gecmis F/K verisi hesaplanamadi. Final deger EPS x 10 olarak kullanildi.")
+
+
 def _refresh_symbol_and_sector(
     symbol: str,
     db_path: str,
@@ -214,8 +243,8 @@ if analyze:
             {
                 "pe_ratio": result.pe_ratio,
                 "pb_ratio": result.pb_ratio,
-                "roe": (result.estimated_net_income / result.equity) if result.estimated_net_income is not None and result.equity not in (None, 0) else None,
-                "estimated_net_income": result.estimated_net_income,
+                "roe": (result.valuation_scenarios["year_end"].net_income / result.equity) if result.valuation_scenarios["year_end"].net_income is not None and result.equity not in (None, 0) else None,
+                "estimated_net_income": result.valuation_scenarios["year_end"].net_income,
                 "equity": result.equity,
             },
             sector_metrics or {},
@@ -226,7 +255,7 @@ if analyze:
         col1.metric("Hisse Fiyati", _fmt(result.price))
         col2.metric("Piyasa Degeri", _fmt(result.market_cap))
         col3.metric("Hisse Sayisi", _fmt(result.shares_outstanding))
-        col4.metric("Tahmini Net Kar", _fmt(result.estimated_net_income))
+        col4.metric("Tahmini Net Kar (Yil Sonu)", _fmt(result.valuation_scenarios["year_end"].net_income))
         col5, col6, col7 = st.columns(3)
         col5.metric("F/K", _fmt(result.pe_ratio))
         col6.metric("PD/DD", _fmt(result.pb_ratio))
@@ -240,7 +269,7 @@ if analyze:
         st.write(f"TTM tahmin: `{_fmt(result.estimation.method_values.get('ttm'))}`")
         st.write(f"Sezonsallik tahmin: `{_fmt(result.estimation.method_values.get('seasonal'))}`")
         st.write(f"Ciro x marj tahmin: `{_fmt(result.estimation.method_values.get('revenue_margin'))}`")
-        st.write(f"Nihai tahmini net kar: `{_fmt(result.estimated_net_income)}`")
+        st.write(f"Nihai tahmini net kar: `{_fmt(result.estimation.estimated_net_income)}`")
         if cached.get("net_income_source") == "implied_from_pe":
             st.warning("Tahmini net kar F/K ve piyasa degeri uzerinden turetildi.")
         if cached.get("equity_source") == "implied_from_pb":
@@ -248,14 +277,8 @@ if analyze:
         if result.missing_fields:
             st.warning("Eksik veri alanlari: " + ", ".join(sorted(set(result.missing_fields))))
 
-        st.header("5 Yontemli Degerleme Tablosu")
-        st.table({"Yontem": list(result.target_prices.keys()), "Hedef Fiyat": [_fmt(v) for v in result.target_prices.values()]})
-        st.write(f"5 yontem ortalamasi: `{_fmt(result.average_target_price)}`")
-        st.write(f"Prim potansiyeli (%): `{_fmt(result.upside_potential_pct)}`")
-
-        st.header("Sektor Bazli Ek Degerleme")
-        st.table({"Yontem": list(result.sector_target_prices.keys()), "Hedef Fiyat": [_fmt(v) for v in result.sector_target_prices.values()]})
-        st.write(f"Sektor dahil ortalama: `{_fmt(result.average_with_sector_price)}`")
+        _render_scenario_block("Son 12 Ay / TTM Degerleme", result.valuation_scenarios["ttm"])
+        _render_scenario_block("Yil Sonu Tahmini Degerleme", result.valuation_scenarios["year_end"])
 
         st.header("Sektor Analizi")
         st.write(f"Sektor endeksi: `{sector_index or 'N/A'}`")

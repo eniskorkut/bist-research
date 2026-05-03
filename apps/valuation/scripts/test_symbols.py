@@ -12,14 +12,15 @@ def main() -> None:
             print(f"error: {exc}")
             continue
         print(f"price={result.price}")
-        print(f"estimated_net_income={result.estimated_net_income}")
-        print(f"target_prices={result.target_prices}")
-        print(f"average_target_price={result.average_target_price}")
-        print(f"upside_potential_pct={result.upside_potential_pct}")
+        print(f"ttm_net_income={result.valuation_scenarios['ttm'].net_income}")
+        print(f"year_end_net_income={result.valuation_scenarios['year_end'].net_income}")
+        print(f"ttm_target_prices={result.valuation_scenarios['ttm'].target_prices}")
+        print(f"year_end_target_prices={result.valuation_scenarios['year_end'].target_prices}")
+        print(f"year_end_fair_value_median={result.valuation_scenarios['year_end'].fair_value_median}")
+        print(f"year_end_upside_potential_pct={result.valuation_scenarios['year_end'].upside_potential_pct}")
         if result.missing_fields:
             print(f"missing_fields={result.missing_fields}")
 
 
 if __name__ == "__main__":
     main()
-

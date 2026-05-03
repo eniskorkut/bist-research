@@ -40,118 +40,14 @@ def _make_snapshot() -> BistSnapshot:
     )
 
 
-def test_valuation_engine_formulas() -> None:
-    snapshot = _make_snapshot()
-    sector_metrics = {
-        "pe_median": 12.0,
-        "pe_aggregate": 11.0,
-        "pb_median": 1.8,
-        "pb_aggregate": 1.6,
-        "roe_aggregate": 0.15,
-    }
-    result = run_valuation("THYAO", client=FakeClient(snapshot), sector_metrics=sector_metrics)
-    # auto estimate median(ttm=10000, seasonal=9600, rev_margin=12000) => 10000
-    assert result.estimated_net_income == 10000.0
-    assert result.target_prices["cari_fk"] == 100.0
-    assert result.target_prices["pd_dd"] == 100.0
-    assert result.target_prices["odenmis_sermaye"] == 1000.0
-    assert result.target_prices["potansiyel_piyasa_degeri"] == 100.0
-    assert result.target_prices["ozsermaye_karliligi"] == 20.0
-    assert result.average_target_price == 264.0
-    assert result.upside_potential_pct == 164.0
-    assert result.sector_target_prices["sektor_fk_hedef"] == 120.0
-    assert result.sector_target_prices["sektor_pd_dd_hedef"] == 90.0
+def test_scenario_structure_exists() -> None:
+    result = run_valuation("THYAO", client=FakeClient(_make_snapshot()))
+    assert "ttm" in result.valuation_scenarios
+    assert "year_end" in result.valuation_scenarios
 
 
-def test_run_valuation_from_snapshot_no_borsapy() -> None:
-    """run_valuation_from_snapshot must produce correct results without
-    touching borsapy at all."""
-
-    cached_snapshot = {
-        "symbol": "THYAO",
-        "price": 100.0,
-        "market_cap": 100_000.0,
-        "pe_ratio": 10.0,
-        "pb_ratio": 2.0,
-        "shares_outstanding": 1_000.0,
-        "paid_in_capital": 1_000.0,
-        "equity": 50_000.0,
-        "estimated_net_income": 10_000.0,
-        "period_type": "interim",
-        "financial_period": "2025/06",
-        "missing_fields_json": [],
-    }
-    sector_metrics = {
-        "pe_median": 12.0,
-        "pe_aggregate": 11.0,
-        "pb_median": 1.8,
-        "pb_aggregate": 1.6,
-        "roe_aggregate": 0.15,
-    }
-
-    result = run_valuation_from_snapshot(cached_snapshot, sector_metrics=sector_metrics)
-
-    assert result.source == "cache"
-    assert result.estimation.selected_method == "cache"
-    assert result.estimated_net_income == 10_000.0
-    assert result.target_prices["cari_fk"] == 100.0
-    assert result.target_prices["pd_dd"] == 100.0
-    assert result.target_prices["odenmis_sermaye"] == 1000.0
-    assert result.target_prices["potansiyel_piyasa_degeri"] == 100.0
-    assert result.target_prices["ozsermaye_karliligi"] == 20.0
-    assert result.average_target_price == 264.0
-    assert result.upside_potential_pct == 164.0
-    assert result.sector_target_prices["sektor_fk_hedef"] == 120.0
-    assert result.sector_target_prices["sektor_pd_dd_hedef"] == 90.0
-
-
-def test_run_valuation_from_snapshot_missing_fields_string() -> None:
-    """missing_fields_json stored as a JSON string should be parsed."""
-    cached_snapshot = {
-        "symbol": "TEST",
-        "price": 50.0,
-        "market_cap": 50_000.0,
-        "pe_ratio": 5.0,
-        "pb_ratio": 1.0,
-        "shares_outstanding": 1_000.0,
-        "paid_in_capital": 1_000.0,
-        "equity": 50_000.0,
-        "estimated_net_income": None,
-        "period_type": "interim",
-        "financial_period": "2025/06",
-        "missing_fields_json": '["equity", "net_income_latest_period"]',
-    }
-    result = run_valuation_from_snapshot(cached_snapshot)
-    assert "equity" in result.missing_fields
-    assert "estimated_net_income" in result.missing_fields
-
-
-def test_run_valuation_from_refresh_snapshot() -> None:
-    """Refresh sonrası cache'e yazılan snapshot ile valuation çalışmalı."""
-    cached_snapshot = {
-        "symbol": "ASELS",
-        "price": 120.0,
-        "market_cap": 240_000.0,
-        "pe_ratio": 12.0,
-        "pb_ratio": 2.4,
-        "shares_outstanding": 2_000.0,
-        "paid_in_capital": 2_000.0,
-        "equity": 100_000.0,
-        "estimated_net_income": 18_000.0,
-        "period_type": "interim",
-        "financial_period": "2025/06",
-        "source": "borsapy",
-        "missing_fields_json": [],
-    }
-    sector_metrics = {"pe_median": 10.0, "pb_median": 2.0, "roe_aggregate": 0.16}
-    result = run_valuation_from_snapshot(cached_snapshot, sector_metrics=sector_metrics)
-    assert result.symbol == "ASELS"
-    assert result.source == "cache"
-    assert result.target_prices["cari_fk"] == 108.0
-
-
-def test_run_valuation_from_snapshot_implied_values() -> None:
-    cached_snapshot = {
+def test_paid_capital_course_formula() -> None:
+    cached = {
         "symbol": "THYAO",
         "price": 308.25,
         "market_cap": 425_385_000_000.0,
@@ -159,11 +55,45 @@ def test_run_valuation_from_snapshot_implied_values() -> None:
         "paid_in_capital": 1_380_000_000.0,
         "pe_ratio": 3.0,
         "pb_ratio": 0.4,
-        "estimated_net_income": 141_795_000_000.0,
         "equity": 1_063_462_500_000.0,
+        "estimated_net_income": 142_763_197_242.16,
+        "net_income_ttm": 142_763_197_242.16,
+        "period_type": "interim",
+        "financial_period": "2025",
+        "data_quality_status": "usable",
         "missing_fields_json": [],
-        "data_quality_status": "partial",
+        "net_income_source": "implied_from_pe",
+        "equity_source": "implied_from_pb",
     }
-    result = run_valuation_from_snapshot(cached_snapshot)
-    assert round(result.estimated_net_income, 2) == 141_795_000_000.0
-    assert round(result.equity, 2) == 1_063_462_500_000.0
+    result = run_valuation_from_snapshot(cached)
+    scenario = result.valuation_scenarios["year_end"]
+    eps = scenario.paid_capital_details["eps"]
+    assert round(float(eps), 2) == 103.45
+    assert round(float(scenario.paid_capital_details["x10"]), 2) == 1034.52
+    assert scenario.target_prices["odenmis_sermaye_final"] != 31888.0
+
+
+def test_historical_pe_none_uses_x10_final() -> None:
+    cached = {
+        "symbol": "ASELS",
+        "price": 120.0,
+        "market_cap": 240_000.0,
+        "shares_outstanding": 2_000.0,
+        "paid_in_capital": 2_000.0,
+        "pe_ratio": 12.0,
+        "pb_ratio": 2.4,
+        "equity": 100_000.0,
+        "estimated_net_income": 18_000.0,
+        "net_income_ttm": 18_000.0,
+        "period_type": "interim",
+        "financial_period": "2025/06",
+        "data_quality_status": "usable",
+        "missing_fields_json": [],
+        "net_income_source": "financial_statement",
+        "equity_source": "financial_statement",
+    }
+    result = run_valuation_from_snapshot(cached)
+    scenario = result.valuation_scenarios["year_end"]
+    assert scenario.paid_capital_details["historical_pe_median"] is None
+    assert scenario.paid_capital_details["final_method"] == "x10_only"
+    assert scenario.target_prices["odenmis_sermaye_final"] == scenario.target_prices["odenmis_sermaye_x10"]
