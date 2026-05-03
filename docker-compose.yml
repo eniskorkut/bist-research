@@ -1,0 +1,29 @@
+services:
+  borsapy-alert:
+    build:
+      context: ./borsapy-alert
+    container_name: borsapy-alert
+    env_file:
+      - path: ./.env
+        required: false
+    command:
+      - python
+      - scripts/run_volume_alert.py
+      - --index
+      - XU030
+      - --dry-run
+      - --check-interval
+      - "5"
+    volumes:
+      - ./borsapy-alert/alerts.csv:/app/alerts.csv
+    restart: unless-stopped
+
+  borsa-mcp:
+    build:
+      context: ./borsa-mcp
+    container_name: borsa-mcp
+    command:
+      - borsa-mcp
+    stdin_open: true
+    tty: true
+    restart: unless-stopped
