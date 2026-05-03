@@ -32,9 +32,17 @@ def test_valuation_engine_formulas() -> None:
         average_margin_3y=0.12,
         period_type="interim",
         period_label="2025/06",
+        source="borsapy",
         missing_fields=[],
     )
-    result = run_valuation("THYAO", client=FakeClient(snapshot))
+    sector_metrics = {
+        "pe_median": 12.0,
+        "pe_aggregate": 11.0,
+        "pb_median": 1.8,
+        "pb_aggregate": 1.6,
+        "roe_aggregate": 0.15,
+    }
+    result = run_valuation("THYAO", client=FakeClient(snapshot), sector_metrics=sector_metrics)
     # auto estimate median(ttm=10000, seasonal=9600, rev_margin=12000) => 10000
     assert result.estimated_net_income == 10000.0
     assert result.target_prices["cari_fk"] == 100.0
@@ -44,3 +52,5 @@ def test_valuation_engine_formulas() -> None:
     assert result.target_prices["ozsermaye_karliligi"] == 20.0
     assert result.average_target_price == 264.0
     assert result.upside_potential_pct == 164.0
+    assert result.sector_target_prices["sektor_fk_hedef"] == 120.0
+    assert result.sector_target_prices["sektor_pd_dd_hedef"] == 90.0

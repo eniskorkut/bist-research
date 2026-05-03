@@ -71,4 +71,21 @@ services:
       - --server.port=8502
     ports:
       - "8502:8502"
+    volumes:
+      - ./data:/data
     restart: unless-stopped
+
+  valuation-refresh:
+    build:
+      context: ./apps/valuation
+    container_name: valuation-refresh
+    command:
+      - python
+      - scripts/refresh_bist_cache.py
+      - --index
+      - XU100
+      - --db-path
+      - /data/valuation_cache.sqlite
+    volumes:
+      - ./data:/data
+    restart: "no"

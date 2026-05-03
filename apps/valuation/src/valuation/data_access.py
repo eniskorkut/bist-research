@@ -31,6 +31,31 @@ def _extract_first_number(mapping: dict[str, Any], aliases: list[str]) -> float 
     return None
 
 
+def _safe_mapping(obj: Any) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    if obj is None:
+        return result
+    if isinstance(obj, dict):
+        iterator = obj.keys()
+        for key in iterator:
+            try:
+                result[str(key)] = obj[key]
+            except Exception:  # noqa: BLE001
+                continue
+        return result
+    for key in dir(obj):
+        if key.startswith("_"):
+            continue
+        try:
+            value = getattr(obj, key)
+        except Exception:  # noqa: BLE001
+            continue
+        if callable(value):
+            continue
+        result[str(key)] = value
+    return result
+
+
 def _extract_series_value(df: pd.DataFrame, aliases: list[str]) -> float | None:
     if df is None or df.empty:
         return None
@@ -73,6 +98,7 @@ class BistSnapshot:
     average_margin_3y: float | None
     period_type: str
     period_label: str
+    source: str
     missing_fields: list[str]
 
 
@@ -80,8 +106,8 @@ class BorsapyFinancialClient:
     def load_snapshot(self, symbol: str) -> BistSnapshot:
         normalized_symbol = _normalize_symbol(symbol)
         ticker = bp.Ticker(normalized_symbol)
-        info = getattr(ticker, "info", None) or {}
-        fast_info = getattr(ticker, "fast_info", None) or {}
+        info = _safe_mapping(getattr(ticker, "info", None))
+        fast_info = _safe_mapping(getattr(ticker, "fast_info", None))
         combined = {**info, **fast_info}
 
         income = ticker.get_income_stmt()
@@ -203,5 +229,6 @@ class BorsapyFinancialClient:
             average_margin_3y=average_margin_3y,
             period_type=period_type,
             period_label=period_label,
+            source="borsapy",
             missing_fields=missing,
         )
