@@ -11,6 +11,7 @@ from valuation.cache import (
     get_sector_metrics,
     init_db,
     is_stale,
+    should_write_snapshot,
     upsert_company_snapshot,
     upsert_sector_metrics,
 )
@@ -68,7 +69,7 @@ def _refresh_symbol_and_sector(
     db_path: str,
     *,
     force: bool = False,
-) -> tuple[dict | None, dict | None, str | None]:
+) -> tuple[dict | None, dict | None, str | None, dict]:
     """Refresh the given *symbol* and its sector peers into the cache.
 
     For each symbol in the sector:
@@ -88,6 +89,12 @@ def _refresh_symbol_and_sector(
         process_symbols = sorted(set(process_symbols + get_sector_symbols(target_sector)))
 
     snapshots: list[dict] = []
+    refresh_meta = {
+        "wrote_to_cache": 0,
+        "preserved_existing_cache": 0,
+        "rejected_unusable_refresh": 0,
+        "messages": [],
+    }
     for sym in process_symbols:
         # Check existing cache first
         existing = get_company_snapshot(db_path, sym)
@@ -131,9 +138,19 @@ def _refresh_symbol_and_sector(
         quality_status, quality_errors = evaluate_snapshot_quality(payload)
         payload["data_quality_status"] = quality_status
         payload["data_quality_errors_json"] = quality_errors
-        upsert_company_snapshot(db_path, payload)
-        if sector_index == target_sector:
-            snapshots.append(payload)
+        should_write, reason = should_write_snapshot(payload, existing)
+        if should_write:
+            upsert_company_snapshot(db_path, payload)
+            refresh_meta["wrote_to_cache"] += 1
+            if sector_index == target_sector:
+                snapshots.append(payload)
+        else:
+            refresh_meta["preserved_existing_cache"] += 1
+            if quality_status == "unusable":
+                refresh_meta["rejected_unusable_refresh"] += 1
+            refresh_meta["messages"].append(f"{sym}: {reason}")
+            if existing is not None and (existing.get("sector_index") or "") == target_sector:
+                snapshots.append(existing)
 
     sector_metrics = None
     if target_sector and snapshots:
@@ -148,7 +165,7 @@ def _refresh_symbol_and_sector(
         upsert_sector_metrics(db_path, sector_metrics)
     cached_company = get_company_snapshot(db_path, symbol)
     cached_sector = sector_metrics or (get_sector_metrics(db_path, target_sector) if target_sector else None)
-    return cached_company, cached_sector, target_sector
+    return cached_company, cached_sector, target_sector, refresh_meta
 
 
 st.set_page_config(page_title="BIST Otomatik Degerleme", layout="wide")
@@ -163,8 +180,16 @@ refresh = col_b.button("Cache'i yenile")
 
 if refresh and symbol:
     try:
-        _refresh_symbol_and_sector(symbol, DB_PATH, force=True)
-        st.success("Cache yenilendi.")
+        _, _, _, refresh_meta = _refresh_symbol_and_sector(symbol, DB_PATH, force=True)
+        if refresh_meta["wrote_to_cache"] > 0:
+            st.success(f"Cache yenilendi. Yazilan kayit: {refresh_meta['wrote_to_cache']}")
+        if refresh_meta["preserved_existing_cache"] > 0:
+            st.warning(
+                "Bazi sembollerde borsapy eksik veri dondurdu; eski saglikli cache korundu. "
+                f"Korunan kayit: {refresh_meta['preserved_existing_cache']}"
+            )
+        if refresh_meta["wrote_to_cache"] == 0 and refresh_meta["preserved_existing_cache"] == 0:
+            st.warning("Cache yenilemede kullanilabilir veri yazilamadi.")
     except Exception as exc:  # noqa: BLE001
         st.error(f"Cache yenileme hatasi: {exc}")
 
@@ -190,13 +215,15 @@ if analyze:
         if not company_fresh:
             # Company stale/missing → refresh both company and sector
             try:
-                _refresh_symbol_and_sector(symbol, DB_PATH)
+                _, _, _, refresh_meta = _refresh_symbol_and_sector(symbol, DB_PATH)
                 cached = get_company_snapshot(DB_PATH, symbol)
                 sector_index = cached.get("sector_index") if cached else sector_index
                 sector_metrics = get_sector_metrics(DB_PATH, sector_index) if sector_index else None
                 company_fresh = cached is not None and not is_stale(cached.get("updated_at"))
                 sector_fresh = sector_metrics is not None and not is_stale(sector_metrics.get("calculated_at"))
                 valuation_source = "borsapy_refresh"
+                if refresh_meta["preserved_existing_cache"] > 0:
+                    st.warning("Yenilemede eksik veri algilandi; mevcut cache korundu.")
             except Exception as exc:  # noqa: BLE001
                 st.error(f"Veri cekme hatasi: {exc}")
                 st.stop()
@@ -204,12 +231,14 @@ if analyze:
             # Company fresh, sector stale/missing → refresh sector only
             # (the helper will skip the fresh company snapshot automatically)
             try:
-                _refresh_symbol_and_sector(symbol, DB_PATH)
+                _, _, _, refresh_meta = _refresh_symbol_and_sector(symbol, DB_PATH)
                 cached = get_company_snapshot(DB_PATH, symbol)
                 sector_index = cached.get("sector_index") if cached else sector_index
                 sector_metrics = get_sector_metrics(DB_PATH, sector_index) if sector_index else None
                 sector_fresh = sector_metrics is not None and not is_stale(sector_metrics.get("calculated_at"))
                 valuation_source = "cache"  # company came from cache
+                if refresh_meta["preserved_existing_cache"] > 0:
+                    st.warning("Sektor yenilemede eksik veri algilandi; mevcut cache korundu.")
             except Exception as exc:  # noqa: BLE001
                 st.error(f"Sektor yenileme hatasi: {exc}")
                 # sector_metrics may remain None, continue anyway

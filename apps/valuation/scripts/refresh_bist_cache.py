@@ -9,6 +9,7 @@ from valuation.cache import (
     get_company_snapshot,
     init_db,
     is_stale,
+    should_write_snapshot,
     upsert_company_snapshot,
     upsert_sector_metrics,
 )
@@ -48,6 +49,9 @@ def main() -> None:
     usable_symbols: list[str] = []
     partial_symbols: list[str] = []
     unusable_symbols: list[str] = []
+    rejected_unusable_refresh: list[str] = []
+    preserved_existing_cache: list[str] = []
+    overwritten_symbols: list[str] = []
 
     for symbol in symbols:
         try:
@@ -103,16 +107,27 @@ def main() -> None:
             quality_status, quality_errors = evaluate_snapshot_quality(payload)
             payload["data_quality_status"] = quality_status
             payload["data_quality_errors_json"] = quality_errors
-            upsert_company_snapshot(args.db_path, payload)
-            refreshed_symbols.append(symbol)
-            if quality_status == "usable":
-                usable_symbols.append(symbol)
-            elif quality_status == "partial":
-                partial_symbols.append(symbol)
+            should_write, reason = should_write_snapshot(payload, existing)
+            if should_write:
+                upsert_company_snapshot(args.db_path, payload)
+                refreshed_symbols.append(symbol)
+                if existing is not None:
+                    overwritten_symbols.append(symbol)
+                if quality_status == "usable":
+                    usable_symbols.append(symbol)
+                elif quality_status == "partial":
+                    partial_symbols.append(symbol)
+                else:
+                    unusable_symbols.append(symbol)
+                if sector_index and quality_status != "unusable":
+                    by_sector.setdefault(sector_index, []).append(payload)
             else:
-                unusable_symbols.append(symbol)
-            if sector_index and quality_status != "unusable":
-                by_sector.setdefault(sector_index, []).append(payload)
+                preserved_existing_cache.append(symbol)
+                if quality_status == "unusable":
+                    rejected_unusable_refresh.append(symbol)
+                if existing is not None and existing.get("sector_index"):
+                    by_sector.setdefault(existing["sector_index"], []).append(existing)
+                print(f"skip_write={symbol}:{reason}")
         except Exception as exc:  # noqa: BLE001
             errors.append(f"{symbol}: {exc}")
 
@@ -130,6 +145,9 @@ def main() -> None:
     print(f"usable_symbols={len(usable_symbols)}")
     print(f"partial_symbols={len(partial_symbols)}")
     print(f"unusable_symbols={len(unusable_symbols)}")
+    print(f"rejected_unusable_refresh={len(rejected_unusable_refresh)}")
+    print(f"preserved_existing_cache={len(preserved_existing_cache)}")
+    print(f"overwritten_symbols={len(overwritten_symbols)}")
     print(f"errors={len(errors)}")
     if errors:
         for item in errors:

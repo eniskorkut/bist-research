@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -220,6 +221,13 @@ def is_stale(updated_at: str | None, max_age_hours: int = 24) -> bool:
 
 
 def evaluate_snapshot_quality(snapshot: dict[str, Any]) -> tuple[str, list[str]]:
+    def _is_missing(value: Any) -> bool:
+        if value is None:
+            return True
+        if isinstance(value, float):
+            return math.isnan(value) or math.isinf(value)
+        return False
+
     errors: list[str] = []
     price = snapshot.get("price")
     market_cap = snapshot.get("market_cap")
@@ -228,13 +236,13 @@ def evaluate_snapshot_quality(snapshot: dict[str, Any]) -> tuple[str, list[str]]
     equity = snapshot.get("equity")
     estimated_net_income = snapshot.get("estimated_net_income")
 
-    if price is None and market_cap is None and shares_outstanding is None:
+    if _is_missing(price) and _is_missing(market_cap) and _is_missing(shares_outstanding):
         errors.append("price_marketcap_shares_all_missing")
-    if shares_outstanding is None and paid_in_capital is None:
+    if _is_missing(shares_outstanding) and _is_missing(paid_in_capital):
         errors.append("shares_or_paid_in_capital_missing")
-    if equity is None:
+    if _is_missing(equity):
         errors.append("equity_missing")
-    if estimated_net_income is None:
+    if _is_missing(estimated_net_income):
         errors.append("estimated_net_income_missing")
 
     if len(errors) == 0:
@@ -247,3 +255,27 @@ def evaluate_snapshot_quality(snapshot: dict[str, Any]) -> tuple[str, list[str]]
 def is_snapshot_usable(snapshot: dict[str, Any]) -> bool:
     status, _ = evaluate_snapshot_quality(snapshot)
     return status in {"usable", "partial"}
+
+
+def should_write_snapshot(new_snapshot: dict[str, Any], old_snapshot: dict[str, Any] | None) -> tuple[bool, str]:
+    priority = {"unusable": 0, "partial": 1, "usable": 2}
+
+    new_status = new_snapshot.get("data_quality_status")
+    if new_status not in priority:
+        new_status, _ = evaluate_snapshot_quality(new_snapshot)
+    old_status = "unusable"
+    if old_snapshot:
+        old_status = old_snapshot.get("data_quality_status") or evaluate_snapshot_quality(old_snapshot)[0]
+
+    if old_snapshot is None:
+        if new_status == "unusable":
+            return False, "new_snapshot_unusable_no_existing_cache"
+        return True, "new_snapshot_written_no_existing_cache"
+
+    if priority[new_status] < priority[old_status]:
+        return False, f"new_snapshot_{new_status}_worse_than_existing_{old_status}"
+
+    if old_status == "usable" and new_status == "partial":
+        return False, "new_snapshot_partial_worse_than_existing_usable"
+
+    return True, f"new_snapshot_{new_status}_written_over_existing_{old_status}"

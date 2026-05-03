@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+import math
 from pathlib import Path
 
 from valuation.cache import (
@@ -11,6 +12,7 @@ from valuation.cache import (
     is_snapshot_usable,
     is_stale,
     save_valuation_result,
+    should_write_snapshot,
     upsert_company_snapshot,
     upsert_sector_metrics,
 )
@@ -180,3 +182,53 @@ def test_snapshot_quality_partial_vs_usable() -> None:
     status_usable, _ = evaluate_snapshot_quality(usable)
     assert status_usable == "usable"
     assert is_snapshot_usable(usable) is True
+
+
+def test_snapshot_quality_treats_nan_as_missing() -> None:
+    snapshot = {
+        "price": math.nan,
+        "market_cap": math.nan,
+        "shares_outstanding": math.nan,
+        "paid_in_capital": None,
+        "equity": math.nan,
+        "estimated_net_income": math.nan,
+    }
+    status, errors = evaluate_snapshot_quality(snapshot)
+    assert status == "unusable"
+    assert "price_marketcap_shares_all_missing" in errors
+
+
+def test_should_write_snapshot_protects_usable_from_unusable() -> None:
+    old_snapshot = {
+        "data_quality_status": "usable",
+        "price": 10.0,
+        "market_cap": 100.0,
+        "shares_outstanding": 10.0,
+        "equity": 50.0,
+        "estimated_net_income": 5.0,
+    }
+    new_snapshot = {
+        "data_quality_status": "unusable",
+        "price": None,
+        "market_cap": None,
+        "shares_outstanding": None,
+        "equity": None,
+        "estimated_net_income": None,
+    }
+    should_write, reason = should_write_snapshot(new_snapshot, old_snapshot)
+    assert should_write is False
+    assert "worse_than_existing_usable" in reason
+
+
+def test_should_write_snapshot_writes_partial_over_unusable() -> None:
+    old_snapshot = {"data_quality_status": "unusable"}
+    new_snapshot = {
+        "data_quality_status": "partial",
+        "price": 10.0,
+        "market_cap": 100.0,
+        "shares_outstanding": 10.0,
+        "equity": None,
+        "estimated_net_income": None,
+    }
+    should_write, _ = should_write_snapshot(new_snapshot, old_snapshot)
+    assert should_write is True
