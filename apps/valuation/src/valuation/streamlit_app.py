@@ -21,7 +21,7 @@ from valuation.sector_analysis import (
     get_sector_index_for_symbol,
     get_sector_symbols,
 )
-from valuation.valuation_engine import run_valuation, run_valuation_from_snapshot
+from valuation.valuation_engine import run_valuation_from_snapshot
 
 DB_PATH = "/data/valuation_cache.sqlite"
 
@@ -152,9 +152,12 @@ if analyze:
         if not company_fresh:
             # Company stale/missing → refresh both company and sector
             try:
-                cached, sector_metrics, sector_index = _refresh_symbol_and_sector(symbol, DB_PATH)
-                company_fresh = cached is not None
-                sector_fresh = sector_metrics is not None
+                _refresh_symbol_and_sector(symbol, DB_PATH)
+                cached = get_company_snapshot(DB_PATH, symbol)
+                sector_index = cached.get("sector_index") if cached else sector_index
+                sector_metrics = get_sector_metrics(DB_PATH, sector_index) if sector_index else None
+                company_fresh = cached is not None and not is_stale(cached.get("updated_at"))
+                sector_fresh = sector_metrics is not None and not is_stale(sector_metrics.get("calculated_at"))
                 valuation_source = "borsapy_refresh"
             except Exception as exc:  # noqa: BLE001
                 st.error(f"Veri cekme hatasi: {exc}")
@@ -163,8 +166,11 @@ if analyze:
             # Company fresh, sector stale/missing → refresh sector only
             # (the helper will skip the fresh company snapshot automatically)
             try:
-                cached, sector_metrics, sector_index = _refresh_symbol_and_sector(symbol, DB_PATH)
-                sector_fresh = sector_metrics is not None
+                _refresh_symbol_and_sector(symbol, DB_PATH)
+                cached = get_company_snapshot(DB_PATH, symbol)
+                sector_index = cached.get("sector_index") if cached else sector_index
+                sector_metrics = get_sector_metrics(DB_PATH, sector_index) if sector_index else None
+                sector_fresh = sector_metrics is not None and not is_stale(sector_metrics.get("calculated_at"))
                 valuation_source = "cache"  # company came from cache
             except Exception as exc:  # noqa: BLE001
                 st.error(f"Sektor yenileme hatasi: {exc}")
@@ -174,11 +180,8 @@ if analyze:
             st.error("Sirket verisi bulunamadi.")
             st.stop()
 
-        # ---- run valuation ----
-        if valuation_source == "cache":
-            result = run_valuation_from_snapshot(cached, sector_metrics=sector_metrics, db_path=DB_PATH)
-        else:
-            result = run_valuation(symbol, sector_metrics=sector_metrics, db_path=DB_PATH)
+        # ---- run valuation (always from cache snapshot) ----
+        result = run_valuation_from_snapshot(cached, sector_metrics=sector_metrics, db_path=DB_PATH)
 
         sector_name = get_bist_sector_map().get(sector_index or "", "Bilinmiyor")
         sector_comparison = compare_company_to_sector(
