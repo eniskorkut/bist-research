@@ -27,3 +27,34 @@ services:
     stdin_open: true
     tty: true
     restart: unless-stopped
+
+  us-research:
+    build:
+      context: ./apps/us_research
+    container_name: us-research
+    env_file:
+      - path: ./.env
+        required: false
+    command:
+      - python
+      - scripts/test_openbb.py
+    restart: "no"
+
+  openbb-mcp:
+    build:
+      context: ./apps/openbb-mcp
+    container_name: openbb-mcp
+    env_file:
+      - path: ./.env
+        required: false
+    command:
+      - openbb-mcp
+      - --transport
+      - streamable-http
+      - --port
+      - "8001"
+      - --host
+      - 0.0.0.0
+    ports:
+      - "8001:8001"
+    restart: unless-stopped

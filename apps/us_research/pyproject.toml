@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "us-research"
+version = "0.1.0"
+description = "US market and SEC research utilities using OpenBB and edgartools."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "openbb>=4.0.0",
+    "openbb-yfinance",
+    "edgartools",
+    "pandas",
+    "python-dotenv",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
