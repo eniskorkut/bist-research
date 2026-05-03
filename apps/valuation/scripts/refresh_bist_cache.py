@@ -14,7 +14,7 @@ from valuation.cache import (
     upsert_sector_metrics,
 )
 from valuation.data_access import BorsapyFinancialClient
-from valuation.profit_estimator import estimate_net_income_auto
+from valuation.profit_estimator import estimate_net_income_from_snapshot
 from valuation.sector_analysis import (
     calculate_sector_metrics,
     get_bist_sector_map,
@@ -71,7 +71,7 @@ def main() -> None:
                 continue
 
             snapshot = client.load_snapshot(symbol)
-            estimation = estimate_net_income_auto(symbol, client=client)
+            estimation = estimate_net_income_from_snapshot(snapshot)
             estimated_net_income = estimation.estimated_net_income
             roe = (
                 (estimated_net_income / snapshot.equity)

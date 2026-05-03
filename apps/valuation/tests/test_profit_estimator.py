@@ -3,6 +3,7 @@ from __future__ import annotations
 from valuation.data_access import BistSnapshot
 from valuation.profit_estimator import (
     estimate_net_income_auto,
+    estimate_net_income_from_snapshot,
     estimate_net_income_revenue_margin,
     estimate_net_income_seasonal,
     estimate_net_income_ttm,
@@ -112,3 +113,34 @@ def test_auto_estimator_interim_uses_median() -> None:
     # ttm=11000, seasonal=11250, revenue_margin=11232 -> median=11232
     assert result.selected_method == "median_of_available_methods"
     assert result.estimated_net_income == 11232.0
+
+
+def test_estimate_from_snapshot_uses_single_snapshot() -> None:
+    snapshot = BistSnapshot(
+        symbol="THYAO",
+        price=100.0,
+        market_cap=100_000.0,
+        pe_ratio=8.0,
+        pb_ratio=1.8,
+        shares_outstanding=1_000.0,
+        paid_in_capital=1_000.0,
+        equity=50_000.0,
+        net_income_latest_period=6_000.0,
+        net_income_ttm=10_500.0,
+        revenue_latest_period=45_000.0,
+        previous_year_same_period_net_income=5_000.0,
+        previous_year_full_net_income=9_000.0,
+        previous_year_same_period_revenue=40_000.0,
+        previous_year_full_revenue=80_000.0,
+        average_margin_3y=0.11,
+        period_type="interim",
+        period_label="2025/06",
+        source="borsapy",
+        net_income_source="financial_statement",
+        equity_source="financial_statement",
+        revenue_source="financial_statement",
+        missing_fields=[],
+    )
+    result = estimate_net_income_from_snapshot(snapshot)
+    assert result.selected_method == "median_of_available_methods"
+    assert result.estimated_net_income is not None

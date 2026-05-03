@@ -10,6 +10,7 @@ from valuation.cache import (
     get_sector_metrics,
     init_db,
     is_snapshot_usable,
+    is_snapshot_valuation_ready,
     is_stale,
     save_valuation_result,
     should_write_snapshot,
@@ -232,3 +233,63 @@ def test_should_write_snapshot_writes_partial_over_unusable() -> None:
     }
     should_write, _ = should_write_snapshot(new_snapshot, old_snapshot)
     assert should_write is True
+
+
+def test_valuation_ready_false_when_estimated_income_missing() -> None:
+    ready, errors = is_snapshot_valuation_ready(
+        {
+            "price": 100.0,
+            "shares_outstanding": 1000.0,
+            "paid_in_capital": 1000.0,
+            "estimated_net_income": None,
+            "equity": 2000.0,
+            "pe_ratio": 5.0,
+            "pb_ratio": 1.0,
+        }
+    )
+    assert ready is False
+    assert "estimated_net_income_missing_or_nonpositive" in errors
+
+
+def test_should_write_snapshot_rejects_non_ready_partial_when_no_old() -> None:
+    new_snapshot = {
+        "data_quality_status": "partial",
+        "price": 100.0,
+        "shares_outstanding": 1000.0,
+        "paid_in_capital": 1000.0,
+        "estimated_net_income": None,
+        "equity": 2000.0,
+        "pe_ratio": 5.0,
+        "pb_ratio": 1.0,
+    }
+    should_write, reason = should_write_snapshot(new_snapshot, None)
+    assert should_write is False
+    assert reason == "new_snapshot_not_valuation_ready_no_existing_cache"
+
+
+def test_should_write_snapshot_rejects_non_ready_when_old_ready() -> None:
+    old_snapshot = {
+        "data_quality_status": "usable",
+        "price": 100.0,
+        "market_cap": 10000.0,
+        "shares_outstanding": 1000.0,
+        "paid_in_capital": 1000.0,
+        "estimated_net_income": 1200.0,
+        "equity": 5000.0,
+        "pe_ratio": 8.0,
+        "pb_ratio": 1.5,
+    }
+    new_snapshot = {
+        "data_quality_status": "partial",
+        "price": 100.0,
+        "market_cap": 10000.0,
+        "shares_outstanding": 1000.0,
+        "paid_in_capital": 1000.0,
+        "estimated_net_income": None,
+        "equity": 5000.0,
+        "pe_ratio": 8.0,
+        "pb_ratio": 1.5,
+    }
+    should_write, reason = should_write_snapshot(new_snapshot, old_snapshot)
+    assert should_write is False
+    assert reason == "new_snapshot_not_valuation_ready_preserved_existing"

@@ -224,9 +224,11 @@ def evaluate_snapshot_quality(snapshot: dict[str, Any]) -> tuple[str, list[str]]
     def _is_missing(value: Any) -> bool:
         if value is None:
             return True
-        if isinstance(value, float):
-            return math.isnan(value) or math.isinf(value)
-        return False
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return False
+        return math.isnan(numeric) or math.isinf(numeric)
 
     errors: list[str] = []
     price = snapshot.get("price")
@@ -257,6 +259,29 @@ def is_snapshot_usable(snapshot: dict[str, Any]) -> bool:
     return status in {"usable", "partial"}
 
 
+def is_snapshot_valuation_ready(snapshot: dict[str, Any]) -> tuple[bool, list[str]]:
+    def _pos(name: str) -> bool:
+        value = snapshot.get(name)
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return False
+        return not math.isnan(numeric) and not math.isinf(numeric) and numeric > 0
+
+    errors: list[str] = []
+    if not _pos("price"):
+        errors.append("price_missing_or_nonpositive")
+    if not (_pos("shares_outstanding") or _pos("paid_in_capital")):
+        errors.append("shares_and_paid_in_capital_missing_or_nonpositive")
+    if not _pos("estimated_net_income"):
+        errors.append("estimated_net_income_missing_or_nonpositive")
+    if not _pos("equity"):
+        errors.append("equity_missing_or_nonpositive")
+    if not (_pos("pe_ratio") or _pos("pb_ratio")):
+        errors.append("pe_and_pb_missing_or_nonpositive")
+    return len(errors) == 0, errors
+
+
 def should_write_snapshot(new_snapshot: dict[str, Any], old_snapshot: dict[str, Any] | None) -> tuple[bool, str]:
     priority = {"unusable": 0, "partial": 1, "usable": 2}
 
@@ -270,12 +295,23 @@ def should_write_snapshot(new_snapshot: dict[str, Any], old_snapshot: dict[str, 
     if old_snapshot is None:
         if new_status == "unusable":
             return False, "new_snapshot_unusable_no_existing_cache"
+        new_ready, _ = is_snapshot_valuation_ready(new_snapshot)
+        if not new_ready:
+            return False, "new_snapshot_not_valuation_ready_no_existing_cache"
         return True, "new_snapshot_written_no_existing_cache"
+
+    new_ready, _ = is_snapshot_valuation_ready(new_snapshot)
+    old_ready, _ = is_snapshot_valuation_ready(old_snapshot)
+    if old_ready and not new_ready:
+        return False, "new_snapshot_not_valuation_ready_preserved_existing"
 
     if priority[new_status] < priority[old_status]:
         return False, f"new_snapshot_{new_status}_worse_than_existing_{old_status}"
 
     if old_status == "usable" and new_status == "partial":
         return False, "new_snapshot_partial_worse_than_existing_usable"
+
+    if old_status == "partial" and not new_ready:
+        return False, "new_snapshot_not_valuation_ready_worse_than_existing_partial"
 
     return True, f"new_snapshot_{new_status}_written_over_existing_{old_status}"

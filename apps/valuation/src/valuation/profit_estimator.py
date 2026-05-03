@@ -105,3 +105,7 @@ def _auto_from_snapshot(snapshot: BistSnapshot) -> ProfitEstimationResult:
 def estimate_net_income_auto(symbol: str, client: BorsapyFinancialClient | None = None) -> ProfitEstimationResult:
     snapshot = (client or BorsapyFinancialClient()).load_snapshot(symbol)
     return _auto_from_snapshot(snapshot)
+
+
+def estimate_net_income_from_snapshot(snapshot: BistSnapshot) -> ProfitEstimationResult:
+    return _auto_from_snapshot(snapshot)

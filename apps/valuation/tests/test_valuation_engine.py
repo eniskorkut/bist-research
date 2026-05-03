@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from valuation.data_access import BistSnapshot
+import valuation.valuation_engine as engine
 from valuation.valuation_engine import run_valuation, run_valuation_from_snapshot
 
 
@@ -73,7 +74,7 @@ def test_paid_capital_course_formula() -> None:
     assert scenario.target_prices["odenmis_sermaye_final"] != 31888.0
 
 
-def test_historical_pe_none_uses_x10_final() -> None:
+def test_historical_pe_none_uses_sector_pe_fallback() -> None:
     cached = {
         "symbol": "ASELS",
         "price": 120.0,
@@ -92,8 +93,64 @@ def test_historical_pe_none_uses_x10_final() -> None:
         "net_income_source": "financial_statement",
         "equity_source": "financial_statement",
     }
-    result = run_valuation_from_snapshot(cached)
+    result = run_valuation_from_snapshot(
+        cached,
+        sector_metrics={"pe_median": 3.0},
+    )
     scenario = result.valuation_scenarios["year_end"]
     assert scenario.paid_capital_details["historical_pe_median"] is None
-    assert scenario.paid_capital_details["final_method"] == "x10_only"
-    assert scenario.target_prices["odenmis_sermaye_final"] == scenario.target_prices["odenmis_sermaye_x10"]
+    assert scenario.paid_capital_details["final_method"] == "average_x10_sector_pe"
+    assert scenario.paid_capital_details["final"] is not None
+    assert scenario.paid_capital_details["included_in_fair_value"] is True
+
+
+def test_historical_and_sector_none_uses_current_pe_only() -> None:
+    cached = {
+        "symbol": "ASELS",
+        "price": 120.0,
+        "market_cap": 240_000.0,
+        "shares_outstanding": 2_000.0,
+        "paid_in_capital": 2_000.0,
+        "pe_ratio": 3.0,
+        "pb_ratio": 2.4,
+        "equity": 100_000.0,
+        "estimated_net_income": 18_000.0,
+        "net_income_ttm": 18_000.0,
+        "period_type": "interim",
+        "financial_period": "2025/06",
+        "data_quality_status": "usable",
+        "missing_fields_json": [],
+        "net_income_source": "financial_statement",
+        "equity_source": "financial_statement",
+    }
+    result = run_valuation_from_snapshot(cached, sector_metrics={"pe_median": None})
+    scenario = result.valuation_scenarios["year_end"]
+    assert scenario.paid_capital_details["final_method"] == "current_pe_only"
+    assert scenario.paid_capital_details["final"] == scenario.paid_capital_details["current_pe_value"]
+
+
+def test_only_x10_available_is_info_only(monkeypatch) -> None:
+    monkeypatch.setattr(engine, "get_historical_pe_median", lambda symbol: None)
+    cached = {
+        "symbol": "ASELS",
+        "price": 120.0,
+        "market_cap": 240_000.0,
+        "shares_outstanding": 2_000.0,
+        "paid_in_capital": 2_000.0,
+        "pe_ratio": None,
+        "pb_ratio": 2.4,
+        "equity": 100_000.0,
+        "estimated_net_income": 18_000.0,
+        "net_income_ttm": 18_000.0,
+        "period_type": "interim",
+        "financial_period": "2025/06",
+        "data_quality_status": "usable",
+        "missing_fields_json": [],
+        "net_income_source": "financial_statement",
+        "equity_source": "financial_statement",
+    }
+    result = run_valuation_from_snapshot(cached, sector_metrics={"pe_median": None})
+    scenario = result.valuation_scenarios["year_end"]
+    assert scenario.paid_capital_details["x10"] is not None
+    assert scenario.paid_capital_details["final"] is None
+    assert scenario.paid_capital_details["included_in_fair_value"] is False

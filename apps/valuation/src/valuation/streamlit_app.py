@@ -7,6 +7,7 @@ import streamlit as st
 from valuation.cache import (
     evaluate_snapshot_quality,
     is_snapshot_usable,
+    is_snapshot_valuation_ready,
     get_company_snapshot,
     get_sector_metrics,
     init_db,
@@ -16,7 +17,7 @@ from valuation.cache import (
     upsert_sector_metrics,
 )
 from valuation.data_access import BorsapyFinancialClient
-from valuation.profit_estimator import estimate_net_income_auto
+from valuation.profit_estimator import estimate_net_income_from_snapshot
 from valuation.sector_analysis import (
     calculate_sector_metrics,
     compare_company_to_sector,
@@ -59,9 +60,13 @@ def _render_scenario_block(title: str, scenario) -> None:
     st.write(f"Kurs formulu (EPS x 10): `{_fmt(scenario.paid_capital_details.get('x10'))}`")
     st.write(f"Gecmis F/K medyan: `{_fmt(scenario.paid_capital_details.get('historical_pe_median'))}`")
     st.write(f"EPS x gecmis F/K: `{_fmt(scenario.paid_capital_details.get('historical_pe_value'))}`")
+    st.write(f"Sektor F/K medyan: `{_fmt(scenario.paid_capital_details.get('sector_pe_median'))}`")
+    st.write(f"EPS x sektor F/K: `{_fmt(scenario.paid_capital_details.get('sector_pe_value'))}`")
+    st.write(f"EPS x guncel F/K: `{_fmt(scenario.paid_capital_details.get('current_pe_value'))}`")
     st.write(f"Odenmis sermaye final: `{_fmt(scenario.paid_capital_details.get('final'))}`")
-    if scenario.paid_capital_details.get("historical_pe_median") is None:
-        st.warning("Gecmis F/K verisi hesaplanamadi. Final deger EPS x 10 olarak kullanildi.")
+    st.write(f"Final method: `{scenario.paid_capital_details.get('final_method')}`")
+    if scenario.paid_capital_details.get("final") is None:
+        st.warning("Carpan bulunamadigi icin EPS x 10 sadece bilgi amacli gosterildi.")
 
 
 def _refresh_symbol_and_sector(
@@ -106,7 +111,7 @@ def _refresh_symbol_and_sector(
 
         # Stale / missing / forced → fetch from borsapy
         snapshot = client.load_snapshot(sym)
-        estimation = estimate_net_income_auto(sym, client=client)
+        estimation = estimate_net_income_from_snapshot(snapshot)
         estimated_net_income = estimation.estimated_net_income
         roe = (estimated_net_income / snapshot.equity) if estimated_net_income is not None and snapshot.equity not in (None, 0) else None
         sector_index = get_sector_index_for_symbol(sym)
@@ -190,6 +195,7 @@ if refresh and symbol:
             )
         if refresh_meta["wrote_to_cache"] == 0 and refresh_meta["preserved_existing_cache"] == 0:
             st.warning("Cache yenilemede kullanilabilir veri yazilamadi.")
+        st.rerun()
     except Exception as exc:  # noqa: BLE001
         st.error(f"Cache yenileme hatasi: {exc}")
 
@@ -262,6 +268,14 @@ if analyze:
                     "updated_at": cached.get("updated_at"),
                 }
             )
+            st.stop()
+        valuation_ready, valuation_ready_errors = is_snapshot_valuation_ready(cached)
+        if not valuation_ready:
+            st.error("Bu cache kaydi degerleme icin yeterli degil.")
+            st.write("Eksik kritik alanlar:")
+            st.code("\n".join(valuation_ready_errors))
+            st.write(f"Son cache zamani: `{cached.get('updated_at')}`")
+            st.code(f"docker compose run --rm valuation-app python scripts/debug_borsapy_symbol.py {symbol}")
             st.stop()
 
         # ---- run valuation (always from cache snapshot) ----

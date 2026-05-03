@@ -7,7 +7,10 @@ from statistics import median
 from valuation.cache import evaluate_snapshot_quality, save_valuation_result
 from valuation.data_access import BorsapyFinancialClient
 from valuation.historical_multiples import get_historical_pe_median
-from valuation.profit_estimator import ProfitEstimationResult, estimate_net_income_auto
+from valuation.profit_estimator import (
+    ProfitEstimationResult,
+    estimate_net_income_from_snapshot,
+)
 from valuation.sector_analysis import compare_company_to_sector
 
 
@@ -84,6 +87,7 @@ def _build_scenario(
     pe: float | None,
     pb: float | None,
     historical_pe_median: float | None,
+    sector_pe_median: float | None,
 ) -> ScenarioValuation:
     eps = _safe_div(net_income, shares)
     paid_cap_eps = _safe_div(net_income, paid_in_capital)
@@ -97,8 +101,25 @@ def _build_scenario(
         if paid_cap_eps is not None and paid_cap_eps > 0 and (historical_pe_median or 0) > 0
         else None
     )
-    paid_cap_values = [x for x in [odenmis_sermaye_x10, odenmis_sermaye_historical_pe] if x is not None]
-    odenmis_sermaye_final = _mean(paid_cap_values) if paid_cap_values else None
+    odenmis_sermaye_sector_pe = (
+        paid_cap_eps * sector_pe_median
+        if paid_cap_eps is not None and paid_cap_eps > 0 and (sector_pe_median or 0) > 0
+        else None
+    )
+    odenmis_sermaye_current_pe = (
+        paid_cap_eps * pe if paid_cap_eps is not None and paid_cap_eps > 0 and (pe or 0) > 0 else None
+    )
+    odenmis_sermaye_final = None
+    paid_cap_method = "info_only_x10_no_multiplier"
+    if odenmis_sermaye_historical_pe is not None and odenmis_sermaye_x10 is not None:
+        odenmis_sermaye_final = _mean([odenmis_sermaye_x10, odenmis_sermaye_historical_pe])
+        paid_cap_method = "average_x10_historical_pe"
+    elif odenmis_sermaye_sector_pe is not None and odenmis_sermaye_x10 is not None:
+        odenmis_sermaye_final = _mean([odenmis_sermaye_x10, odenmis_sermaye_sector_pe])
+        paid_cap_method = "average_x10_sector_pe"
+    elif odenmis_sermaye_current_pe is not None:
+        odenmis_sermaye_final = odenmis_sermaye_current_pe
+        paid_cap_method = "current_pe_only"
 
     implied_caps = []
     if net_income is not None and net_income > 0 and (pe or 0) > 0:
@@ -118,13 +139,32 @@ def _build_scenario(
         "pd_dd": pd_dd,
         "odenmis_sermaye_x10": odenmis_sermaye_x10,
         "odenmis_sermaye_historical_pe": odenmis_sermaye_historical_pe,
+        "odenmis_sermaye_sector_pe": odenmis_sermaye_sector_pe,
+        "odenmis_sermaye_current_pe": odenmis_sermaye_current_pe,
         "odenmis_sermaye_final": odenmis_sermaye_final,
         "potansiyel_piyasa_degeri": potansiyel_piyasa_degeri,
         "ozsermaye_karliligi": ozsermaye_karliligi,
     }
-    included_methods = [k for k, v in target_prices.items() if v is not None and k != "odenmis_sermaye_x10"]
-    excluded_methods = [k for k, v in target_prices.items() if v is None or k == "odenmis_sermaye_x10"]
-    fair_values = [target_prices[k] for k in included_methods if target_prices[k] is not None]
+    fair_values: list[float] = []
+    included_methods: list[str] = []
+    excluded_methods: list[str] = []
+    for method, value in target_prices.items():
+        if value is None:
+            excluded_methods.append(method)
+            continue
+        if method in {"odenmis_sermaye_x10", "odenmis_sermaye_historical_pe", "odenmis_sermaye_sector_pe", "odenmis_sermaye_current_pe"}:
+            excluded_methods.append(method)
+            continue
+        if value <= 0:
+            excluded_methods.append(method)
+            continue
+        if price not in (None, 0):
+            if value > price * 5 or value < price * 0.2:
+                excluded_methods.append(method)
+                continue
+        included_methods.append(method)
+        fair_values.append(float(value))
+
     fair_value_median = median(fair_values) if fair_values else None
     fair_value_mean_filtered = _filtered_mean([float(v) for v in fair_values if v is not None])
     upside_potential_pct = (
@@ -148,8 +188,12 @@ def _build_scenario(
             "x10": odenmis_sermaye_x10,
             "historical_pe_median": historical_pe_median,
             "historical_pe_value": odenmis_sermaye_historical_pe,
+            "sector_pe_median": sector_pe_median,
+            "sector_pe_value": odenmis_sermaye_sector_pe,
+            "current_pe_value": odenmis_sermaye_current_pe,
             "final": odenmis_sermaye_final,
-            "final_method": "x10_only" if odenmis_sermaye_historical_pe is None and odenmis_sermaye_x10 is not None else "average_x10_historical_pe",
+            "final_method": paid_cap_method,
+            "included_in_fair_value": odenmis_sermaye_final is not None,
         },
     )
 
@@ -162,8 +206,9 @@ def run_valuation(
 ) -> ValuationResult:
     financial_client = client or BorsapyFinancialClient()
     snapshot = financial_client.load_snapshot(symbol)
-    estimation = estimate_net_income_auto(symbol=symbol, client=financial_client)
+    estimation = estimate_net_income_from_snapshot(snapshot)
     historical_pe_median = get_historical_pe_median(symbol)
+    sector_pe_median = (sector_metrics or {}).get("pe_median")
 
     ttm_scenario = _build_scenario(
         scenario_key="ttm",
@@ -177,6 +222,7 @@ def run_valuation(
         pe=snapshot.pe_ratio,
         pb=snapshot.pb_ratio,
         historical_pe_median=historical_pe_median,
+        sector_pe_median=sector_pe_median,
     )
     year_end_scenario = _build_scenario(
         scenario_key="year_end",
@@ -190,6 +236,7 @@ def run_valuation(
         pe=snapshot.pe_ratio,
         pb=snapshot.pb_ratio,
         historical_pe_median=historical_pe_median,
+        sector_pe_median=sector_pe_median,
     )
 
     estimated_roe = _safe_div(estimation.estimated_net_income, snapshot.equity) if (estimation.estimated_net_income or 0) > 0 and (snapshot.equity or 0) > 0 else None
@@ -263,6 +310,7 @@ def run_valuation_from_snapshot(
     symbol = snapshot["symbol"]
     quality_status, quality_errors = evaluate_snapshot_quality(snapshot)
     historical_pe_median = get_historical_pe_median(symbol)
+    sector_pe_median = (sector_metrics or {}).get("pe_median")
 
     estimation = ProfitEstimationResult(
         symbol=symbol,
@@ -286,6 +334,7 @@ def run_valuation_from_snapshot(
         pe=snapshot.get("pe_ratio"),
         pb=snapshot.get("pb_ratio"),
         historical_pe_median=historical_pe_median,
+        sector_pe_median=sector_pe_median,
     )
     year_end_scenario = _build_scenario(
         scenario_key="year_end",
@@ -299,6 +348,7 @@ def run_valuation_from_snapshot(
         pe=snapshot.get("pe_ratio"),
         pb=snapshot.get("pb_ratio"),
         historical_pe_median=historical_pe_median,
+        sector_pe_median=sector_pe_median,
     )
 
     estimated_roe = _safe_div(snapshot.get("estimated_net_income"), snapshot.get("equity")) if (snapshot.get("estimated_net_income") or 0) > 0 and (snapshot.get("equity") or 0) > 0 else None
