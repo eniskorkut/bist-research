@@ -173,7 +173,7 @@ def test_snapshot_quality_partial_vs_usable() -> None:
     }
     status_partial, _ = evaluate_snapshot_quality(partial)
     assert status_partial == "partial"
-    assert is_snapshot_usable(partial) is False
+    assert is_snapshot_usable(partial) is True
 
     usable = dict(partial)
     usable["estimated_net_income"] = 70.0

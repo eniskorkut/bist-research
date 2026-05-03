@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from valuation.data_access import _extract_first_number, _safe_mapping
+import pandas as pd
+
+from valuation.data_access import _extract_first_number, _extract_series_value, _normalize_label, _safe_mapping
 
 
 class _WithToDict:
@@ -28,3 +30,22 @@ def test_extract_aliases_new_keys() -> None:
     assert _extract_first_number(mapping, ["sharesoutstanding"]) == 100.0
     assert _extract_first_number(mapping, ["trailingpe"]) == 5.0
     assert _extract_first_number(mapping, ["pricetobook"]) == 1.2
+
+
+def test_normalize_label_turkish_and_punctuation() -> None:
+    assert _normalize_label("Özkaynaklar (Ana-Ortaklık)/Toplam") == "ozkaynaklar ana ortaklik toplam"
+
+
+def test_extract_series_value_contains_and_transpose() -> None:
+    df = pd.DataFrame(
+        {"2025": [1000.0], "2024": [900.0]},
+        index=["Ana Ortaklığa Ait Özkaynaklar"],
+    )
+    val, _, src = _extract_series_value(df, ["ana ortakliga ait ozkaynaklar"])
+    assert val == 1000.0
+    assert src == "financial_statement"
+
+    df_t = df.T
+    val_t, _, src_t = _extract_series_value(df_t, ["ana ortakliga ait ozkaynaklar"])
+    assert val_t == 1000.0
+    assert src_t in {"financial_statement", "transposed_financial_statement"}

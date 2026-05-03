@@ -29,6 +29,9 @@ class ValuationResult:
     estimation: ProfitEstimationResult
     sector_comparison: dict[str, float | str | list[str] | None]
     source: str
+    net_income_source: str
+    equity_source: str
+    data_quality_status: str
     missing_fields: list[str]
 
 
@@ -150,6 +153,9 @@ def run_valuation(
         estimation=estimation,
         sector_comparison=sector_comparison,
         source=snapshot.source,
+        net_income_source=snapshot.net_income_source,
+        equity_source=snapshot.equity_source,
+        data_quality_status="usable",
         missing_fields=missing,
     )
     if db_path and quality_status != "unusable":
@@ -310,6 +316,9 @@ def run_valuation_from_snapshot(
         estimation=estimation,
         sector_comparison=sector_comparison,
         source="cache",
+        net_income_source=snapshot.get("net_income_source", "unknown"),
+        equity_source=snapshot.get("equity_source", "unknown"),
+        data_quality_status=quality_status or "unknown",
         missing_fields=missing,
     )
     if db_path:

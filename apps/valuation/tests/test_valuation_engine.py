@@ -33,6 +33,9 @@ def _make_snapshot() -> BistSnapshot:
         period_type="interim",
         period_label="2025/06",
         source="borsapy",
+        net_income_source="financial_statement",
+        equity_source="financial_statement",
+        revenue_source="financial_statement",
         missing_fields=[],
     )
 
@@ -145,3 +148,22 @@ def test_run_valuation_from_refresh_snapshot() -> None:
     assert result.symbol == "ASELS"
     assert result.source == "cache"
     assert result.target_prices["cari_fk"] == 108.0
+
+
+def test_run_valuation_from_snapshot_implied_values() -> None:
+    cached_snapshot = {
+        "symbol": "THYAO",
+        "price": 308.25,
+        "market_cap": 425_385_000_000.0,
+        "shares_outstanding": 1_380_000_000.0,
+        "paid_in_capital": 1_380_000_000.0,
+        "pe_ratio": 3.0,
+        "pb_ratio": 0.4,
+        "estimated_net_income": 141_795_000_000.0,
+        "equity": 1_063_462_500_000.0,
+        "missing_fields_json": [],
+        "data_quality_status": "partial",
+    }
+    result = run_valuation_from_snapshot(cached_snapshot)
+    assert round(result.estimated_net_income, 2) == 141_795_000_000.0
+    assert round(result.equity, 2) == 1_063_462_500_000.0

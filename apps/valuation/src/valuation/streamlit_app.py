@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 import streamlit as st
 
 from valuation.cache import (
+    evaluate_snapshot_quality,
     is_snapshot_usable,
     get_company_snapshot,
     get_sector_metrics,
@@ -92,9 +93,15 @@ def _refresh_symbol_and_sector(
             "financial_period": snapshot.period_label,
             "period_type": snapshot.period_type,
             "source": "borsapy",
+            "net_income_source": snapshot.net_income_source,
+            "equity_source": snapshot.equity_source,
+            "revenue_source": snapshot.revenue_source,
             "missing_fields_json": sorted(set(snapshot.missing_fields + estimation.missing_fields)),
             "updated_at": datetime.now(UTC).isoformat(),
         }
+        quality_status, quality_errors = evaluate_snapshot_quality(payload)
+        payload["data_quality_status"] = quality_status
+        payload["data_quality_errors_json"] = quality_errors
         upsert_company_snapshot(db_path, payload)
         if sector_index == target_sector:
             snapshots.append(payload)
@@ -224,6 +231,9 @@ if analyze:
         col5.metric("F/K", _fmt(result.pe_ratio))
         col6.metric("PD/DD", _fmt(result.pb_ratio))
         col7.metric("Ozkaynak", _fmt(result.equity))
+        st.write(f"Net kar kaynagi: `{cached.get('net_income_source', 'unknown')}`")
+        st.write(f"Ozkaynak kaynagi: `{cached.get('equity_source', 'unknown')}`")
+        st.write(f"Veri kalite durumu: `{cached.get('data_quality_status', 'unknown')}`")
 
         st.header("Tahmini Net Kar")
         st.write(f"Secilen yontem: `{result.estimation.selected_method}`")
@@ -231,6 +241,10 @@ if analyze:
         st.write(f"Sezonsallik tahmin: `{_fmt(result.estimation.method_values.get('seasonal'))}`")
         st.write(f"Ciro x marj tahmin: `{_fmt(result.estimation.method_values.get('revenue_margin'))}`")
         st.write(f"Nihai tahmini net kar: `{_fmt(result.estimated_net_income)}`")
+        if cached.get("net_income_source") == "implied_from_pe":
+            st.warning("Tahmini net kar F/K ve piyasa degeri uzerinden turetildi.")
+        if cached.get("equity_source") == "implied_from_pb":
+            st.warning("Ozkaynak PD/DD ve piyasa degeri uzerinden turetildi.")
         if result.missing_fields:
             st.warning("Eksik veri alanlari: " + ", ".join(sorted(set(result.missing_fields))))
 

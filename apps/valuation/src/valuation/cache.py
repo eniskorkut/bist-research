@@ -37,6 +37,9 @@ def init_db(db_path: str) -> None:
                 financial_period TEXT,
                 period_type TEXT,
                 source TEXT,
+                net_income_source TEXT,
+                equity_source TEXT,
+                revenue_source TEXT,
                 missing_fields_json TEXT,
                 data_quality_status TEXT,
                 data_quality_errors_json TEXT,
@@ -73,6 +76,9 @@ def init_db(db_path: str) -> None:
         for sql in [
             "ALTER TABLE company_snapshot ADD COLUMN data_quality_status TEXT",
             "ALTER TABLE company_snapshot ADD COLUMN data_quality_errors_json TEXT",
+            "ALTER TABLE company_snapshot ADD COLUMN net_income_source TEXT",
+            "ALTER TABLE company_snapshot ADD COLUMN equity_source TEXT",
+            "ALTER TABLE company_snapshot ADD COLUMN revenue_source TEXT",
         ]:
             try:
                 conn.execute(sql)
@@ -86,6 +92,9 @@ def upsert_company_snapshot(db_path: str, snapshot: dict[str, Any]) -> None:
     payload["missing_fields_json"] = json.dumps(payload.get("missing_fields_json", []))
     payload["data_quality_errors_json"] = json.dumps(payload.get("data_quality_errors_json", []))
     payload.setdefault("data_quality_status", "partial")
+    payload.setdefault("net_income_source", "unknown")
+    payload.setdefault("equity_source", "unknown")
+    payload.setdefault("revenue_source", "unknown")
     with _connect(db_path) as conn:
         conn.execute(
             """
@@ -93,11 +102,13 @@ def upsert_company_snapshot(db_path: str, snapshot: dict[str, Any]) -> None:
                 symbol, market, sector_index, sector_name, price, market_cap, shares_outstanding,
                 paid_in_capital, pe_ratio, pb_ratio, roe, equity, net_income_latest_period,
                 net_income_ttm, estimated_net_income, financial_period, period_type, source,
+                net_income_source, equity_source, revenue_source,
                 missing_fields_json, data_quality_status, data_quality_errors_json, updated_at
             ) VALUES (
                 :symbol, :market, :sector_index, :sector_name, :price, :market_cap, :shares_outstanding,
                 :paid_in_capital, :pe_ratio, :pb_ratio, :roe, :equity, :net_income_latest_period,
                 :net_income_ttm, :estimated_net_income, :financial_period, :period_type, :source,
+                :net_income_source, :equity_source, :revenue_source,
                 :missing_fields_json, :data_quality_status, :data_quality_errors_json, :updated_at
             )
             ON CONFLICT(symbol) DO UPDATE SET
@@ -118,6 +129,9 @@ def upsert_company_snapshot(db_path: str, snapshot: dict[str, Any]) -> None:
                 financial_period=excluded.financial_period,
                 period_type=excluded.period_type,
                 source=excluded.source,
+                net_income_source=excluded.net_income_source,
+                equity_source=excluded.equity_source,
+                revenue_source=excluded.revenue_source,
                 missing_fields_json=excluded.missing_fields_json,
                 data_quality_status=excluded.data_quality_status,
                 data_quality_errors_json=excluded.data_quality_errors_json,
@@ -232,4 +246,4 @@ def evaluate_snapshot_quality(snapshot: dict[str, Any]) -> tuple[str, list[str]]
 
 def is_snapshot_usable(snapshot: dict[str, Any]) -> bool:
     status, _ = evaluate_snapshot_quality(snapshot)
-    return status == "usable"
+    return status in {"usable", "partial"}

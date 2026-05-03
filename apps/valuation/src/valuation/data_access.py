@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 from typing import Any
 
 import borsapy as bp
@@ -21,11 +22,21 @@ def _to_float(value: Any) -> float | None:
     return val
 
 
+def _normalize_label(label: str) -> str:
+    text = str(label).lower().strip()
+    tr_map = str.maketrans({"ç": "c", "ğ": "g", "ı": "i", "ö": "o", "ş": "s", "ü": "u"})
+    text = text.translate(tr_map)
+    text = re.sub(r"[\/\-\_\.\(\)\[\]\:]+", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
 def _extract_first_number(mapping: dict[str, Any], aliases: list[str]) -> float | None:
-    lowered = {str(k).strip().lower(): v for k, v in mapping.items()}
+    lowered = {_normalize_label(str(k)): v for k, v in mapping.items()}
     for alias in aliases:
-        if alias in lowered:
-            parsed = _to_float(lowered[alias])
+        normalized_alias = _normalize_label(alias)
+        if normalized_alias in lowered:
+            parsed = _to_float(lowered[normalized_alias])
             if parsed is not None:
                 return parsed
     return None
@@ -62,26 +73,66 @@ def _safe_mapping(obj: Any) -> dict[str, Any]:
     return result
 
 
-def _extract_series_value(df: pd.DataFrame, aliases: list[str]) -> float | None:
+def _pick_latest_column(df: pd.DataFrame) -> Any:
     if df is None or df.empty:
         return None
-    normalized_aliases = {item.lower() for item in aliases}
-    index_lookup = {str(idx).strip().lower(): idx for idx in df.index}
-    for alias in normalized_aliases:
-        key = index_lookup.get(alias)
-        if key is None:
-            continue
-        row = df.loc[key]
-        if isinstance(row, pd.Series):
-            for value in row.tolist():
-                parsed = _to_float(value)
-                if parsed is not None:
-                    return parsed
-        else:
-            parsed = _to_float(row)
-            if parsed is not None:
-                return parsed
+    def _score(col: Any) -> tuple[int, str]:
+        text = _normalize_label(str(col))
+        nums = re.findall(r"\d{4}", text)
+        year = int(nums[0]) if nums else -1
+        return (year, text)
+    cols = list(df.columns)
+    return sorted(cols, key=_score, reverse=True)[0] if cols else None
+
+
+def _extract_from_series(series: pd.Series) -> float | None:
+    if series is None:
+        return None
+    for value in series.tolist():
+        parsed = _to_float(value)
+        if parsed is not None:
+            return parsed
     return None
+
+
+def _extract_series_value(df: pd.DataFrame, aliases: list[str]) -> tuple[float | None, str | None, str | None]:
+    if df is None or df.empty:
+        return None, None, None
+    alias_norm = [_normalize_label(item) for item in aliases]
+
+    def _search(frame: pd.DataFrame, source: str) -> tuple[float | None, str | None, str | None]:
+        index_map = {_normalize_label(str(idx)): idx for idx in frame.index}
+        # exact
+        for alias in alias_norm:
+            key = index_map.get(alias)
+            if key is not None:
+                col = _pick_latest_column(frame)
+                row = frame.loc[key]
+                value = _extract_from_series(row if isinstance(row, pd.Series) else pd.Series([row]))
+                if value is not None:
+                    return value, str(key), source
+        # contains / token overlap
+        for idx in frame.index:
+            idx_norm = _normalize_label(str(idx))
+            for alias in alias_norm:
+                if alias in idx_norm or idx_norm in alias:
+                    row = frame.loc[idx]
+                    value = _extract_from_series(row if isinstance(row, pd.Series) else pd.Series([row]))
+                    if value is not None:
+                        return value, str(idx), source
+                alias_tokens = set(alias.split())
+                idx_tokens = set(idx_norm.split())
+                if alias_tokens and len(alias_tokens.intersection(idx_tokens)) >= max(1, len(alias_tokens) - 1):
+                    row = frame.loc[idx]
+                    value = _extract_from_series(row if isinstance(row, pd.Series) else pd.Series([row]))
+                    if value is not None:
+                        return value, str(idx), source
+        return None, None, None
+
+    value, label, src = _search(df, "financial_statement")
+    if value is not None:
+        return value, label, src
+    return _search(df.T, "transposed_financial_statement")
 
 
 @dataclass
@@ -105,6 +156,9 @@ class BistSnapshot:
     period_type: str
     period_label: str
     source: str
+    net_income_source: str
+    equity_source: str
+    revenue_source: str
     missing_fields: list[str]
 
 
@@ -132,27 +186,63 @@ class BorsapyFinancialClient:
             ["sharesoutstanding", "shares_outstanding", "shares", "numberofshares", "hisse_sayisi"],
         )
 
-        paid_in_capital = _extract_series_value(
+        paid_in_capital, _, _ = _extract_series_value(
             balance,
             ["paid in capital", "odenmis sermaye", "ödenmiş sermaye", "share capital"],
         )
-        equity = _extract_series_value(
+        equity, _, equity_source = _extract_series_value(
             balance,
-            ["total stockholder equity", "equity", "ozkaynak", "özkaynak", "total equity"],
+            [
+                "total stockholder equity",
+                "equity",
+                "total equity",
+                "ozkaynak",
+                "ozkaynaklar",
+                "ana ortakliga ait ozkaynaklar",
+                "toplam ozkaynaklar",
+            ],
         )
 
-        net_income_latest = _extract_series_value(
+        net_income_latest, _, net_income_source = _extract_series_value(
             income,
-            ["net income", "netincome", "net period profit", "donem net kari", "dönem net karı"],
+            [
+                "net income",
+                "netincome",
+                "net period profit",
+                "donem net kari",
+                "net donem kari",
+                "donem kari zarari",
+                "net donem kari zarari",
+                "ana ortaklik paylari",
+                "ana ortakliga ait net donem kari",
+                "surdurulen faaliyetler donem kari",
+            ],
         )
-        revenue_latest = _extract_series_value(
+        revenue_latest, _, revenue_source = _extract_series_value(
             income,
-            ["total revenue", "revenue", "sales", "hasilat", "satislar", "satışlar"],
+            [
+                "total revenue",
+                "revenue",
+                "sales",
+                "hasilat",
+                "satislar",
+                "net satislar",
+                "satis gelirleri",
+            ],
         )
 
-        net_income_ttm = _extract_series_value(
+        net_income_ttm, _, _ = _extract_series_value(
             ttm_income if isinstance(ttm_income, pd.DataFrame) else pd.DataFrame(),
-            ["net income", "netincome", "net period profit", "donem net kari", "dönem net karı"],
+            [
+                "net income",
+                "netincome",
+                "net period profit",
+                "donem net kari",
+                "net donem kari",
+                "donem kari zarari",
+                "net donem kari zarari",
+                "ana ortaklik paylari",
+            ],
         )
 
         if isinstance(income, pd.DataFrame) and income.shape[1] >= 2:
@@ -160,34 +250,34 @@ class BorsapyFinancialClient:
             prev_year_col = income.columns[min(1, income.shape[1] - 1)]
             prev3_col = income.columns[min(2, income.shape[1] - 1)]
             prev4_col = income.columns[min(3, income.shape[1] - 1)] if income.shape[1] >= 4 else None
-            previous_year_same_period_net_income = _extract_series_value(
+            previous_year_same_period_net_income, _, _ = _extract_series_value(
                 income[[prev_year_col]],
-                ["net income", "netincome", "net period profit", "donem net kari", "dönem net karı"],
+                ["net income", "netincome", "net period profit", "donem net kari", "ana ortaklik paylari"],
             )
-            previous_year_same_period_revenue = _extract_series_value(
+            previous_year_same_period_revenue, _, _ = _extract_series_value(
                 income[[prev_year_col]],
-                ["total revenue", "revenue", "sales", "hasilat", "satislar", "satışlar"],
+                ["total revenue", "revenue", "sales", "hasilat", "satislar", "satis gelirleri"],
             )
-            previous_year_full_net_income = _extract_series_value(
+            previous_year_full_net_income, _, _ = _extract_series_value(
                 income[[prev3_col]],
-                ["net income", "netincome", "net period profit", "donem net kari", "dönem net karı"],
+                ["net income", "netincome", "net period profit", "donem net kari", "ana ortaklik paylari"],
             )
-            previous_year_full_revenue = _extract_series_value(
+            previous_year_full_revenue, _, _ = _extract_series_value(
                 income[[prev3_col]],
-                ["total revenue", "revenue", "sales", "hasilat", "satislar", "satışlar"],
+                ["total revenue", "revenue", "sales", "hasilat", "satislar", "satis gelirleri"],
             )
             margin_samples: list[float] = []
             cols_for_margin = [latest_col, prev_year_col, prev3_col]
             if prev4_col is not None:
                 cols_for_margin.append(prev4_col)
             for col in cols_for_margin:
-                n = _extract_series_value(
+                n, _, _ = _extract_series_value(
                     income[[col]],
-                    ["net income", "netincome", "net period profit", "donem net kari", "dönem net karı"],
+                    ["net income", "netincome", "net period profit", "donem net kari", "ana ortaklik paylari"],
                 )
-                r = _extract_series_value(
+                r, _, _ = _extract_series_value(
                     income[[col]],
-                    ["total revenue", "revenue", "sales", "hasilat", "satislar", "satışlar"],
+                    ["total revenue", "revenue", "sales", "hasilat", "satislar", "satis gelirleri"],
                 )
                 if n is not None and r and r != 0:
                     margin_samples.append(n / r)
@@ -216,6 +306,23 @@ class BorsapyFinancialClient:
             if value is None:
                 missing.append(key)
 
+        if (net_income_ttm is None or net_income_latest is None) and (market_cap or 0) > 0 and (pe_ratio or 0) > 0:
+            implied_net_income = market_cap / pe_ratio
+            net_income_ttm = net_income_ttm or implied_net_income
+            net_income_latest = net_income_latest or implied_net_income
+            net_income_source = "implied_from_pe"
+
+        if equity is None and (market_cap or 0) > 0 and (pb_ratio or 0) > 0:
+            equity = market_cap / pb_ratio
+            equity_source = "implied_from_pb"
+
+        if revenue_source is None:
+            revenue_source = "unknown"
+        if net_income_source is None:
+            net_income_source = "financial_statement" if net_income_latest is not None else "unknown"
+        if equity_source is None:
+            equity_source = "financial_statement" if equity is not None else "unknown"
+
         return BistSnapshot(
             symbol=normalized_symbol,
             price=price,
@@ -236,5 +343,8 @@ class BorsapyFinancialClient:
             period_type=period_type,
             period_label=period_label,
             source="borsapy",
+            net_income_source=net_income_source,
+            equity_source=equity_source,
+            revenue_source=revenue_source,
             missing_fields=missing,
         )

@@ -95,6 +95,9 @@ def main() -> None:
                 "financial_period": snapshot.period_label,
                 "period_type": snapshot.period_type,
                 "source": "borsapy",
+                "net_income_source": snapshot.net_income_source,
+                "equity_source": snapshot.equity_source,
+                "revenue_source": snapshot.revenue_source,
                 "missing_fields_json": sorted(set(snapshot.missing_fields + estimation.missing_fields)),
             }
             quality_status, quality_errors = evaluate_snapshot_quality(payload)

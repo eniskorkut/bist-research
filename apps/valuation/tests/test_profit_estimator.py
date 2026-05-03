@@ -39,6 +39,9 @@ def test_individual_estimators() -> None:
         period_type="interim",
         period_label="2025/06",
         source="borsapy",
+        net_income_source="financial_statement",
+        equity_source="financial_statement",
+        revenue_source="financial_statement",
         missing_fields=[],
     )
     client = FakeClient(snapshot)
@@ -69,6 +72,9 @@ def test_auto_estimator_annual_uses_reported() -> None:
         period_type="annual",
         period_label="2024/12",
         source="borsapy",
+        net_income_source="financial_statement",
+        equity_source="financial_statement",
+        revenue_source="financial_statement",
         missing_fields=[],
     )
     result = estimate_net_income_auto("ASELS", client=FakeClient(snapshot))
@@ -97,6 +103,9 @@ def test_auto_estimator_interim_uses_median() -> None:
         period_type="interim",
         period_label="2025/06",
         source="borsapy",
+        net_income_source="financial_statement",
+        equity_source="financial_statement",
+        revenue_source="financial_statement",
         missing_fields=[],
     )
     result = estimate_net_income_auto("TUPRS", client=FakeClient(snapshot))
