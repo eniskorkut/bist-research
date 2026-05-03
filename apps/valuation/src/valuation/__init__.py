@@ -1,0 +1,2 @@
+"""Automatic BIST valuation module."""
+

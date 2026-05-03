@@ -8,6 +8,7 @@ Iki parcali BIST arastirma ortami + US research modulu.
 - `borsa-mcp`: Codex/LLM tarafina MCP finansal veri tool server saglar.
 - `apps/us_research`: ABD hisseleri icin OpenBB + edgartools arastirma modulu.
 - `openbb-mcp`: OpenBB endpointlerini MCP server olarak sunar.
+- `apps/valuation`: BIST hisseleri icin otomatik 5 yontemli degerleme modulu (Streamlit).
 - Telegram yok. Al-sat yok. Sadece arastirma, veri izleme ve analiz.
 
 ## borsapy-alert
@@ -50,6 +51,7 @@ python scripts/run_volume_alert.py --index XU030 --dry-run --check-interval 5
 borsa-mcp
 python scripts/test_openbb.py
 openbb-mcp --transport streamable-http --port 8001 --host 0.0.0.0
+streamlit run src/valuation/streamlit_app.py --server.port 8502
 ```
 
 `alerts.csv` host dosyasi olarak `./borsapy-alert/alerts.csv` konumuna baglidir.
@@ -97,6 +99,13 @@ OpenBB MCP test:
 ```shell
 docker compose build openbb-mcp
 docker compose up openbb-mcp
+```
+
+Valuation app test:
+
+```shell
+docker compose build valuation-app
+docker compose up valuation-app
 ```
 
 ## Codex/MCP Kullanimi

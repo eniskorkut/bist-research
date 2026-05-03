@@ -58,3 +58,17 @@ services:
     ports:
       - "8001:8001"
     restart: unless-stopped
+
+  valuation-app:
+    build:
+      context: ./apps/valuation
+    container_name: valuation-app
+    command:
+      - streamlit
+      - run
+      - src/valuation/streamlit_app.py
+      - --server.address=0.0.0.0
+      - --server.port=8502
+    ports:
+      - "8502:8502"
+    restart: unless-stopped
