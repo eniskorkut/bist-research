@@ -4,7 +4,7 @@ import argparse
 
 import borsapy as bp
 
-from valuation.cache import init_db, is_stale, upsert_company_snapshot, upsert_sector_metrics
+from valuation.cache import get_company_snapshot, init_db, is_stale, upsert_company_snapshot, upsert_sector_metrics
 from valuation.data_access import BorsapyFinancialClient
 from valuation.profit_estimator import estimate_net_income_auto
 from valuation.sector_analysis import (
@@ -36,9 +36,20 @@ def main() -> None:
     errors: list[str] = []
     by_sector: dict[str, list[dict]] = {}
     sector_name_map = get_bist_sector_map()
+    refreshed_symbols: list[str] = []
+    skipped_fresh_symbols: list[str] = []
 
     for symbol in symbols:
         try:
+            # Check cache freshness before calling borsapy
+            existing = get_company_snapshot(args.db_path, symbol)
+            if existing is not None and not is_stale(existing.get("updated_at")) and not args.force:
+                skipped_fresh_symbols.append(symbol)
+                sector_index = existing.get("sector_index")
+                if sector_index:
+                    by_sector.setdefault(sector_index, []).append(existing)
+                continue
+
             snapshot = client.load_snapshot(symbol)
             estimation = estimate_net_income_auto(symbol, client=client)
             estimated_net_income = estimation.estimated_net_income
@@ -71,6 +82,7 @@ def main() -> None:
                 "missing_fields_json": sorted(set(snapshot.missing_fields + estimation.missing_fields)),
             }
             upsert_company_snapshot(args.db_path, payload)
+            refreshed_symbols.append(symbol)
             if sector_index:
                 by_sector.setdefault(sector_index, []).append(payload)
         except Exception as exc:  # noqa: BLE001
@@ -85,10 +97,14 @@ def main() -> None:
         sector_count += 1
 
     print(f"processed_symbols={len(symbols)}")
+    print(f"refreshed_symbols={len(refreshed_symbols)}")
+    print(f"skipped_fresh_symbols={len(skipped_fresh_symbols)}")
     print(f"errors={len(errors)}")
     if errors:
         for item in errors:
             print(f"warning={item}")
+    if skipped_fresh_symbols:
+        print(f"skipped_list={','.join(skipped_fresh_symbols)}")
     print(f"sector_metrics_computed={sector_count}")
     print(f"db_path={args.db_path}")
 

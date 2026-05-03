@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from valuation.cache import (
@@ -78,3 +79,67 @@ def test_cache_roundtrip(tmp_path: Path) -> None:
         },
     )
     assert is_stale(None) is True
+
+
+def test_is_stale_none() -> None:
+    assert is_stale(None) is True
+
+
+def test_is_stale_invalid_string() -> None:
+    assert is_stale("not-a-date") is True
+
+
+def test_is_stale_fresh() -> None:
+    recent = datetime.now(UTC).isoformat()
+    assert is_stale(recent) is False
+
+
+def test_is_stale_25_hours_ago() -> None:
+    old = (datetime.now(UTC) - timedelta(hours=25)).isoformat()
+    assert is_stale(old) is True
+
+
+def test_is_stale_23_hours_ago() -> None:
+    recent = (datetime.now(UTC) - timedelta(hours=23)).isoformat()
+    assert is_stale(recent) is False
+
+
+def test_is_stale_custom_max_age() -> None:
+    ts = (datetime.now(UTC) - timedelta(hours=5)).isoformat()
+    assert is_stale(ts, max_age_hours=4) is True
+    assert is_stale(ts, max_age_hours=6) is False
+
+
+def test_fresh_snapshot_skipped_on_upsert(tmp_path: Path) -> None:
+    """Simulate refresh_bist_cache skip logic: fresh snapshots should be
+    detected via is_stale and not re-fetched."""
+    db = str(tmp_path / "cache.sqlite")
+    init_db(db)
+    upsert_company_snapshot(
+        db,
+        {
+            "symbol": "GARAN",
+            "market": "BIST",
+            "sector_index": "XBANK",
+            "sector_name": "Banka",
+            "price": 150.0,
+            "market_cap": 200_000.0,
+            "shares_outstanding": 1_000.0,
+            "paid_in_capital": 1_000.0,
+            "pe_ratio": 5.0,
+            "pb_ratio": 1.2,
+            "roe": 0.20,
+            "equity": 160_000.0,
+            "net_income_latest_period": 10_000.0,
+            "net_income_ttm": 12_000.0,
+            "estimated_net_income": 11_000.0,
+            "financial_period": "2025/06",
+            "period_type": "interim",
+            "source": "borsapy",
+            "missing_fields_json": [],
+            "updated_at": datetime.now(UTC).isoformat(),
+        },
+    )
+    existing = get_company_snapshot(db, "GARAN")
+    assert existing is not None
+    assert not is_stale(existing["updated_at"])  # should be fresh

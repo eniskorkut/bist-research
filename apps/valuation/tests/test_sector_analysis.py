@@ -12,9 +12,30 @@ def test_calculate_sector_metrics() -> None:
     metrics = calculate_sector_metrics(snapshots)
     assert metrics["pe_median"] == 9.0
     assert metrics["pb_median"] == 1.35
-    assert round(metrics["pe_aggregate"], 4) == 11.1111
+    # pe_aggregate: only companies 1&2 (net_income>0 AND market_cap>0)
+    # (100+80)/(10+8) = 10.0
+    assert metrics["pe_aggregate"] == 10.0
+    # pb_aggregate: all three have equity>0 AND market_cap>0
+    # (100+80+20)/(50+40+10) = 2.0
     assert metrics["pb_aggregate"] == 2.0
-    assert metrics["roe_aggregate"] == 0.18
+    # roe_aggregate: all three have equity>0
+    # (10+8+(-2))/(50+40+10) = 0.16
+    assert metrics["roe_aggregate"] == 0.16
+
+
+def test_calculate_sector_metrics_same_valid_set() -> None:
+    """Verify numerator and denominator use the same valid company set."""
+    snapshots = [
+        {"pe_ratio": 5.0, "pb_ratio": 1.0, "market_cap": 200.0, "estimated_net_income": 20.0, "equity": 100.0},
+        {"pe_ratio": 3.0, "pb_ratio": 0.5, "market_cap": 0.0, "estimated_net_income": 10.0, "equity": 50.0},
+    ]
+    metrics = calculate_sector_metrics(snapshots)
+    # pe_aggregate: company 2 has market_cap=0 → excluded
+    assert metrics["pe_aggregate"] == 200.0 / 20.0
+    # pb_aggregate: company 2 has market_cap=0 → excluded
+    assert metrics["pb_aggregate"] == 200.0 / 100.0
+    # roe_aggregate: both have equity>0
+    assert metrics["roe_aggregate"] == (20.0 + 10.0) / (100.0 + 50.0)
 
 
 def test_compare_company_to_sector() -> None:

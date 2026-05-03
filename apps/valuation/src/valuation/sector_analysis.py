@@ -46,18 +46,29 @@ def calculate_sector_metrics(company_snapshots: list[dict[str, Any]]) -> dict[st
     pe_values = [s.get("pe_ratio") for s in company_snapshots if isinstance(s.get("pe_ratio"), (int, float)) and s.get("pe_ratio") > 0]
     pb_values = [s.get("pb_ratio") for s in company_snapshots if isinstance(s.get("pb_ratio"), (int, float)) and s.get("pb_ratio") > 0]
 
-    market_cap_sum = sum(float(s.get("market_cap") or 0) for s in company_snapshots if (s.get("market_cap") or 0) > 0)
-    pos_income_sum = sum(float(s.get("estimated_net_income") or 0) for s in company_snapshots if (s.get("estimated_net_income") or 0) > 0)
-    pos_equity_sum = sum(float(s.get("equity") or 0) for s in company_snapshots if (s.get("equity") or 0) > 0)
+    # pe_aggregate: only companies with estimated_net_income > 0 AND market_cap > 0
+    pe_valid = [s for s in company_snapshots if (s.get("estimated_net_income") or 0) > 0 and (s.get("market_cap") or 0) > 0]
+    pe_market_cap_sum = sum(float(s["market_cap"]) for s in pe_valid)
+    pe_income_sum = sum(float(s["estimated_net_income"]) for s in pe_valid)
+
+    # pb_aggregate: only companies with equity > 0 AND market_cap > 0
+    pb_valid = [s for s in company_snapshots if (s.get("equity") or 0) > 0 and (s.get("market_cap") or 0) > 0]
+    pb_market_cap_sum = sum(float(s["market_cap"]) for s in pb_valid)
+    pb_equity_sum = sum(float(s["equity"]) for s in pb_valid)
+
+    # roe_aggregate: only companies with equity > 0
+    roe_valid = [s for s in company_snapshots if (s.get("equity") or 0) > 0]
+    roe_income_sum = sum(float(s.get("estimated_net_income") or 0) for s in roe_valid)
+    roe_equity_sum = sum(float(s["equity"]) for s in roe_valid)
 
     return {
         "member_count": len(company_snapshots),
         "valid_member_count": len([s for s in company_snapshots if not s.get("missing_fields_json")]),
         "pe_median": median(pe_values) if pe_values else None,
-        "pe_aggregate": (market_cap_sum / pos_income_sum) if pos_income_sum > 0 else None,
+        "pe_aggregate": (pe_market_cap_sum / pe_income_sum) if pe_income_sum > 0 else None,
         "pb_median": median(pb_values) if pb_values else None,
-        "pb_aggregate": (market_cap_sum / pos_equity_sum) if pos_equity_sum > 0 else None,
-        "roe_aggregate": (pos_income_sum / pos_equity_sum) if pos_equity_sum > 0 else None,
+        "pb_aggregate": (pb_market_cap_sum / pb_equity_sum) if pb_equity_sum > 0 else None,
+        "roe_aggregate": (roe_income_sum / roe_equity_sum) if roe_equity_sum > 0 else None,
     }
 
 

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from valuation.data_access import BistSnapshot
-from valuation.valuation_engine import run_valuation
+from valuation.valuation_engine import run_valuation, run_valuation_from_snapshot
 
 
 class FakeClient:
@@ -12,8 +12,8 @@ class FakeClient:
         return self.snapshot
 
 
-def test_valuation_engine_formulas() -> None:
-    snapshot = BistSnapshot(
+def _make_snapshot() -> BistSnapshot:
+    return BistSnapshot(
         symbol="THYAO",
         price=100.0,
         market_cap=100_000.0,
@@ -35,6 +35,10 @@ def test_valuation_engine_formulas() -> None:
         source="borsapy",
         missing_fields=[],
     )
+
+
+def test_valuation_engine_formulas() -> None:
+    snapshot = _make_snapshot()
     sector_metrics = {
         "pe_median": 12.0,
         "pe_aggregate": 11.0,
@@ -54,3 +58,66 @@ def test_valuation_engine_formulas() -> None:
     assert result.upside_potential_pct == 164.0
     assert result.sector_target_prices["sektor_fk_hedef"] == 120.0
     assert result.sector_target_prices["sektor_pd_dd_hedef"] == 90.0
+
+
+def test_run_valuation_from_snapshot_no_borsapy() -> None:
+    """run_valuation_from_snapshot must produce correct results without
+    touching borsapy at all."""
+
+    cached_snapshot = {
+        "symbol": "THYAO",
+        "price": 100.0,
+        "market_cap": 100_000.0,
+        "pe_ratio": 10.0,
+        "pb_ratio": 2.0,
+        "shares_outstanding": 1_000.0,
+        "paid_in_capital": 1_000.0,
+        "equity": 50_000.0,
+        "estimated_net_income": 10_000.0,
+        "period_type": "interim",
+        "financial_period": "2025/06",
+        "missing_fields_json": [],
+    }
+    sector_metrics = {
+        "pe_median": 12.0,
+        "pe_aggregate": 11.0,
+        "pb_median": 1.8,
+        "pb_aggregate": 1.6,
+        "roe_aggregate": 0.15,
+    }
+
+    result = run_valuation_from_snapshot(cached_snapshot, sector_metrics=sector_metrics)
+
+    assert result.source == "cache"
+    assert result.estimation.selected_method == "cache"
+    assert result.estimated_net_income == 10_000.0
+    assert result.target_prices["cari_fk"] == 100.0
+    assert result.target_prices["pd_dd"] == 100.0
+    assert result.target_prices["odenmis_sermaye"] == 1000.0
+    assert result.target_prices["potansiyel_piyasa_degeri"] == 100.0
+    assert result.target_prices["ozsermaye_karliligi"] == 20.0
+    assert result.average_target_price == 264.0
+    assert result.upside_potential_pct == 164.0
+    assert result.sector_target_prices["sektor_fk_hedef"] == 120.0
+    assert result.sector_target_prices["sektor_pd_dd_hedef"] == 90.0
+
+
+def test_run_valuation_from_snapshot_missing_fields_string() -> None:
+    """missing_fields_json stored as a JSON string should be parsed."""
+    cached_snapshot = {
+        "symbol": "TEST",
+        "price": 50.0,
+        "market_cap": 50_000.0,
+        "pe_ratio": 5.0,
+        "pb_ratio": 1.0,
+        "shares_outstanding": 1_000.0,
+        "paid_in_capital": 1_000.0,
+        "equity": 50_000.0,
+        "estimated_net_income": None,
+        "period_type": "interim",
+        "financial_period": "2025/06",
+        "missing_fields_json": '["equity", "net_income_latest_period"]',
+    }
+    result = run_valuation_from_snapshot(cached_snapshot)
+    assert "equity" in result.missing_fields
+    assert "estimated_net_income" in result.missing_fields

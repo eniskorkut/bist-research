@@ -21,7 +21,7 @@ from valuation.sector_analysis import (
     get_sector_index_for_symbol,
     get_sector_symbols,
 )
-from valuation.valuation_engine import run_valuation
+from valuation.valuation_engine import run_valuation, run_valuation_from_snapshot
 
 DB_PATH = "/data/valuation_cache.sqlite"
 
@@ -32,7 +32,22 @@ def _fmt(value: float | None) -> str:
     return f"{value:,.2f}"
 
 
-def _refresh_symbol_and_sector(symbol: str, db_path: str) -> tuple[dict | None, dict | None, str | None]:
+def _refresh_symbol_and_sector(
+    symbol: str,
+    db_path: str,
+    *,
+    force: bool = False,
+) -> tuple[dict | None, dict | None, str | None]:
+    """Refresh the given *symbol* and its sector peers into the cache.
+
+    For each symbol in the sector:
+    - If the cached snapshot is fresh **and** *force* is ``False``, it is
+      re-used from the cache (borsapy is NOT called).
+    - Otherwise the data is fetched from borsapy and upserted.
+
+    Sector metrics are always re-computed from the (possibly mixed
+    cache / fresh) snapshots.
+    """
     init_db(db_path)
     client = BorsapyFinancialClient()
     sector_names = get_bist_sector_map()
@@ -43,6 +58,15 @@ def _refresh_symbol_and_sector(symbol: str, db_path: str) -> tuple[dict | None, 
 
     snapshots: list[dict] = []
     for sym in process_symbols:
+        # Check existing cache first
+        existing = get_company_snapshot(db_path, sym)
+        if existing is not None and not is_stale(existing.get("updated_at")) and not force:
+            # Fresh & no force → skip borsapy call, reuse cached payload
+            if (existing.get("sector_index") or "") == target_sector:
+                snapshots.append(existing)
+            continue
+
+        # Stale / missing / forced → fetch from borsapy
         snapshot = client.load_snapshot(sym)
         estimation = estimate_net_income_auto(sym, client=client)
         estimated_net_income = estimation.estimated_net_income
@@ -102,7 +126,7 @@ refresh = col_b.button("Cache'i yenile")
 
 if refresh and symbol:
     try:
-        _refresh_symbol_and_sector(symbol, DB_PATH)
+        _refresh_symbol_and_sector(symbol, DB_PATH, force=True)
         st.success("Cache yenilendi.")
     except Exception as exc:  # noqa: BLE001
         st.error(f"Cache yenileme hatasi: {exc}")
@@ -111,25 +135,51 @@ if analyze:
     if not symbol:
         st.error("Hisse kodu girin.")
     else:
+        # ---- determine freshness ----
         cached = get_company_snapshot(DB_PATH, symbol)
-        company_from_cache = cached is not None and not is_stale(cached.get("updated_at"))
-        sector_metrics = None
-        sector_index = cached.get("sector_index") if cached else None
-        if sector_index:
-            sector_metrics = get_sector_metrics(DB_PATH, sector_index)
+        company_fresh = cached is not None and not is_stale(cached.get("updated_at"))
 
-        if not company_from_cache:
+        sector_index = cached.get("sector_index") if cached else None
+        if not sector_index:
+            sector_index = get_sector_index_for_symbol(symbol)
+
+        sector_metrics = get_sector_metrics(DB_PATH, sector_index) if sector_index else None
+        sector_fresh = sector_metrics is not None and not is_stale(sector_metrics.get("calculated_at"))
+
+        # ---- refresh as needed ----
+        valuation_source = "cache"
+
+        if not company_fresh:
+            # Company stale/missing → refresh both company and sector
             try:
                 cached, sector_metrics, sector_index = _refresh_symbol_and_sector(symbol, DB_PATH)
+                company_fresh = cached is not None
+                sector_fresh = sector_metrics is not None
+                valuation_source = "borsapy_refresh"
             except Exception as exc:  # noqa: BLE001
                 st.error(f"Veri cekme hatasi: {exc}")
                 st.stop()
+        elif not sector_fresh:
+            # Company fresh, sector stale/missing → refresh sector only
+            # (the helper will skip the fresh company snapshot automatically)
+            try:
+                cached, sector_metrics, sector_index = _refresh_symbol_and_sector(symbol, DB_PATH)
+                sector_fresh = sector_metrics is not None
+                valuation_source = "cache"  # company came from cache
+            except Exception as exc:  # noqa: BLE001
+                st.error(f"Sektor yenileme hatasi: {exc}")
+                # sector_metrics may remain None, continue anyway
 
         if cached is None:
             st.error("Sirket verisi bulunamadi.")
             st.stop()
 
-        result = run_valuation(symbol, sector_metrics=sector_metrics, db_path=DB_PATH)
+        # ---- run valuation ----
+        if valuation_source == "cache":
+            result = run_valuation_from_snapshot(cached, sector_metrics=sector_metrics, db_path=DB_PATH)
+        else:
+            result = run_valuation(symbol, sector_metrics=sector_metrics, db_path=DB_PATH)
+
         sector_name = get_bist_sector_map().get(sector_index or "", "Bilinmiyor")
         sector_comparison = compare_company_to_sector(
             {
@@ -186,11 +236,14 @@ if analyze:
 
         st.header("Cache Durumu")
         updated_at = cached.get("updated_at")
-        st.write(f"Kaynak: `borsapy`")
-        st.write(f"Cache kullanildi mi: `{'Evet' if company_from_cache else 'Hayir (anlik yenilendi)'}`")
+        company_cache_status = "fresh" if company_fresh else ("stale" if cached else "missing")
+        sector_cache_status = "fresh" if sector_fresh else ("stale" if sector_metrics else "missing")
+        st.write(f"Kaynak: `{valuation_source}`")
+        st.write(f"company_cache_status: `{company_cache_status}`")
+        st.write(f"sector_cache_status: `{sector_cache_status}`")
+        st.write(f"valuation_source: `{valuation_source}`")
         st.write(f"updated_at: `{updated_at}`")
-        st.write(f"stale/fresh: `{'stale' if is_stale(updated_at) else 'fresh'}`")
-        if not company_from_cache:
-            st.warning("Cache stale veya yoktu; secili hisse ve sektoru yenilendi.")
+        if valuation_source == "borsapy_refresh":
+            st.warning("Cache stale veya yoktu; borsapy'den yenilendi.")
 
         st.info("Yatirim tavsiyesi degildir.")
