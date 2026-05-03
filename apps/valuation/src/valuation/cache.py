@@ -38,6 +38,8 @@ def init_db(db_path: str) -> None:
                 period_type TEXT,
                 source TEXT,
                 missing_fields_json TEXT,
+                data_quality_status TEXT,
+                data_quality_errors_json TEXT,
                 updated_at TEXT
             );
             CREATE TABLE IF NOT EXISTS sector_metrics (
@@ -67,12 +69,23 @@ def init_db(db_path: str) -> None:
             );
             """
         )
+        # best-effort backward-compatible migrations
+        for sql in [
+            "ALTER TABLE company_snapshot ADD COLUMN data_quality_status TEXT",
+            "ALTER TABLE company_snapshot ADD COLUMN data_quality_errors_json TEXT",
+        ]:
+            try:
+                conn.execute(sql)
+            except sqlite3.OperationalError:
+                pass
 
 
 def upsert_company_snapshot(db_path: str, snapshot: dict[str, Any]) -> None:
     payload = dict(snapshot)
     payload.setdefault("updated_at", datetime.now(UTC).isoformat())
     payload["missing_fields_json"] = json.dumps(payload.get("missing_fields_json", []))
+    payload["data_quality_errors_json"] = json.dumps(payload.get("data_quality_errors_json", []))
+    payload.setdefault("data_quality_status", "partial")
     with _connect(db_path) as conn:
         conn.execute(
             """
@@ -80,12 +93,12 @@ def upsert_company_snapshot(db_path: str, snapshot: dict[str, Any]) -> None:
                 symbol, market, sector_index, sector_name, price, market_cap, shares_outstanding,
                 paid_in_capital, pe_ratio, pb_ratio, roe, equity, net_income_latest_period,
                 net_income_ttm, estimated_net_income, financial_period, period_type, source,
-                missing_fields_json, updated_at
+                missing_fields_json, data_quality_status, data_quality_errors_json, updated_at
             ) VALUES (
                 :symbol, :market, :sector_index, :sector_name, :price, :market_cap, :shares_outstanding,
                 :paid_in_capital, :pe_ratio, :pb_ratio, :roe, :equity, :net_income_latest_period,
                 :net_income_ttm, :estimated_net_income, :financial_period, :period_type, :source,
-                :missing_fields_json, :updated_at
+                :missing_fields_json, :data_quality_status, :data_quality_errors_json, :updated_at
             )
             ON CONFLICT(symbol) DO UPDATE SET
                 market=excluded.market,
@@ -106,6 +119,8 @@ def upsert_company_snapshot(db_path: str, snapshot: dict[str, Any]) -> None:
                 period_type=excluded.period_type,
                 source=excluded.source,
                 missing_fields_json=excluded.missing_fields_json,
+                data_quality_status=excluded.data_quality_status,
+                data_quality_errors_json=excluded.data_quality_errors_json,
                 updated_at=excluded.updated_at
             """,
             payload,
@@ -119,6 +134,7 @@ def get_company_snapshot(db_path: str, symbol: str) -> dict[str, Any] | None:
         return None
     out = dict(row)
     out["missing_fields_json"] = json.loads(out.get("missing_fields_json") or "[]")
+    out["data_quality_errors_json"] = json.loads(out.get("data_quality_errors_json") or "[]")
     return out
 
 
@@ -187,3 +203,33 @@ def is_stale(updated_at: str | None, max_age_hours: int = 24) -> bool:
     except ValueError:
         return True
     return datetime.now(UTC) - dt > timedelta(hours=max_age_hours)
+
+
+def evaluate_snapshot_quality(snapshot: dict[str, Any]) -> tuple[str, list[str]]:
+    errors: list[str] = []
+    price = snapshot.get("price")
+    market_cap = snapshot.get("market_cap")
+    shares_outstanding = snapshot.get("shares_outstanding")
+    paid_in_capital = snapshot.get("paid_in_capital")
+    equity = snapshot.get("equity")
+    estimated_net_income = snapshot.get("estimated_net_income")
+
+    if price is None and market_cap is None and shares_outstanding is None:
+        errors.append("price_marketcap_shares_all_missing")
+    if shares_outstanding is None and paid_in_capital is None:
+        errors.append("shares_or_paid_in_capital_missing")
+    if equity is None:
+        errors.append("equity_missing")
+    if estimated_net_income is None:
+        errors.append("estimated_net_income_missing")
+
+    if len(errors) == 0:
+        return "usable", []
+    if "price_marketcap_shares_all_missing" in errors or "shares_or_paid_in_capital_missing" in errors:
+        return "unusable", errors
+    return "partial", errors
+
+
+def is_snapshot_usable(snapshot: dict[str, Any]) -> bool:
+    status, _ = evaluate_snapshot_quality(snapshot)
+    return status == "usable"

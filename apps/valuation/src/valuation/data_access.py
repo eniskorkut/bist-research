@@ -32,17 +32,23 @@ def _extract_first_number(mapping: dict[str, Any], aliases: list[str]) -> float 
 
 
 def _safe_mapping(obj: Any) -> dict[str, Any]:
-    result: dict[str, Any] = {}
     if obj is None:
-        return result
+        return {}
     if isinstance(obj, dict):
-        iterator = obj.keys()
-        for key in iterator:
-            try:
-                result[str(key)] = obj[key]
-            except Exception:  # noqa: BLE001
-                continue
-        return result
+        return dict(obj)
+    if hasattr(obj, "todict"):
+        try:
+            data = obj.todict()
+            if isinstance(data, dict):
+                return dict(data)
+        except Exception:  # noqa: BLE001
+            pass
+    if hasattr(obj, "items"):
+        try:
+            return dict(obj.items())
+        except Exception:  # noqa: BLE001
+            pass
+    result: dict[str, Any] = {}
     for key in dir(obj):
         if key.startswith("_"):
             continue
@@ -116,14 +122,14 @@ class BorsapyFinancialClient:
 
         price = _extract_first_number(
             combined,
-            ["last_price", "regularmarketprice", "price", "close"],
+            ["last", "regularmarketprice", "currentprice", "last_price", "price", "close"],
         )
         market_cap = _extract_first_number(combined, ["marketcap", "market_cap", "market_value"])
-        pe_ratio = _extract_first_number(combined, ["trailingpe", "pe", "fk", "f/k"])
-        pb_ratio = _extract_first_number(combined, ["pricetobook", "pb", "pddd", "pd/dd"])
+        pe_ratio = _extract_first_number(combined, ["trailingpe", "pe_ratio", "pe", "fk", "f/k"])
+        pb_ratio = _extract_first_number(combined, ["pricetobook", "pb_ratio", "pb", "pddd", "pd/dd"])
         shares_outstanding = _extract_first_number(
             combined,
-            ["sharesoutstanding", "shares", "numberofshares", "hisse_sayisi"],
+            ["sharesoutstanding", "shares_outstanding", "shares", "numberofshares", "hisse_sayisi"],
         )
 
         paid_in_capital = _extract_series_value(

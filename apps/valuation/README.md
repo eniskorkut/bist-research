@@ -54,6 +54,9 @@ Streamlit arayuzunde "Cache Durumu" bolumunde su bilgiler gosterilir:
 - `company_cache_status`: fresh / stale / missing
 - `sector_cache_status`: fresh / stale / missing
 - `valuation_source`: cache / borsapy_refresh
+- `data_quality_status`: usable / partial / unusable
+
+`data_quality_status=unusable` olan kayitlar fresh olsa bile degerleme icin kullanilmaz.
 
 ## Sektor Hesabi
 
@@ -72,6 +75,7 @@ Negatif kar veya negatif ozkaynakta ilgili carpana dayali hedef fiyat hesaplanma
 ```shell
 docker compose build valuation-app
 docker compose run --rm valuation-app python -m pytest
+docker compose run --rm valuation-app python scripts/debug_borsapy_symbol.py THYAO
 
 # Zorla yenile (fresh cache'i goz ardi et)
 docker compose run --rm valuation-app python scripts/refresh_bist_cache.py --symbols THYAO ASELS GARAN --db-path /data/valuation_cache.sqlite --force

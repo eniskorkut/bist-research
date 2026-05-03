@@ -4,9 +4,11 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from valuation.cache import (
+    evaluate_snapshot_quality,
     get_company_snapshot,
     get_sector_metrics,
     init_db,
+    is_snapshot_usable,
     is_stale,
     save_valuation_result,
     upsert_company_snapshot,
@@ -143,3 +145,38 @@ def test_fresh_snapshot_skipped_on_upsert(tmp_path: Path) -> None:
     existing = get_company_snapshot(db, "GARAN")
     assert existing is not None
     assert not is_stale(existing["updated_at"])  # should be fresh
+
+
+def test_snapshot_quality_unusable_all_critical_missing() -> None:
+    snapshot = {
+        "price": None,
+        "market_cap": None,
+        "shares_outstanding": None,
+        "paid_in_capital": None,
+        "equity": None,
+        "estimated_net_income": None,
+    }
+    status, errors = evaluate_snapshot_quality(snapshot)
+    assert status == "unusable"
+    assert "price_marketcap_shares_all_missing" in errors
+    assert is_snapshot_usable(snapshot) is False
+
+
+def test_snapshot_quality_partial_vs_usable() -> None:
+    partial = {
+        "price": 100.0,
+        "market_cap": 1000.0,
+        "shares_outstanding": 10.0,
+        "paid_in_capital": 10.0,
+        "equity": 500.0,
+        "estimated_net_income": None,
+    }
+    status_partial, _ = evaluate_snapshot_quality(partial)
+    assert status_partial == "partial"
+    assert is_snapshot_usable(partial) is False
+
+    usable = dict(partial)
+    usable["estimated_net_income"] = 70.0
+    status_usable, _ = evaluate_snapshot_quality(usable)
+    assert status_usable == "usable"
+    assert is_snapshot_usable(usable) is True

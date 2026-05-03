@@ -4,7 +4,7 @@ from dataclasses import asdict
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
-from valuation.cache import save_valuation_result
+from valuation.cache import evaluate_snapshot_quality, save_valuation_result
 from valuation.data_access import BorsapyFinancialClient
 from valuation.profit_estimator import ProfitEstimationResult, estimate_net_income_auto
 from valuation.sector_analysis import compare_company_to_sector
@@ -152,7 +152,7 @@ def run_valuation(
         source=snapshot.source,
         missing_fields=missing,
     )
-    if db_path:
+    if db_path and quality_status != "unusable":
         save_valuation_result(
             db_path,
             {
@@ -181,6 +181,10 @@ def run_valuation_from_snapshot(
     *snapshot* dictionary (as stored in the ``company_snapshot`` SQLite table).
     """
     symbol = snapshot["symbol"]
+    quality_status = snapshot.get("data_quality_status")
+    quality_errors = snapshot.get("data_quality_errors_json") or []
+    if not quality_status:
+        quality_status, quality_errors = evaluate_snapshot_quality(snapshot)
     estimated_net_income = snapshot.get("estimated_net_income")
     shares = snapshot.get("shares_outstanding")
     price = snapshot.get("price")
@@ -195,6 +199,9 @@ def run_valuation_from_snapshot(
     if isinstance(missing_fields_raw, str):
         import json
         missing_fields_raw = json.loads(missing_fields_raw)
+    if isinstance(quality_errors, str):
+        import json
+        quality_errors = json.loads(quality_errors)
 
     estimation = ProfitEstimationResult(
         symbol=symbol,
@@ -283,6 +290,8 @@ def run_valuation_from_snapshot(
     if estimated_net_income is None and "estimated_net_income" not in missing:
         missing.append("estimated_net_income")
 
+    if quality_status == "unusable":
+        missing = sorted(set(list(missing_fields_raw) + list(quality_errors) + ["snapshot_unusable"]))
     result = ValuationResult(
         symbol=symbol,
         price=price,

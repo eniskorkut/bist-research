@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 import streamlit as st
 
 from valuation.cache import (
+    is_snapshot_usable,
     get_company_snapshot,
     get_sector_metrics,
     init_db,
@@ -137,7 +138,8 @@ if analyze:
     else:
         # ---- determine freshness ----
         cached = get_company_snapshot(DB_PATH, symbol)
-        company_fresh = cached is not None and not is_stale(cached.get("updated_at"))
+        company_usable = cached is not None and is_snapshot_usable(cached)
+        company_fresh = cached is not None and not is_stale(cached.get("updated_at")) and company_usable
 
         sector_index = cached.get("sector_index") if cached else None
         if not sector_index:
@@ -178,6 +180,23 @@ if analyze:
 
         if cached is None:
             st.error("Sirket verisi bulunamadi.")
+            st.stop()
+        if not is_snapshot_usable(cached):
+            st.error(
+                "Cache fresh ama veri kalitesi yetersiz. borsapy verisi bos dondu veya parser alanlari cikarilamadi."
+            )
+            st.error(
+                f"{symbol} icin gerekli temel veriler alinamadi. Debug icin: "
+                "`python scripts/debug_borsapy_symbol.py {symbol}`"
+            )
+            st.json(
+                {
+                    "data_quality_status": cached.get("data_quality_status"),
+                    "data_quality_errors": cached.get("data_quality_errors_json"),
+                    "missing_fields": cached.get("missing_fields_json"),
+                    "updated_at": cached.get("updated_at"),
+                }
+            )
             st.stop()
 
         # ---- run valuation (always from cache snapshot) ----
