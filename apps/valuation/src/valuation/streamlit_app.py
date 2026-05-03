@@ -1,16 +1,19 @@
 from __future__ import annotations
 
+from dataclasses import asdict, is_dataclass
 from datetime import UTC, datetime
+from typing import Any
 
+import pandas as pd
 import streamlit as st
 
 from valuation.cache import (
     evaluate_snapshot_quality,
-    is_snapshot_usable,
-    is_snapshot_valuation_ready,
     get_company_snapshot,
     get_sector_metrics,
     init_db,
+    is_snapshot_usable,
+    is_snapshot_valuation_ready,
     is_stale,
     should_write_snapshot,
     upsert_company_snapshot,
@@ -30,61 +33,121 @@ from valuation.valuation_engine import run_valuation_from_snapshot
 DB_PATH = "/data/valuation_cache.sqlite"
 
 
-def _fmt(value: float | None) -> str:
+def fmt_number(value: float | int | None, suffix: str = "") -> str:
     if value is None:
         return "N/A"
-    return f"{value:,.2f}"
+    return f"{float(value):,.2f}{suffix}"
 
 
-def _render_scenario_block(title: str, scenario) -> None:
-    st.header(title)
-    st.write(f"Kullanilan donem: `{scenario.period_label}`")
-    st.write(f"Kullanilan net kar: `{_fmt(scenario.net_income)}`")
-    st.write(f"Net kar kaynagi: `{scenario.net_income_source}`")
-
-    st.subheader("Hedef Fiyat Tablosu")
-    st.table(
-        {
-            "Yontem": list(scenario.target_prices.keys()),
-            "Hedef Fiyat": [_fmt(v) for v in scenario.target_prices.values()],
-        }
-    )
-    st.write(f"Dahil edilen yontemler: `{', '.join(scenario.included_methods) if scenario.included_methods else 'yok'}`")
-    st.write(f"Haric tutulan yontemler: `{', '.join(scenario.excluded_methods) if scenario.excluded_methods else 'yok'}`")
-    st.write(f"Medyan adil deger: `{_fmt(scenario.fair_value_median)}`")
-    st.write(f"Filtreli ortalama adil deger: `{_fmt(scenario.fair_value_mean_filtered)}`")
-    st.write(f"Prim potansiyeli (%): `{_fmt(scenario.upside_potential_pct)}`")
-
-    st.subheader("Odenmis Sermaye Hesabi")
-    st.write(f"EPS (net_income / paid_in_capital): `{_fmt(scenario.paid_capital_details.get('eps'))}`")
-    st.write(f"Kurs formulu (EPS x 10): `{_fmt(scenario.paid_capital_details.get('x10'))}`")
-    st.write(f"Gecmis F/K medyan: `{_fmt(scenario.paid_capital_details.get('historical_pe_median'))}`")
-    st.write(f"EPS x gecmis F/K: `{_fmt(scenario.paid_capital_details.get('historical_pe_value'))}`")
-    st.write(f"Sektor F/K medyan: `{_fmt(scenario.paid_capital_details.get('sector_pe_median'))}`")
-    st.write(f"EPS x sektor F/K: `{_fmt(scenario.paid_capital_details.get('sector_pe_value'))}`")
-    st.write(f"EPS x guncel F/K: `{_fmt(scenario.paid_capital_details.get('current_pe_value'))}`")
-    st.write(f"Odenmis sermaye final: `{_fmt(scenario.paid_capital_details.get('final'))}`")
-    st.write(f"Final method: `{scenario.paid_capital_details.get('final_method')}`")
-    if scenario.paid_capital_details.get("final") is None:
-        st.warning("Carpan bulunamadigi icin EPS x 10 sadece bilgi amacli gosterildi.")
+def fmt_money(value: float | int | None) -> str:
+    return fmt_number(value)
 
 
-def _refresh_symbol_and_sector(
-    symbol: str,
-    db_path: str,
-    *,
-    force: bool = False,
-) -> tuple[dict | None, dict | None, str | None, dict]:
-    """Refresh the given *symbol* and its sector peers into the cache.
+def fmt_pct(value: float | int | None) -> str:
+    if value is None:
+        return "N/A"
+    return f"{float(value):,.2f}%"
 
-    For each symbol in the sector:
-    - If the cached snapshot is fresh **and** *force* is ``False``, it is
-      re-used from the cache (borsapy is NOT called).
-    - Otherwise the data is fetched from borsapy and upserted.
 
-    Sector metrics are always re-computed from the (possibly mixed
-    cache / fresh) snapshots.
-    """
+def fmt_text(value: Any) -> str:
+    if value in (None, "", [], {}):
+        return "N/A"
+    return str(value)
+
+
+def render_status_badge(label: str, status: str) -> str:
+    return f"{label}: {fmt_text(status)}"
+
+
+def to_plain_dict(obj: Any) -> Any:
+    if is_dataclass(obj):
+        return {k: to_plain_dict(v) for k, v in asdict(obj).items()}
+    if isinstance(obj, dict):
+        return {k: to_plain_dict(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [to_plain_dict(x) for x in obj]
+    if isinstance(obj, tuple):
+        return [to_plain_dict(x) for x in obj]
+    return obj
+
+
+def build_target_price_dataframe(scenario: Any) -> pd.DataFrame:
+    method_map = {
+        "cari_fk": ("Cari F/K", "Net Kâr × F/K / Hisse Sayısı"),
+        "pd_dd": ("PD/DD", "Özkaynak × PD/DD / Hisse Sayısı"),
+        "odenmis_sermaye_x10": ("Ödenmiş Sermaye: EPS × 10", "EPS × 10"),
+        "odenmis_sermaye_historical_pe": ("Ödenmiş Sermaye: EPS × Geçmiş F/K", "EPS × Geçmiş F/K"),
+        "odenmis_sermaye_sector_pe": ("Ödenmiş Sermaye: EPS × Sektör F/K", "EPS × Sektör F/K"),
+        "odenmis_sermaye_current_pe": ("Ödenmiş Sermaye: EPS × Güncel F/K", "EPS × Güncel F/K"),
+        "odenmis_sermaye_final": ("Ödenmiş Sermaye Final", "Fallback kuralına göre final"),
+        "potansiyel_piyasa_degeri": ("Potansiyel Piyasa Değeri", "Çarpanlardan türetilen potansiyel değer"),
+        "ozsermaye_karliligi": ("Özsermaye Kârlılığı", "ROE temelli yaklaşım"),
+        "sektor_fk_hedef": ("Sektör F/K Hedefi", "EPS × Sektör F/K"),
+        "sektor_pd_dd_hedef": ("Sektör PD/DD Hedefi", "Defter Değeri × Sektör PD/DD"),
+    }
+    rows: list[dict[str, str]] = []
+    included = set(scenario.included_methods or [])
+    for method, value in scenario.target_prices.items():
+        label, formula = method_map.get(method, (method, "-"))
+        in_fair_value = "Evet" if method in included else "Hayır"
+        if value is None:
+            status = "Eksik veri"
+        elif method in included:
+            status = "Kullanıldı"
+        else:
+            status = "Hariç tutuldu / bilgi amaçlı"
+        rows.append(
+            {
+                "Yöntem": label,
+                "Formül": formula,
+                "Hedef Fiyat": fmt_money(value),
+                "Adil Değere Dahil": in_fair_value,
+                "Durum": status,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def build_summary_dataframe(result: Any, cached: dict[str, Any]) -> pd.DataFrame:
+    rows = [
+        ("Piyasa Değeri", fmt_money(result.market_cap), "borsapy"),
+        ("Hisse Sayısı", fmt_number(result.shares_outstanding), "borsapy"),
+        ("Ödenmiş Sermaye", fmt_number(result.paid_in_capital), "borsapy"),
+        ("Özkaynak", fmt_money(result.equity), cached.get("equity_source")),
+        ("Net Kâr TTM", fmt_money(cached.get("net_income_ttm")), cached.get("net_income_source")),
+        ("Tahmini Yıl Sonu Net Kâr", fmt_money(result.valuation_scenarios["year_end"].net_income), result.valuation_scenarios["year_end"].net_income_source),
+        ("Net Kâr Kaynağı", fmt_text(cached.get("net_income_source")), "system"),
+        ("Özkaynak Kaynağı", fmt_text(cached.get("equity_source")), "system"),
+        ("Veri Kalite Durumu", fmt_text(cached.get("data_quality_status")), "cache"),
+    ]
+    return pd.DataFrame(rows, columns=["Alan", "Değer", "Kaynak"])
+
+
+def build_sector_dataframe(
+    result: Any,
+    sector_metrics: dict[str, Any] | None,
+    sector_comparison: dict[str, Any] | None,
+    sector_index: str | None,
+    sector_name: str,
+) -> pd.DataFrame:
+    comp = sector_comparison or {}
+    metrics = sector_metrics or {}
+    rows = [
+        ("Sektör Endeksi", fmt_text(sector_index)),
+        ("Sektör Adı", fmt_text(sector_name)),
+        ("Şirket F/K", fmt_number(result.pe_ratio)),
+        ("Sektör F/K Medyan", fmt_number(metrics.get("pe_median"))),
+        ("Sektör F/K Aggregate", fmt_number(metrics.get("pe_aggregate"))),
+        ("Şirket PD/DD", fmt_number(result.pb_ratio)),
+        ("Sektör PD/DD Medyan", fmt_number(metrics.get("pb_median"))),
+        ("Sektör PD/DD Aggregate", fmt_number(metrics.get("pb_aggregate"))),
+        ("Şirket ROE", fmt_pct(comp.get("company_roe"))),
+        ("Sektör ROE Aggregate", fmt_pct(metrics.get("roe_aggregate"))),
+    ]
+    return pd.DataFrame(rows, columns=["Gösterge", "Değer"])
+
+
+def _refresh_symbol_and_sector(symbol: str, db_path: str, *, force: bool = False) -> tuple[dict | None, dict | None, str | None, dict]:
     init_db(db_path)
     client = BorsapyFinancialClient()
     sector_names = get_bist_sector_map()
@@ -100,16 +163,14 @@ def _refresh_symbol_and_sector(
         "rejected_unusable_refresh": 0,
         "messages": [],
     }
+
     for sym in process_symbols:
-        # Check existing cache first
         existing = get_company_snapshot(db_path, sym)
         if existing is not None and not is_stale(existing.get("updated_at")) and not force:
-            # Fresh & no force → skip borsapy call, reuse cached payload
             if (existing.get("sector_index") or "") == target_sector:
                 snapshots.append(existing)
             continue
 
-        # Stale / missing / forced → fetch from borsapy
         snapshot = client.load_snapshot(sym)
         estimation = estimate_net_income_from_snapshot(snapshot)
         estimated_net_income = estimation.estimated_net_income
@@ -143,8 +204,8 @@ def _refresh_symbol_and_sector(
         quality_status, quality_errors = evaluate_snapshot_quality(payload)
         payload["data_quality_status"] = quality_status
         payload["data_quality_errors_json"] = quality_errors
-        should_write, reason = should_write_snapshot(payload, existing)
-        if should_write:
+        write_ok, reason = should_write_snapshot(payload, existing)
+        if write_ok:
             upsert_company_snapshot(db_path, payload)
             refresh_meta["wrote_to_cache"] += 1
             if sector_index == target_sector:
@@ -173,179 +234,322 @@ def _refresh_symbol_and_sector(
     return cached_company, cached_sector, target_sector, refresh_meta
 
 
-st.set_page_config(page_title="BIST Otomatik Degerleme", layout="wide")
-st.title("BIST Otomatik Degerleme")
-st.caption("Yatirim tavsiyesi degildir.")
+def _render_insufficient_data_panel(symbol: str, cached: dict[str, Any] | None, ready_errors: list[str]) -> None:
+    st.error("Değerleme için yeterli veri yok")
+    data_quality_errors = (cached or {}).get("data_quality_errors_json") if cached else []
+    missing_fields = (cached or {}).get("missing_fields_json") if cached else []
+    panel = pd.DataFrame(
+        [
+            ("Eksik kritik alanlar", ", ".join(ready_errors) if ready_errors else "N/A"),
+            ("Son cache zamanı", fmt_text((cached or {}).get("updated_at"))),
+            ("data_quality_status", fmt_text((cached or {}).get("data_quality_status"))),
+            ("data_quality_errors_json", fmt_text(data_quality_errors)),
+            ("missing_fields_json", fmt_text(missing_fields)),
+        ],
+        columns=["Alan", "Değer"],
+    )
+    st.dataframe(panel, use_container_width=True, hide_index=True)
+    st.code(f"docker compose run --rm valuation-app python scripts/debug_borsapy_symbol.py {symbol}")
 
-init_db(DB_PATH)
-symbol = st.text_input("Hisse kodu", value="THYAO").strip().upper()
-col_a, col_b = st.columns(2)
-analyze = col_a.button("Analiz")
-refresh = col_b.button("Cache'i yenile")
 
-if refresh and symbol:
-    try:
-        _, _, _, refresh_meta = _refresh_symbol_and_sector(symbol, DB_PATH, force=True)
-        if refresh_meta["wrote_to_cache"] > 0:
-            st.success(f"Cache yenilendi. Yazilan kayit: {refresh_meta['wrote_to_cache']}")
-        if refresh_meta["preserved_existing_cache"] > 0:
-            st.warning(
-                "Bazi sembollerde borsapy eksik veri dondurdu; eski saglikli cache korundu. "
-                f"Korunan kayit: {refresh_meta['preserved_existing_cache']}"
-            )
-        if refresh_meta["wrote_to_cache"] == 0 and refresh_meta["preserved_existing_cache"] == 0:
-            st.warning("Cache yenilemede kullanilabilir veri yazilamadi.")
-        st.rerun()
-    except Exception as exc:  # noqa: BLE001
-        st.error(f"Cache yenileme hatasi: {exc}")
+def _render_scenario_tab(scenario: Any, title: str) -> None:
+    st.subheader(title)
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Kullanılan Dönem", fmt_text(scenario.period_label))
+    c2.metric("Kullanılan Net Kâr", fmt_money(scenario.net_income))
+    c3.metric("Net Kâr Kaynağı", fmt_text(scenario.net_income_source))
+    c4, c5 = st.columns(2)
+    c4.metric("Medyan Adil Değer", fmt_money(scenario.fair_value_median))
+    c5.metric("Prim Potansiyeli", fmt_pct(scenario.upside_potential_pct))
+    st.dataframe(build_target_price_dataframe(scenario), use_container_width=True, hide_index=True)
 
-if analyze:
+    st.markdown("#### Ödenmiş Sermaye Detayı")
+    details = scenario.paid_capital_details
+    info = pd.DataFrame(
+        [
+            ("EPS", fmt_money(details.get("eps"))),
+            ("Kurs formülü: EPS × 10", fmt_money(details.get("x10"))),
+            ("Geçmiş F/K medyan", fmt_number(details.get("historical_pe_median"))),
+            ("EPS × Geçmiş F/K", fmt_money(details.get("historical_pe_value"))),
+            ("Sektör F/K medyan", fmt_number(details.get("sector_pe_median"))),
+            ("EPS × Sektör F/K", fmt_money(details.get("sector_pe_value"))),
+            ("EPS × Güncel F/K", fmt_money(details.get("current_pe_value"))),
+            ("Final değer", fmt_money(details.get("final"))),
+            ("Final yöntemi", fmt_text(details.get("final_method"))),
+        ],
+        columns=["Alan", "Değer"],
+    )
+    st.dataframe(info, use_container_width=True, hide_index=True)
+    st.info(
+        "x10 tek başına ana adil değeri belirlemez. Geçmiş F/K yoksa sektör/güncel F/K fallback kullanılır. "
+        "Final boşsa x10 sadece bilgi amaçlıdır."
+    )
+
+
+def main() -> None:
+    st.set_page_config(page_title="BIST Otomatik Değerleme", layout="wide")
+    st.markdown(
+        """
+        <style>
+        .small-note { color: #6b7280; font-size: 0.9rem; }
+        div[data-testid="stMetric"] {
+            background: #131a24;
+            border: 1px solid #2a3445;
+            padding: 10px;
+            border-radius: 8px;
+        }
+        div[data-testid="stMetric"] [data-testid="stMetricValue"] {
+            color: #e6edf3;
+        }
+        div[data-testid="stMetric"] [data-testid="stMetricLabel"] {
+            color: #9fb0c7;
+        }
+        div[data-testid="stMetric"] [data-testid="stMetricDelta"] {
+            color: #9fd3ff;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.title("BIST Otomatik Değerleme")
+    st.caption("Bu çalışma yatırım tavsiyesi değildir. Veriler otomatik kaynaklardan alınır; eksik veya hatalı veri olabilir.")
+
+    init_db(DB_PATH)
+    if "analyze_requested" not in st.session_state:
+        st.session_state["analyze_requested"] = False
+    if "last_refresh_meta" not in st.session_state:
+        st.session_state["last_refresh_meta"] = None
+
+    with st.sidebar:
+        st.header("Girdi")
+        symbol = st.text_input("Hisse kodu", value="THYAO").strip().upper()
+        analyze = st.button("Analiz")
+        refresh = st.button("Cache’i yenile")
+        st.markdown("<div class='small-note'>Cache taze ise borsapy yeniden çağrılmaz.</div>", unsafe_allow_html=True)
+
+    if analyze:
+        st.session_state["analyze_requested"] = True
+
+    if refresh and symbol:
+        try:
+            with st.spinner("Cache yenileniyor..."):
+                _, _, _, refresh_meta = _refresh_symbol_and_sector(symbol, DB_PATH, force=True)
+            st.session_state["last_refresh_meta"] = refresh_meta
+            st.rerun()
+        except Exception as exc:  # noqa: BLE001
+            st.error(f"Cache yenileme hatası: {exc}")
+            return
+
+    if not st.session_state["analyze_requested"]:
+        st.info("Analiz başlatmak için hisse kodu girip Analiz düğmesine basın.")
+        return
     if not symbol:
         st.error("Hisse kodu girin.")
-    else:
-        # ---- determine freshness ----
-        cached = get_company_snapshot(DB_PATH, symbol)
-        company_usable = cached is not None and is_snapshot_usable(cached)
-        company_fresh = cached is not None and not is_stale(cached.get("updated_at")) and company_usable
+        return
 
-        sector_index = cached.get("sector_index") if cached else None
-        if not sector_index:
-            sector_index = get_sector_index_for_symbol(symbol)
+    cached = get_company_snapshot(DB_PATH, symbol)
+    company_usable = cached is not None and is_snapshot_usable(cached)
+    company_fresh = cached is not None and not is_stale(cached.get("updated_at")) and company_usable
+    sector_index = (cached or {}).get("sector_index") or get_sector_index_for_symbol(symbol)
+    sector_metrics = get_sector_metrics(DB_PATH, sector_index) if sector_index else None
+    sector_fresh = sector_metrics is not None and not is_stale(sector_metrics.get("calculated_at"))
+    valuation_source = "cache"
 
-        sector_metrics = get_sector_metrics(DB_PATH, sector_index) if sector_index else None
-        sector_fresh = sector_metrics is not None and not is_stale(sector_metrics.get("calculated_at"))
-
-        # ---- refresh as needed ----
-        valuation_source = "cache"
-
-        if not company_fresh:
-            # Company stale/missing → refresh both company and sector
-            try:
+    if not company_fresh:
+        try:
+            with st.spinner("Şirket ve sektör cache güncelleniyor..."):
                 _, _, _, refresh_meta = _refresh_symbol_and_sector(symbol, DB_PATH)
-                cached = get_company_snapshot(DB_PATH, symbol)
-                sector_index = cached.get("sector_index") if cached else sector_index
-                sector_metrics = get_sector_metrics(DB_PATH, sector_index) if sector_index else None
-                company_fresh = cached is not None and not is_stale(cached.get("updated_at"))
-                sector_fresh = sector_metrics is not None and not is_stale(sector_metrics.get("calculated_at"))
-                valuation_source = "borsapy_refresh"
-                if refresh_meta["preserved_existing_cache"] > 0:
-                    st.warning("Yenilemede eksik veri algilandi; mevcut cache korundu.")
-            except Exception as exc:  # noqa: BLE001
-                st.error(f"Veri cekme hatasi: {exc}")
-                st.stop()
-        elif not sector_fresh:
-            # Company fresh, sector stale/missing → refresh sector only
-            # (the helper will skip the fresh company snapshot automatically)
-            try:
+            st.session_state["last_refresh_meta"] = refresh_meta
+            cached = get_company_snapshot(DB_PATH, symbol)
+            sector_index = (cached or {}).get("sector_index") or sector_index
+            sector_metrics = get_sector_metrics(DB_PATH, sector_index) if sector_index else None
+            company_fresh = cached is not None and not is_stale(cached.get("updated_at"))
+            sector_fresh = sector_metrics is not None and not is_stale(sector_metrics.get("calculated_at"))
+            valuation_source = "borsapy_refresh"
+        except Exception as exc:  # noqa: BLE001
+            st.error(f"Veri çekme hatası: {exc}")
+            return
+    elif not sector_fresh:
+        try:
+            with st.spinner("Sektör cache güncelleniyor..."):
                 _, _, _, refresh_meta = _refresh_symbol_and_sector(symbol, DB_PATH)
-                cached = get_company_snapshot(DB_PATH, symbol)
-                sector_index = cached.get("sector_index") if cached else sector_index
-                sector_metrics = get_sector_metrics(DB_PATH, sector_index) if sector_index else None
-                sector_fresh = sector_metrics is not None and not is_stale(sector_metrics.get("calculated_at"))
-                valuation_source = "cache"  # company came from cache
-                if refresh_meta["preserved_existing_cache"] > 0:
-                    st.warning("Sektor yenilemede eksik veri algilandi; mevcut cache korundu.")
-            except Exception as exc:  # noqa: BLE001
-                st.error(f"Sektor yenileme hatasi: {exc}")
-                # sector_metrics may remain None, continue anyway
+            st.session_state["last_refresh_meta"] = refresh_meta
+            cached = get_company_snapshot(DB_PATH, symbol)
+            sector_index = (cached or {}).get("sector_index") or sector_index
+            sector_metrics = get_sector_metrics(DB_PATH, sector_index) if sector_index else None
+            sector_fresh = sector_metrics is not None and not is_stale(sector_metrics.get("calculated_at"))
+        except Exception as exc:  # noqa: BLE001
+            st.warning(f"Sektör yenileme hatası: {exc}")
 
-        if cached is None:
-            st.error("Sirket verisi bulunamadi.")
-            st.stop()
-        if not is_snapshot_usable(cached):
-            st.error(
-                "Cache fresh ama veri kalitesi yetersiz. borsapy verisi bos dondu veya parser alanlari cikarilamadi."
-            )
-            st.error(
-                f"{symbol} icin gerekli temel veriler alinamadi. Debug icin: "
-                "`python scripts/debug_borsapy_symbol.py {symbol}`"
-            )
-            st.json(
-                {
-                    "data_quality_status": cached.get("data_quality_status"),
-                    "data_quality_errors": cached.get("data_quality_errors_json"),
-                    "missing_fields": cached.get("missing_fields_json"),
-                    "updated_at": cached.get("updated_at"),
-                }
-            )
-            st.stop()
-        valuation_ready, valuation_ready_errors = is_snapshot_valuation_ready(cached)
-        if not valuation_ready:
-            st.error("Bu cache kaydi degerleme icin yeterli degil.")
-            st.write("Eksik kritik alanlar:")
-            st.code("\n".join(valuation_ready_errors))
-            st.write(f"Son cache zamani: `{cached.get('updated_at')}`")
-            st.code(f"docker compose run --rm valuation-app python scripts/debug_borsapy_symbol.py {symbol}")
-            st.stop()
+    if cached is None:
+        _render_insufficient_data_panel(symbol, None, ["cache_kaydi_bulunamadi"])
+        return
+    if not is_snapshot_usable(cached):
+        _render_insufficient_data_panel(symbol, cached, ["snapshot_usable_degil"])
+        return
+    valuation_ready, valuation_ready_errors = is_snapshot_valuation_ready(cached)
+    if not valuation_ready:
+        _render_insufficient_data_panel(symbol, cached, valuation_ready_errors)
+        return
 
-        # ---- run valuation (always from cache snapshot) ----
-        result = run_valuation_from_snapshot(cached, sector_metrics=sector_metrics, db_path=DB_PATH)
+    result = run_valuation_from_snapshot(cached, sector_metrics=sector_metrics, db_path=DB_PATH)
+    sector_name = get_bist_sector_map().get(sector_index or "", "Bilinmiyor")
+    sector_comparison = compare_company_to_sector(
+        {
+            "pe_ratio": result.pe_ratio,
+            "pb_ratio": result.pb_ratio,
+            "roe": (result.valuation_scenarios["year_end"].net_income / result.equity) if result.valuation_scenarios["year_end"].net_income is not None and result.equity not in (None, 0) else None,
+            "estimated_net_income": result.valuation_scenarios["year_end"].net_income,
+            "equity": result.equity,
+        },
+        sector_metrics or {},
+    ) if sector_metrics else {}
 
-        sector_name = get_bist_sector_map().get(sector_index or "", "Bilinmiyor")
-        sector_comparison = compare_company_to_sector(
-            {
-                "pe_ratio": result.pe_ratio,
-                "pb_ratio": result.pb_ratio,
-                "roe": (result.valuation_scenarios["year_end"].net_income / result.equity) if result.valuation_scenarios["year_end"].net_income is not None and result.equity not in (None, 0) else None,
-                "estimated_net_income": result.valuation_scenarios["year_end"].net_income,
-                "equity": result.equity,
-            },
-            sector_metrics or {},
-        ) if sector_metrics else {}
-
-        st.header("Temel Veriler")
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Hisse Fiyati", _fmt(result.price))
-        col2.metric("Piyasa Degeri", _fmt(result.market_cap))
-        col3.metric("Hisse Sayisi", _fmt(result.shares_outstanding))
-        col4.metric("Tahmini Net Kar (Yil Sonu)", _fmt(result.valuation_scenarios["year_end"].net_income))
-        col5, col6, col7 = st.columns(3)
-        col5.metric("F/K", _fmt(result.pe_ratio))
-        col6.metric("PD/DD", _fmt(result.pb_ratio))
-        col7.metric("Ozkaynak", _fmt(result.equity))
-        st.write(f"Net kar kaynagi: `{cached.get('net_income_source', 'unknown')}`")
-        st.write(f"Ozkaynak kaynagi: `{cached.get('equity_source', 'unknown')}`")
-        st.write(f"Veri kalite durumu: `{cached.get('data_quality_status', 'unknown')}`")
-
-        st.header("Tahmini Net Kar")
-        st.write(f"Secilen yontem: `{result.estimation.selected_method}`")
-        st.write(f"TTM tahmin: `{_fmt(result.estimation.method_values.get('ttm'))}`")
-        st.write(f"Sezonsallik tahmin: `{_fmt(result.estimation.method_values.get('seasonal'))}`")
-        st.write(f"Ciro x marj tahmin: `{_fmt(result.estimation.method_values.get('revenue_margin'))}`")
-        st.write(f"Nihai tahmini net kar: `{_fmt(result.estimation.estimated_net_income)}`")
-        if cached.get("net_income_source") == "implied_from_pe":
-            st.warning("Tahmini net kar F/K ve piyasa degeri uzerinden turetildi.")
-        if cached.get("equity_source") == "implied_from_pb":
-            st.warning("Ozkaynak PD/DD ve piyasa degeri uzerinden turetildi.")
-        if result.missing_fields:
-            st.warning("Eksik veri alanlari: " + ", ".join(sorted(set(result.missing_fields))))
-
-        _render_scenario_block("Son 12 Ay / TTM Degerleme", result.valuation_scenarios["ttm"])
-        _render_scenario_block("Yil Sonu Tahmini Degerleme", result.valuation_scenarios["year_end"])
-
-        st.header("Sektor Analizi")
-        st.write(f"Sektor endeksi: `{sector_index or 'N/A'}`")
-        st.write(f"Sektor adi: `{sector_name}`")
-        if sector_metrics:
-            st.write(f"Sektor F/K medyan: `{_fmt(sector_metrics.get('pe_median'))}`")
-            st.write(f"Sektor F/K aggregate: `{_fmt(sector_metrics.get('pe_aggregate'))}`")
-            st.write(f"Sektor PD/DD medyan: `{_fmt(sector_metrics.get('pb_median'))}`")
-            st.write(f"Sektor PD/DD aggregate: `{_fmt(sector_metrics.get('pb_aggregate'))}`")
-            st.write(f"Sektor ROE aggregate: `{_fmt(sector_metrics.get('roe_aggregate'))}`")
-            st.json(sector_comparison)
-        else:
-            st.warning("Sektor metrikleri yok.")
-
+    with st.sidebar:
         st.header("Cache Durumu")
-        updated_at = cached.get("updated_at")
         company_cache_status = "fresh" if company_fresh else ("stale" if cached else "missing")
         sector_cache_status = "fresh" if sector_fresh else ("stale" if sector_metrics else "missing")
-        st.write(f"Kaynak: `{valuation_source}`")
-        st.write(f"company_cache_status: `{company_cache_status}`")
-        st.write(f"sector_cache_status: `{sector_cache_status}`")
-        st.write(f"valuation_source: `{valuation_source}`")
-        st.write(f"updated_at: `{updated_at}`")
-        if valuation_source == "borsapy_refresh":
-            st.warning("Cache stale veya yoktu; borsapy'den yenilendi.")
+        sidebar_rows = [
+            render_status_badge("company_cache_status", company_cache_status),
+            render_status_badge("sector_cache_status", sector_cache_status),
+            render_status_badge("data_quality_status", cached.get("data_quality_status")),
+            render_status_badge("valuation_source", valuation_source),
+            render_status_badge("updated_at", cached.get("updated_at")),
+        ]
+        for row in sidebar_rows:
+            st.caption(row)
 
-        st.info("Yatirim tavsiyesi degildir.")
+    year_end = result.valuation_scenarios["year_end"]
+    ttm = result.valuation_scenarios["ttm"]
+    col1, col2, col3, col4, col5, col6 = st.columns(6)
+    col1.metric("Güncel Fiyat", fmt_money(result.price))
+    col2.metric("Yıl Sonu Adil Değer", fmt_money(year_end.fair_value_median))
+    col3.metric("Yıl Sonu Prim Potansiyeli", fmt_pct(year_end.upside_potential_pct))
+    col4.metric("TTM Adil Değer", fmt_money(ttm.fair_value_median))
+    col5.metric("F/K", fmt_number(result.pe_ratio))
+    col6.metric("PD/DD", fmt_number(result.pb_ratio))
+
+    tabs = st.tabs(
+        [
+            "Özet",
+            "Yıl Sonu Tahmini",
+            "Son 12 Ay / TTM",
+            "Sektör Karşılaştırması",
+            "Veri Kalitesi",
+            "Debug",
+        ]
+    )
+
+    with tabs[0]:
+        if year_end.fair_value_median is None:
+            st.warning("Adil değer hesaplanamadı.")
+        elif (year_end.upside_potential_pct or 0) > 20:
+            st.info("Model pozitif prim potansiyeli hesaplıyor.")
+        elif -10 <= (year_end.upside_potential_pct or 0) <= 20:
+            st.info("Adil değer güncel fiyata yakın.")
+        else:
+            st.warning("Model güncel fiyatın üzerinde değerleme riski işaret ediyor.")
+        st.dataframe(build_summary_dataframe(result, cached), use_container_width=True, hide_index=True)
+        scenario_compare = pd.DataFrame(
+            [
+                (
+                    "Yıl Sonu Tahmini",
+                    fmt_money(year_end.net_income),
+                    fmt_money(year_end.fair_value_median),
+                    fmt_money(year_end.fair_value_mean_filtered),
+                    fmt_pct(year_end.upside_potential_pct),
+                    len(year_end.included_methods),
+                    len(year_end.excluded_methods),
+                ),
+                (
+                    "Son 12 Ay / TTM",
+                    fmt_money(ttm.net_income),
+                    fmt_money(ttm.fair_value_median),
+                    fmt_money(ttm.fair_value_mean_filtered),
+                    fmt_pct(ttm.upside_potential_pct),
+                    len(ttm.included_methods),
+                    len(ttm.excluded_methods),
+                ),
+            ],
+            columns=[
+                "Senaryo",
+                "Kullanılan Net Kâr",
+                "Medyan Adil Değer",
+                "Filtreli Ortalama",
+                "Prim Potansiyeli",
+                "Dahil Edilen Yöntem Sayısı",
+                "Hariç Tutulan Yöntem Sayısı",
+            ],
+        )
+        st.dataframe(scenario_compare, use_container_width=True, hide_index=True)
+
+    with tabs[1]:
+        _render_scenario_tab(year_end, "Yıl Sonu Tahmini Değerleme")
+
+    with tabs[2]:
+        _render_scenario_tab(ttm, "Son 12 Ay / TTM Değerleme")
+
+    with tabs[3]:
+        st.dataframe(
+            build_sector_dataframe(result, sector_metrics, sector_comparison, sector_index, sector_name),
+            use_container_width=True,
+            hide_index=True,
+        )
+        company_pe = sector_comparison.get("company_pe")
+        sector_pe = sector_comparison.get("sector_pe_median")
+        company_pb = sector_comparison.get("company_pb")
+        sector_pb = sector_comparison.get("sector_pb_median")
+        company_roe = sector_comparison.get("company_roe")
+        sector_roe = sector_metrics.get("roe_aggregate") if sector_metrics else None
+        notes: list[str] = []
+        if isinstance(company_pe, (int, float)) and isinstance(sector_pe, (int, float)):
+            notes.append(
+                "Şirket F/K bazında sektöre göre iskontolu görünüyor."
+                if company_pe < sector_pe
+                else "Şirket F/K bazında sektörün üzerinde fiyatlanıyor."
+            )
+        if isinstance(company_pb, (int, float)) and isinstance(sector_pb, (int, float)):
+            notes.append(
+                "Şirket PD/DD bazında sektöre göre iskontolu görünüyor."
+                if company_pb < sector_pb
+                else "Şirket PD/DD bazında sektörün üzerinde fiyatlanıyor."
+            )
+        if not isinstance(company_roe, (int, float)) or not isinstance(sector_roe, (int, float)):
+            notes.append("ROE karşılaştırması için yeterli veri yok.")
+        st.info(" ".join(notes) if notes else "Sektör karşılaştırması hazır.")
+
+    with tabs[4]:
+        refresh_meta = st.session_state.get("last_refresh_meta") or {}
+        quality_rows = [
+            ("company_cache_status", "fresh" if company_fresh else ("stale" if cached else "missing")),
+            ("sector_cache_status", "fresh" if sector_fresh else ("stale" if sector_metrics else "missing")),
+            ("valuation_source", valuation_source),
+            ("updated_at", cached.get("updated_at")),
+            ("data_quality_status", cached.get("data_quality_status")),
+            ("data_quality_errors_json", cached.get("data_quality_errors_json")),
+            ("missing_fields_json", cached.get("missing_fields_json")),
+            ("net_income_source", cached.get("net_income_source")),
+            ("equity_source", cached.get("equity_source")),
+            ("revenue_source", cached.get("revenue_source")),
+            ("refresh.wrote_to_cache", refresh_meta.get("wrote_to_cache")),
+            ("refresh.preserved_existing_cache", refresh_meta.get("preserved_existing_cache")),
+            ("refresh.rejected_unusable_refresh", refresh_meta.get("rejected_unusable_refresh")),
+            ("refresh.messages", refresh_meta.get("messages")),
+        ]
+        st.dataframe(pd.DataFrame(quality_rows, columns=["Alan", "Değer"]), use_container_width=True, hide_index=True)
+
+    with tabs[5]:
+        with st.expander("Cached company snapshot"):
+            st.json(to_plain_dict(cached))
+        with st.expander("Sector metrics"):
+            st.json(to_plain_dict(sector_metrics))
+        with st.expander("Sector comparison raw"):
+            st.json(to_plain_dict(sector_comparison))
+        with st.expander("Valuation result raw"):
+            st.json(to_plain_dict(result))
+
+    st.info("Yatırım tavsiyesi değildir.")
+
+
+if __name__ == "__main__":
+    main()
