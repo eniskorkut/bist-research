@@ -1,12 +1,20 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, UTC
+from pathlib import Path
 
 import pandas as pd
 
-from market_radar.data_access import BorsapyMarketDataClient, load_bist_universe
+from market_radar.data_access import (
+    BorsapyMarketDataClient,
+    get_cached_universe,
+    init_db,
+    is_stale,
+    load_bist_universe,
+    upsert_cached_universe,
+)
 import market_radar.data_access as data_access
-from market_radar.radar_engine import RadarConfig, calculate_interest_score, evaluate_filters, evaluate_symbol
+from market_radar.radar_engine import RadarConfig, ScanResult, calculate_interest_score, evaluate_filters, evaluate_symbol, scan_symbols
 from market_radar.symbols import normalize_bist_symbol
 
 
@@ -132,7 +140,7 @@ def test_borsapy_fetch_uses_naive_start_datetime(monkeypatch) -> None:
     assert captured["start"].tzinfo is None
 
 
-def test_load_bist_universe_uses_xutum_components(monkeypatch) -> None:
+def test_load_bist_universe_uses_xutum_components(monkeypatch, tmp_path: Path) -> None:
     captured: dict[str, object] = {}
 
     class FakeIndex:
@@ -141,9 +149,12 @@ def test_load_bist_universe_uses_xutum_components(monkeypatch) -> None:
             self.component_symbols = ["thyao", "ASELS", "ODİNE", "INVALIDLONG"]
 
     monkeypatch.setattr(data_access.bp, "Index", FakeIndex)
+    db = str(tmp_path / "test_radar.sqlite")
 
-    assert load_bist_universe("xutum") == ["ASELS", "ODINE", "THYAO"]
+    symbols, source = load_bist_universe("xutum", db_path=db, force=True)
+    assert symbols == ["ASELS", "ODINE", "THYAO"]
     assert captured["index"] == "XUTUM"
+    assert source == "borsapy"
 
 
 def test_filter_evaluation_min_score() -> None:
@@ -163,3 +174,102 @@ def test_filter_evaluation_min_score() -> None:
     assert "min_interest_score" in passed
     assert "min_avg_turnover_try" in passed
     assert not failed or "above_ma50" in failed
+
+
+# ========= Universe cache tests =========
+
+def test_universe_cache_fresh_skips_borsapy(monkeypatch, tmp_path: Path) -> None:
+    """When universe cache is fresh, borsapy should NOT be called."""
+    db = str(tmp_path / "radar.sqlite")
+    init_db(db)
+    upsert_cached_universe(db, "XUTUM", ["THYAO", "ASELS", "GARAN"])
+
+    borsapy_called = {"called": False}
+
+    class FakeIndex:
+        def __init__(self, symbol: str) -> None:
+            borsapy_called["called"] = True
+            self.component_symbols = ["SHOULD_NOT_APPEAR"]
+
+    monkeypatch.setattr(data_access.bp, "Index", FakeIndex)
+
+    symbols, source = load_bist_universe("XUTUM", db_path=db, force=False)
+    assert source == "fresh_cache"
+    assert symbols == ["THYAO", "ASELS", "GARAN"]
+    assert not borsapy_called["called"]
+
+
+def test_universe_cache_stale_fallback(monkeypatch, tmp_path: Path) -> None:
+    """When borsapy fails and stale cache exists, stale cache is used as fallback."""
+    db = str(tmp_path / "radar.sqlite")
+    init_db(db)
+    # Insert a cache entry with an old timestamp
+    import sqlite3, json
+    old_ts = (datetime.now(UTC) - timedelta(hours=25)).isoformat()
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "INSERT INTO universe_cache (index_symbol, fetched_at, symbols_json, source) VALUES (?, ?, ?, ?)",
+            ("XUTUM", old_ts, json.dumps(["THYAO", "ASELS"]), "borsapy"),
+        )
+
+    class FakeIndexBroken:
+        def __init__(self, symbol: str) -> None:
+            raise RuntimeError("borsapy unavailable")
+
+    monkeypatch.setattr(data_access.bp, "Index", FakeIndexBroken)
+
+    symbols, source = load_bist_universe("XUTUM", db_path=db, force=False)
+    assert source == "stale_cache"
+    assert symbols == ["THYAO", "ASELS"]
+
+
+# ========= Per-symbol error tolerance tests =========
+
+def test_scan_continues_on_symbol_error(tmp_path: Path) -> None:
+    """A single symbol error should not abort the entire scan."""
+    db = str(tmp_path / "radar.sqlite")
+    init_db(db)
+
+    call_count = {"count": 0}
+
+    class FakeClient:
+        def load_history(self, symbol: str, lookback_days: int = 260, *, db_path: str = "", force: bool = False) -> pd.DataFrame:
+            call_count["count"] += 1
+            if symbol == "FAIL":
+                raise RuntimeError("data unavailable")
+            return _history_frame()
+
+    config = RadarConfig(
+        include_negative_moves=True,
+        min_interest_score_active=False,
+        db_path=db,
+    )
+    scan = scan_symbols(["THYAO", "FAIL", "ASELS"], config=config, client=FakeClient())
+
+    assert isinstance(scan, ScanResult)
+    assert len(scan.failed_symbols) == 1
+    assert scan.failed_symbols[0]["symbol"] == "FAIL"
+    assert "data unavailable" in scan.failed_symbols[0]["error"]
+    # Successful symbols should still produce results
+    successful_symbols = {r.symbol for r in scan.raw_results}
+    assert "THYAO" in successful_symbols
+    assert "ASELS" in successful_symbols
+    assert scan.scan_summary["failed_symbols"] == 1
+    assert scan.scan_summary["successful_symbols"] >= 2
+
+
+def test_scan_empty_failed_symbols_on_success(tmp_path: Path) -> None:
+    """When all symbols succeed, failed_symbols should be empty."""
+    db = str(tmp_path / "radar.sqlite")
+    init_db(db)
+
+    class FakeClient:
+        def load_history(self, symbol: str, lookback_days: int = 260, *, db_path: str = "", force: bool = False) -> pd.DataFrame:
+            return _history_frame()
+
+    config = RadarConfig(include_negative_moves=True, min_interest_score_active=False, db_path=db)
+    scan = scan_symbols(["THYAO", "ASELS"], config=config, client=FakeClient())
+
+    assert scan.failed_symbols == []
+    assert scan.scan_summary["failed_symbols"] == 0
+    assert scan.scan_summary["successful_symbols"] == 2

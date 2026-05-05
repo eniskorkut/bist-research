@@ -455,54 +455,90 @@ def evaluate_symbol(
     return result
 
 
+@dataclass
+class ScanResult:
+    """Aggregated result of scanning multiple symbols."""
+    results: list[RadarResult]
+    raw_results: list[RadarResult]
+    failed_symbols: list[dict[str, str]]
+    scan_summary: dict[str, Any]
+
+
 def scan_symbols(
     symbols: list[str],
     *,
     config: RadarConfig | None = None,
     client: BorsapyMarketDataClient | None = None,
-) -> tuple[list[RadarResult], list[RadarResult]]:
+    progress_callback: Any | None = None,
+) -> ScanResult:
     config = config or RadarConfig()
     client = client or BorsapyMarketDataClient()
     benchmark = client.load_history("XU100", lookback_days=config.lookback_days, db_path=config.db_path, force=config.force_refresh)
     passed: list[RadarResult] = []
     all_results: list[RadarResult] = []
-    for raw_symbol in symbols:
+    failed_symbols: list[dict[str, str]] = []
+    total = len(symbols)
+
+    for idx, raw_symbol in enumerate(symbols):
         symbol = normalize_bist_symbol(raw_symbol)
         if not symbol:
             continue
-        history = client.load_history(
-            symbol,
-            lookback_days=config.lookback_days,
-            db_path=config.db_path,
-            force=config.force_refresh,
-        )
-        if history.empty:
-            continue
-        result = evaluate_symbol(symbol, history, benchmark, config=config)
-        all_results.append(result)
-        save_radar_result(
-            config.db_path,
-            {
-                "symbol": result.symbol,
-                "scanned_at": result.raw_metrics.get("date"),
-                "source": "borsapy",
-                "interest_score": result.interest_score,
-                "metrics": asdict(result),
-                "signals": result.signals,
-                "passed_filters": result.passed_filters,
-                "failed_filters": result.failed_filters,
-            },
-        )
-        if not config.include_negative_moves and (result.daily_return_pct or 0) < 0:
-            continue
-        if config.min_interest_score_active and result.interest_score < config.min_interest_score:
-            continue
-        if all(name not in result.failed_filters for name in ["min_avg_turnover_try", "min_volume_ratio", "min_turnover_ratio", "min_daily_return", "min_close_position", "above_ma20", "above_ma50", "xu100_relative", "min_interest_score", "negative_price_move"]):
-            passed.append(result)
-        else:
-            # keep positive radar results that still have enough score? if score threshold passed but some optional filter failed, skip.
-            if not result.failed_filters:
+        try:
+            history = client.load_history(
+                symbol,
+                lookback_days=config.lookback_days,
+                db_path=config.db_path,
+                force=config.force_refresh,
+            )
+            if history.empty:
+                continue
+            result = evaluate_symbol(symbol, history, benchmark, config=config)
+            all_results.append(result)
+            save_radar_result(
+                config.db_path,
+                {
+                    "symbol": result.symbol,
+                    "scanned_at": result.raw_metrics.get("date"),
+                    "source": "borsapy",
+                    "interest_score": result.interest_score,
+                    "metrics": asdict(result),
+                    "signals": result.signals,
+                    "passed_filters": result.passed_filters,
+                    "failed_filters": result.failed_filters,
+                },
+            )
+            if not config.include_negative_moves and (result.daily_return_pct or 0) < 0:
+                pass  # don't add to passed
+            elif config.min_interest_score_active and result.interest_score < config.min_interest_score:
+                pass  # don't add to passed
+            elif all(name not in result.failed_filters for name in ["min_avg_turnover_try", "min_volume_ratio", "min_turnover_ratio", "min_daily_return", "min_close_position", "above_ma20", "above_ma50", "xu100_relative", "min_interest_score", "negative_price_move"]):
                 passed.append(result)
+            elif not result.failed_filters:
+                passed.append(result)
+        except Exception as exc:  # noqa: BLE001
+            failed_symbols.append({"symbol": symbol, "error": str(exc)})
+
+        if progress_callback is not None:
+            try:
+                progress_callback(idx + 1, total, symbol)
+            except Exception:  # noqa: BLE001
+                pass
+
     passed = sorted(passed, key=lambda item: item.interest_score, reverse=True)
     all_results = sorted(all_results, key=lambda item: item.interest_score, reverse=True)
-    return passed, all_results
+
+    scan_summary = {
+        "universe_symbol_count": total,
+        "scanned_symbols": len(all_results) + len(failed_symbols),
+        "successful_symbols": len(all_results),
+        "failed_symbols": len(failed_symbols),
+        "result_count": len(passed),
+    }
+
+    return ScanResult(
+        results=passed,
+        raw_results=all_results,
+        failed_symbols=failed_symbols,
+        scan_summary=scan_summary,
+    )
+

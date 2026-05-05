@@ -98,6 +98,16 @@ def init_db(db_path: str) -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS universe_cache (
+                index_symbol TEXT PRIMARY KEY,
+                fetched_at TEXT NOT NULL,
+                symbols_json TEXT NOT NULL,
+                source TEXT NOT NULL
+            )
+            """
+        )
 
 
 def is_stale(fetched_at: str | None, max_age_minutes: int = 15) -> bool:
@@ -168,13 +178,78 @@ def save_radar_result(db_path: str, result: dict[str, Any]) -> None:
         )
 
 
-def load_bist_universe(index_symbol: str = DEFAULT_BIST_UNIVERSE_INDEX) -> list[str]:
+def get_cached_universe(db_path: str, index_symbol: str) -> dict[str, Any] | None:
+    """Return cached universe row as dict, or None."""
+    init_db(db_path)
+    with sqlite3.connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT fetched_at, symbols_json, source FROM universe_cache WHERE index_symbol = ?",
+            (normalize_bist_symbol(index_symbol),),
+        ).fetchone()
+    if row is None:
+        return None
+    return {"fetched_at": row[0], "symbols_json": json.loads(row[1]), "source": row[2]}
+
+
+def upsert_cached_universe(db_path: str, index_symbol: str, symbols: list[str], source: str = "borsapy") -> None:
+    init_db(db_path)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO universe_cache (index_symbol, fetched_at, symbols_json, source)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(index_symbol) DO UPDATE SET
+                fetched_at=excluded.fetched_at,
+                symbols_json=excluded.symbols_json,
+                source=excluded.source
+            """,
+            (normalize_bist_symbol(index_symbol), datetime.now(UTC).isoformat(), json.dumps(symbols), source),
+        )
+
+
+def _fetch_bist_universe_from_borsapy(index_symbol: str) -> list[str]:
+    """Fetch universe symbols directly from borsapy (no cache)."""
     index = bp.Index(normalize_bist_symbol(index_symbol))
     components = getattr(index, "component_symbols", []) or []
     if callable(components):
         components = components()
     symbols = {normalize_bist_symbol(str(symbol)) for symbol in components}
     return sorted(symbol for symbol in symbols if 3 <= len(symbol) <= 6 and symbol.isalnum())
+
+
+def load_bist_universe(
+    index_symbol: str = DEFAULT_BIST_UNIVERSE_INDEX,
+    *,
+    db_path: str = DB_PATH,
+    force: bool = False,
+) -> tuple[list[str], str]:
+    """Load BIST universe symbols with 24h cache.
+
+    Returns ``(symbols, cache_source)`` where *cache_source* is one of
+    ``"fresh_cache"``, ``"stale_cache"``, or ``"borsapy"``.
+    """
+    init_db(db_path)
+    cached = get_cached_universe(db_path, index_symbol)
+
+    # If cache is fresh and not forced, return cached
+    if cached is not None and not force and not is_stale(cached["fetched_at"], max_age_minutes=24 * 60):
+        return cached["symbols_json"], "fresh_cache"
+
+    # Try to fetch from borsapy
+    try:
+        symbols = _fetch_bist_universe_from_borsapy(index_symbol)
+        if symbols:
+            upsert_cached_universe(db_path, index_symbol, symbols)
+            return symbols, "borsapy"
+    except Exception:  # noqa: BLE001
+        pass
+
+    # Fallback to stale cache
+    if cached is not None and cached["symbols_json"]:
+        return cached["symbols_json"], "stale_cache"
+
+    # No cache, re-raise
+    raise RuntimeError(f"BIST universe ({index_symbol}) could not be fetched and no cache available.")
 
 
 class BorsapyMarketDataClient:

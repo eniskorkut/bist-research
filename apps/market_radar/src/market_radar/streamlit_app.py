@@ -7,7 +7,7 @@ import pandas as pd
 import streamlit as st
 
 from market_radar.data_access import DB_PATH, DEFAULT_BIST_UNIVERSE_INDEX, init_db, load_bist_universe
-from market_radar.radar_engine import RadarConfig, RadarResult, scan_symbols
+from market_radar.radar_engine import RadarConfig, RadarResult, ScanResult, scan_symbols
 
 
 def _threshold_select(label: str, options: list[float], default: float) -> float:
@@ -15,17 +15,37 @@ def _threshold_select(label: str, options: list[float], default: float) -> float
     return float(st.selectbox(label, options, index=idx, format_func=lambda v: f"{v:,.1f}" if v >= 10 else f"{v:.1f}"))
 
 
-def _render_summary_cards(results: list[RadarResult], scanned_count: int) -> None:
+def _render_summary_cards(scan: ScanResult, universe_count: int) -> None:
+    results = scan.results
     positive_count = len(results)
     highest_score = max((r.interest_score for r in results), default=0)
     volume_spike_count = sum(1 for r in results if (r.volume_ratio_20d or 0) >= 1.5)
     breakout_count = sum(1 for r in results if r.breakout_20d)
     c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Taranan Hisse", scanned_count)
+    c1.metric("Taranan Hisse", scan.scan_summary.get("successful_symbols", universe_count))
     c2.metric("Pozitif Sinyal", positive_count)
     c3.metric("En Yüksek Skor", f"{highest_score:.0f}")
     c4.metric("Hacim Patlaması", volume_spike_count)
     c5.metric("Breakout", breakout_count)
+
+
+def _render_scan_info(scan: ScanResult, cache_source: str) -> None:
+    summary = scan.scan_summary
+    st.markdown("#### Tarama Özeti")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Taranan sembol", summary.get("scanned_symbols", 0))
+    c2.metric("Başarılı", summary.get("successful_symbols", 0))
+    c3.metric("Hatalı", summary.get("failed_symbols", 0))
+    c4.metric("Sonuç üreten", summary.get("result_count", 0))
+    st.caption(f"Evren kaynağı: `{cache_source}` | Evren sembol sayısı: `{summary.get('universe_symbol_count', 0)}`")
+
+
+def _render_failed_symbols(scan: ScanResult) -> None:
+    if not scan.failed_symbols:
+        return
+    with st.expander(f"Hata veren semboller ({len(scan.failed_symbols)})"):
+        df = pd.DataFrame(scan.failed_symbols)
+        st.dataframe(df, use_container_width=True, hide_index=True)
 
 
 def _render_filters_panel(config: RadarConfig) -> None:
@@ -115,10 +135,10 @@ def render_positive_interest_radar_page(*, embedded: bool = False) -> None:
     st.title("BIST Pozitif İlgi Radarı")
     st.caption("Bu ekran yatırım tavsiyesi değildir. Hacim, fiyat ve teknik hareketlenme metrikleriyle araştırma listesi üretir.")
     init_db(DB_PATH)
-    if "radar_results" not in st.session_state:
-        st.session_state["radar_results"] = []
-    if "radar_raw_results" not in st.session_state:
-        st.session_state["radar_raw_results"] = []
+    if "radar_scan" not in st.session_state:
+        st.session_state["radar_scan"] = None
+    if "radar_cache_source" not in st.session_state:
+        st.session_state["radar_cache_source"] = None
 
     with st.sidebar:
         st.header("Girdi")
@@ -126,7 +146,7 @@ def render_positive_interest_radar_page(*, embedded: bool = False) -> None:
         st.caption(f"Tarama evreni: Tüm Borsa İstanbul ({universe_index})")
         st.caption("Manuel sembol girişi yok; semboller borsapy endeks bileşenlerinden otomatik alınır.")
         lookback_days = st.number_input("Lookback days", min_value=60, value=260, step=10)
-        force_refresh = st.checkbox("Cache’i yenile", value=False)
+        force_refresh = st.checkbox("Cache'i yenile", value=False)
         st.markdown("#### Filtreler")
         min_avg_turnover_try_active = st.checkbox("Minimum Ortalama TL Hacim", value=True)
         min_avg_turnover_try = _threshold_select("Ortalama TL Hacim Eşiği", [5_000_000.0, 10_000_000.0, 25_000_000.0, 50_000_000.0, 100_000_000.0], 10_000_000.0)
@@ -141,7 +161,7 @@ def render_positive_interest_radar_page(*, embedded: bool = False) -> None:
         breakout_mode = st.selectbox("20 Günlük Zirve Kırılımı", ["off", "breakout_20d", "near_20d_high_2pct"], index=0, format_func=lambda v: {"off": "Kapalı", "breakout_20d": "20 günlük zirveyi kıranlar", "near_20d_high_2pct": "20 günlük zirveye %2 yakın olanlar"}[v])
         require_ma20_active = st.checkbox("MA20 Üstü", value=True)
         require_ma50_active = st.checkbox("MA50 Üstü", value=False)
-        min_xu100_relative_active = st.checkbox("XU100’e Göre Güçlü", value=True)
+        min_xu100_relative_active = st.checkbox("XU100'e Göre Güçlü", value=True)
         min_xu100_relative = _threshold_select("XU100 Relative Eşiği", [0.0, 1.0, 2.0, 3.0], 0.0)
         min_interest_score_active = st.checkbox("Minimum İlgi Skoru", value=True)
         min_interest_score = _threshold_select("İlgi Skoru Eşiği", [40.0, 50.0, 60.0, 70.0, 80.0], 50.0)
@@ -173,8 +193,9 @@ def render_positive_interest_radar_page(*, embedded: bool = False) -> None:
             )
         )
 
+    # Load universe
     try:
-        raw_symbols = load_bist_universe(universe_index)
+        raw_symbols, cache_source = load_bist_universe(universe_index, db_path=DB_PATH, force=force_refresh)
     except Exception as exc:
         st.error("BIST hisse evreni alınamadı. borsapy XUTUM bileşenlerini döndürmedi.")
         st.caption(str(exc))
@@ -182,7 +203,8 @@ def render_positive_interest_radar_page(*, embedded: bool = False) -> None:
     if not raw_symbols:
         st.error("BIST hisse evreni boş döndü. Tarama başlatılamadı.")
         return
-    st.caption(f"Tarama evreni: {len(raw_symbols)} BIST hissesi")
+    st.caption(f"Tarama evreni: {len(raw_symbols)} BIST hissesi | Evren kaynağı: `{cache_source}`")
+
     config = RadarConfig(
         lookback_days=int(lookback_days),
         min_avg_turnover_try_active=min_avg_turnover_try_active,
@@ -208,29 +230,48 @@ def render_positive_interest_radar_page(*, embedded: bool = False) -> None:
     )
 
     if start_scan:
-        with st.spinner("Pozitif ilgi taraması yapılıyor..."):
-            try:
-                results, raw_results = scan_symbols(raw_symbols, config=config)
-                st.session_state["radar_results"] = results
-                st.session_state["radar_raw_results"] = raw_results
-            except Exception as exc:
-                st.session_state["radar_results"] = []
-                st.session_state["radar_raw_results"] = []
-                st.error("Radar verisi alınamadı. borsapy geçici olarak veri döndürmemiş olabilir.")
-                st.caption(str(exc))
-    elif not st.session_state.get("radar_results"):
+        progress_bar = st.progress(0, text="Tarama başlatılıyor...")
+        status_text = st.empty()
+
+        def _progress_callback(current: int, total: int, symbol: str) -> None:
+            pct = current / total if total > 0 else 0
+            progress_bar.progress(pct, text=f"Taranıyor: {current} / {total}")
+            status_text.caption(f"Son taranan: `{symbol}`")
+
+        try:
+            scan = scan_symbols(raw_symbols, config=config, progress_callback=_progress_callback)
+            st.session_state["radar_scan"] = scan
+            st.session_state["radar_cache_source"] = cache_source
+            progress_bar.progress(1.0, text="Tarama tamamlandı.")
+            status_text.empty()
+        except Exception as exc:
+            st.session_state["radar_scan"] = None
+            st.session_state["radar_cache_source"] = None
+            progress_bar.empty()
+            status_text.empty()
+            st.error("Radar verisi alınamadı. borsapy geçici olarak veri döndürmemiş olabilir.")
+            st.caption(str(exc))
+    elif st.session_state.get("radar_scan") is None:
         st.info("Filtreleri ayarla ve tüm Borsa İstanbul evrenini taramak için Taramayı Başlat'a bas.")
 
-    results: list[RadarResult] = st.session_state.get("radar_results", [])
-    scanned_count = len(raw_symbols)
-    _render_summary_cards(results, scanned_count)
+    scan: ScanResult | None = st.session_state.get("radar_scan")
+    stored_cache_source = st.session_state.get("radar_cache_source") or cache_source
 
-    if results:
-        df = pd.DataFrame([result.to_row() for result in results]).sort_values("Interest Score", ascending=False)
-        st.dataframe(df, use_container_width=True, hide_index=True)
+    if scan is not None:
+        _render_scan_info(scan, stored_cache_source)
+        _render_summary_cards(scan, len(raw_symbols))
+        _render_failed_symbols(scan)
+
+        results = scan.results
+        if results:
+            df = pd.DataFrame([result.to_row() for result in results]).sort_values("Interest Score", ascending=False)
+            st.dataframe(df, use_container_width=True, hide_index=True)
+        else:
+            st.info("Filtreleri gevşet veya daha geniş bir sembol listesi dene.")
+        _render_details(results)
     else:
-        st.info("Filtreleri gevşet veya daha geniş bir sembol listesi dene.")
-    _render_details(results)
+        # No scan yet - show empty state
+        pass
 
 
 def main() -> None:

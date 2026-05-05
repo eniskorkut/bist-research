@@ -27,14 +27,19 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     init_db(args.db_path)
-    symbols = args.symbols or load_bist_universe(args.index)
-    normalized: list[str] = []
-    for raw in symbols:
-        symbol = normalize_bist_symbol(str(raw))
-        ok, _ = validate_bist_symbol(symbol)
-        if ok:
-            normalized.append(symbol)
-    normalized = sorted(set(normalized))
+
+    if args.symbols:
+        normalized: list[str] = []
+        for raw in args.symbols:
+            symbol = normalize_bist_symbol(str(raw))
+            ok, _ = validate_bist_symbol(symbol)
+            if ok:
+                normalized.append(symbol)
+        normalized = sorted(set(normalized))
+        cache_source = "cli_args"
+    else:
+        normalized, cache_source = load_bist_universe(args.index, db_path=args.db_path, force=args.force)
+
     config = RadarConfig(
         lookback_days=args.lookback_days,
         min_avg_turnover_try_active=True,
@@ -58,17 +63,32 @@ def main() -> None:
         force_refresh=args.force,
         db_path=args.db_path,
     )
-    results, _ = scan_symbols(normalized, config=config)
-    if not results:
+
+    scan = scan_symbols(normalized, config=config)
+
+    # Print summary
+    summary = scan.scan_summary
+    print(f"universe_symbol_count={summary['universe_symbol_count']}")
+    print(f"scanned_symbols={summary['scanned_symbols']}")
+    print(f"successful_symbols={summary['successful_symbols']}")
+    print(f"failed_symbols={summary['failed_symbols']}")
+    print(f"result_count={summary['result_count']}")
+    print(f"cache_source={cache_source}")
+
+    if scan.failed_symbols:
+        for fail in scan.failed_symbols:
+            print(f"  failed: {fail['symbol']}: {fail['error']}")
+
+    if not scan.results:
         print("No positive interest matches.")
         return
     try:
         import pandas as pd
 
-        df = pd.DataFrame([result.to_row() for result in results]).sort_values("Interest Score", ascending=False)
+        df = pd.DataFrame([result.to_row() for result in scan.results]).sort_values("Interest Score", ascending=False)
         print(df.to_string(index=False))
     except Exception:
-        for result in results:
+        for result in scan.results:
             print(result.to_row())
 
 
