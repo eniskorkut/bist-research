@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from statistics import median
 from typing import Any
+import math
 
 import borsapy as bp
 
@@ -43,6 +44,14 @@ def get_sector_index_for_symbol(symbol: str) -> str | None:
 
 
 def calculate_sector_metrics(company_snapshots: list[dict[str, Any]]) -> dict[str, Any]:
+    def _num(value: Any) -> float | None:
+        if not isinstance(value, (int, float)):
+            return None
+        numeric = float(value)
+        if math.isnan(numeric) or math.isinf(numeric):
+            return None
+        return numeric
+
     pe_values = [s.get("pe_ratio") for s in company_snapshots if isinstance(s.get("pe_ratio"), (int, float)) and s.get("pe_ratio") > 0]
     pb_values = [s.get("pb_ratio") for s in company_snapshots if isinstance(s.get("pb_ratio"), (int, float)) and s.get("pb_ratio") > 0]
 
@@ -60,7 +69,17 @@ def calculate_sector_metrics(company_snapshots: list[dict[str, Any]]) -> dict[st
     roe_valid = [s for s in company_snapshots if (s.get("equity") or 0) > 0]
     roe_income_sum = sum(float(s.get("estimated_net_income") or 0) for s in roe_valid)
     roe_equity_sum = sum(float(s["equity"]) for s in roe_valid)
-    negative_income_count = len([s for s in company_snapshots if (s.get("estimated_net_income") or 0) <= 0])
+    negative_income_count = 0
+    missing_income_count = 0
+    zero_income_count = 0
+    for s in company_snapshots:
+        income = _num(s.get("estimated_net_income"))
+        if income is None:
+            missing_income_count += 1
+        elif income < 0:
+            negative_income_count += 1
+        elif income == 0:
+            zero_income_count += 1
     missing_multiplier_count = len(
         [s for s in company_snapshots if (s.get("pe_ratio") in (None, 0)) and (s.get("pb_ratio") in (None, 0))]
     )
@@ -72,6 +91,8 @@ def calculate_sector_metrics(company_snapshots: list[dict[str, Any]]) -> dict[st
         "pb_valid_count": len(pb_values),
         "roe_valid_count": len(roe_valid),
         "negative_income_count": negative_income_count,
+        "missing_income_count": missing_income_count,
+        "zero_income_count": zero_income_count,
         "missing_multiplier_count": missing_multiplier_count,
         "pe_median": median(pe_values) if pe_values else None,
         "pe_aggregate": (pe_market_cap_sum / pe_income_sum) if pe_income_sum > 0 else None,

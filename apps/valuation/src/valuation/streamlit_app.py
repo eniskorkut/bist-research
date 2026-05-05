@@ -90,8 +90,9 @@ def build_target_price_dataframe(scenario: Any) -> pd.DataFrame:
     included = set(scenario.included_methods or [])
     notes = scenario.method_notes or {}
     status_map = {
+        "missing_ttm_net_income": "Atlandı: TTM net kâr verisi yok",
+        "missing_estimated_net_income": "Atlandı: tahmini net kâr yok",
         "negative_net_income": "Atlandı: net kâr negatif",
-        "missing_or_negative_estimated_net_income": "Atlandı: net kâr negatif",
         "missing_multiplier": "Atlandı: çarpan yok",
         "missing_equity": "Atlandı: özkaynak yok",
         "info_only": "Bilgi amaçlı",
@@ -160,6 +161,8 @@ def build_sector_dataframe(
         ("Sektör PB Valid Sayısı", fmt_text(metrics.get("pb_valid_count"))),
         ("Sektör ROE Valid Sayısı", fmt_text(metrics.get("roe_valid_count"))),
         ("Sektör Negatif Kâr Sayısı", fmt_text(metrics.get("negative_income_count"))),
+        ("Sektör Gelir Eksik Sayısı", fmt_text(metrics.get("missing_income_count"))),
+        ("Sektör Sıfır Kâr Sayısı", fmt_text(metrics.get("zero_income_count"))),
         ("Sektör Çarpan Eksik Sayısı", fmt_text(metrics.get("missing_multiplier_count"))),
     ]
     return pd.DataFrame(rows, columns=["Gösterge", "Değer"])
@@ -282,7 +285,9 @@ def _render_scenario_tab(scenario: Any, title: str) -> None:
     st.dataframe(build_target_price_dataframe(scenario), use_container_width=True, hide_index=True)
     if scenario.valuation_status == "negative_net_income":
         st.warning("Son 12 ay net kâr negatif olduğu için kurs modeline göre TTM bazlı F/K, EPS ve ödenmiş sermaye değerlemesi yapılmadı.")
-    elif scenario.valuation_status == "missing_or_negative_estimated_net_income":
+    elif scenario.valuation_status == "missing_ttm_net_income":
+        st.warning("TTM net kâr verisi bulunamadığı için TTM bazlı değerleme hesaplanmadı.")
+    elif scenario.valuation_status == "missing_estimated_net_income":
         st.warning("Yıl sonu pozitif net kâr tahmini üretilemediği için hedef fiyat hesaplanmadı.")
     elif scenario.valuation_status == "insufficient_independent_methods":
         st.warning("Yeterli bağımsız yöntem oluşmadığı için adil değer hesaplanamadı.")
@@ -456,10 +461,10 @@ def main() -> None:
     col4.metric("TTM Adil Değer", fmt_money(ttm.fair_value_median) if ttm.fair_value_median is not None else "Hesaplanamadı")
     col5.metric("F/K", fmt_number(result.pe_ratio))
     col6.metric("PD/DD", fmt_number(result.pb_ratio))
-    if ttm.valuation_status == "negative_net_income" or year_end.valuation_status == "missing_or_negative_estimated_net_income":
+    if ttm.valuation_status in {"negative_net_income", "missing_ttm_net_income"} or year_end.valuation_status in {"negative_net_income", "missing_estimated_net_income"}:
         st.warning("Bu şirket zarar açıkladığı için tam değerleme üretilemedi. Temel veriler ve araştırma görünümü aşağıdadır.")
     if result.ratio_sources.get("pb_ratio_source") == "derived":
-        st.info("PD/DD oranı borsapy’den gelmedi; piyasa değeri / özkaynak üzerinden türetildi.")
+        st.info("PD/DD borsapy'den gelmedi; piyasa değeri / özkaynak üzerinden türetildiği için bağımsız hedef değildir.")
     if result.ratio_sources.get("pe_ratio_source") == "not_applicable_negative_income":
         st.info("F/K oranı negatif net kâr nedeniyle anlamlı değildir.")
 

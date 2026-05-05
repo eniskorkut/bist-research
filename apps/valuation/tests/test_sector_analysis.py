@@ -8,6 +8,8 @@ def test_calculate_sector_metrics() -> None:
         {"pe_ratio": 10.0, "pb_ratio": 1.5, "market_cap": 100.0, "estimated_net_income": 10.0, "equity": 50.0},
         {"pe_ratio": 8.0, "pb_ratio": 1.2, "market_cap": 80.0, "estimated_net_income": 8.0, "equity": 40.0},
         {"pe_ratio": -3.0, "pb_ratio": 0.0, "market_cap": 20.0, "estimated_net_income": -2.0, "equity": 10.0},
+        {"pe_ratio": None, "pb_ratio": None, "market_cap": 5.0, "estimated_net_income": None, "equity": 2.0},
+        {"pe_ratio": None, "pb_ratio": None, "market_cap": 5.0, "estimated_net_income": 0.0, "equity": 2.0},
     ]
     metrics = calculate_sector_metrics(snapshots)
     assert metrics["pe_median"] == 9.0
@@ -15,13 +17,15 @@ def test_calculate_sector_metrics() -> None:
     # pe_aggregate: only companies 1&2 (net_income>0 AND market_cap>0)
     # (100+80)/(10+8) = 10.0
     assert metrics["pe_aggregate"] == 10.0
-    # pb_aggregate: all three have equity>0 AND market_cap>0
-    # (100+80+20)/(50+40+10) = 2.0
-    assert metrics["pb_aggregate"] == 2.0
-    # roe_aggregate: all three have equity>0
-    # (10+8+(-2))/(50+40+10) = 0.16
-    assert metrics["roe_aggregate"] == 0.16
+    # pb_aggregate: all five have equity>0 AND market_cap>0
+    # (100+80+20+5+5)/(50+40+10+2+2) = 2.01923...
+    assert metrics["pb_aggregate"] == (210.0 / 104.0)
+    # roe_aggregate: all five have equity>0
+    # (10+8+(-2)+0+0)/(50+40+10+2+2) = 16/104
+    assert metrics["roe_aggregate"] == (16.0 / 104.0)
     assert metrics["negative_income_count"] == 1
+    assert metrics["missing_income_count"] == 1
+    assert metrics["zero_income_count"] == 1
     assert metrics["pe_valid_count"] == 2
 
 
@@ -47,3 +51,14 @@ def test_compare_company_to_sector() -> None:
     assert "fk_sektore_gore_iskontolu" in comparison["interpretation_flags"]
     assert "pd_dd_sektore_gore_iskontolu" in comparison["interpretation_flags"]
     assert "roe_sektor_ustu" in comparison["interpretation_flags"]
+
+
+def test_negative_income_count_ignores_none_nan() -> None:
+    snapshots = [
+        {"pe_ratio": 1.0, "pb_ratio": 1.0, "market_cap": 10.0, "estimated_net_income": None, "equity": 5.0},
+        {"pe_ratio": 1.0, "pb_ratio": 1.0, "market_cap": 10.0, "estimated_net_income": float("nan"), "equity": 5.0},
+        {"pe_ratio": 1.0, "pb_ratio": 1.0, "market_cap": 10.0, "estimated_net_income": -1.0, "equity": 5.0},
+    ]
+    metrics = calculate_sector_metrics(snapshots)
+    assert metrics["negative_income_count"] == 1
+    assert metrics["missing_income_count"] == 2
