@@ -13,7 +13,8 @@ from valuation.cache import (
     get_sector_metrics,
     init_db,
     is_snapshot_usable,
-    is_snapshot_valuation_ready,
+    is_snapshot_research_ready,
+    is_snapshot_full_valuation_ready,
     is_stale,
     should_write_snapshot,
     upsert_company_snapshot,
@@ -87,10 +88,22 @@ def build_target_price_dataframe(scenario: Any) -> pd.DataFrame:
     }
     rows: list[dict[str, str]] = []
     included = set(scenario.included_methods or [])
+    notes = scenario.method_notes or {}
+    status_map = {
+        "negative_net_income": "Atlandı: net kâr negatif",
+        "missing_or_negative_estimated_net_income": "Atlandı: net kâr negatif",
+        "missing_multiplier": "Atlandı: çarpan yok",
+        "missing_equity": "Atlandı: özkaynak yok",
+        "info_only": "Bilgi amaçlı",
+        "ok": "Kullanıldı",
+    }
     for method, value in scenario.target_prices.items():
         label, formula = method_map.get(method, (method, "-"))
         in_fair_value = "Evet" if method in included else "Hayır"
-        if value is None:
+        note = notes.get(method)
+        if note in status_map:
+            status = status_map[note]
+        elif value is None:
             status = "Eksik veri"
         elif method in included:
             status = "Kullanıldı"
@@ -143,6 +156,11 @@ def build_sector_dataframe(
         ("Sektör PD/DD Aggregate", fmt_number(metrics.get("pb_aggregate"))),
         ("Şirket ROE", fmt_pct(comp.get("company_roe"))),
         ("Sektör ROE Aggregate", fmt_pct(metrics.get("roe_aggregate"))),
+        ("Sektör PE Valid Sayısı", fmt_text(metrics.get("pe_valid_count"))),
+        ("Sektör PB Valid Sayısı", fmt_text(metrics.get("pb_valid_count"))),
+        ("Sektör ROE Valid Sayısı", fmt_text(metrics.get("roe_valid_count"))),
+        ("Sektör Negatif Kâr Sayısı", fmt_text(metrics.get("negative_income_count"))),
+        ("Sektör Çarpan Eksik Sayısı", fmt_text(metrics.get("missing_multiplier_count"))),
     ]
     return pd.DataFrame(rows, columns=["Gösterge", "Değer"])
 
@@ -259,9 +277,15 @@ def _render_scenario_tab(scenario: Any, title: str) -> None:
     c2.metric("Kullanılan Net Kâr", fmt_money(scenario.net_income))
     c3.metric("Net Kâr Kaynağı", fmt_text(scenario.net_income_source))
     c4, c5 = st.columns(2)
-    c4.metric("Medyan Adil Değer", fmt_money(scenario.fair_value_median))
+    c4.metric("Medyan Adil Değer", fmt_money(scenario.fair_value_median) if scenario.fair_value_median is not None else "Hesaplanamadı")
     c5.metric("Prim Potansiyeli", fmt_pct(scenario.upside_potential_pct))
     st.dataframe(build_target_price_dataframe(scenario), use_container_width=True, hide_index=True)
+    if scenario.valuation_status == "negative_net_income":
+        st.warning("Son 12 ay net kâr negatif olduğu için kurs modeline göre TTM bazlı F/K, EPS ve ödenmiş sermaye değerlemesi yapılmadı.")
+    elif scenario.valuation_status == "missing_or_negative_estimated_net_income":
+        st.warning("Yıl sonu pozitif net kâr tahmini üretilemediği için hedef fiyat hesaplanmadı.")
+    elif scenario.valuation_status == "insufficient_independent_methods":
+        st.warning("Yeterli bağımsız yöntem oluşmadığı için adil değer hesaplanamadı.")
 
     st.markdown("#### Ödenmiş Sermaye Detayı")
     details = scenario.paid_capital_details
@@ -387,9 +411,10 @@ def main() -> None:
     if not is_snapshot_usable(cached):
         _render_insufficient_data_panel(symbol, cached, ["snapshot_usable_degil"])
         return
-    valuation_ready, valuation_ready_errors = is_snapshot_valuation_ready(cached)
-    if not valuation_ready:
-        _render_insufficient_data_panel(symbol, cached, valuation_ready_errors)
+    research_ready, research_errors = is_snapshot_research_ready(cached)
+    full_ready, full_ready_errors = is_snapshot_full_valuation_ready(cached)
+    if not research_ready:
+        _render_insufficient_data_panel(symbol, cached, research_errors)
         return
 
     result = run_valuation_from_snapshot(cached, sector_metrics=sector_metrics, db_path=DB_PATH)
@@ -418,16 +443,25 @@ def main() -> None:
         ]
         for row in sidebar_rows:
             st.caption(row)
+    if not full_ready:
+        st.warning("Tam değerleme için yeterli veri yok. Sınırlı araştırma raporu gösteriliyor.")
+        st.info("Eksik tam değerleme alanları: " + ", ".join(full_ready_errors))
 
     year_end = result.valuation_scenarios["year_end"]
     ttm = result.valuation_scenarios["ttm"]
     col1, col2, col3, col4, col5, col6 = st.columns(6)
     col1.metric("Güncel Fiyat", fmt_money(result.price))
-    col2.metric("Yıl Sonu Adil Değer", fmt_money(year_end.fair_value_median))
+    col2.metric("Yıl Sonu Adil Değer", fmt_money(year_end.fair_value_median) if year_end.fair_value_median is not None else "Hesaplanamadı")
     col3.metric("Yıl Sonu Prim Potansiyeli", fmt_pct(year_end.upside_potential_pct))
-    col4.metric("TTM Adil Değer", fmt_money(ttm.fair_value_median))
+    col4.metric("TTM Adil Değer", fmt_money(ttm.fair_value_median) if ttm.fair_value_median is not None else "Hesaplanamadı")
     col5.metric("F/K", fmt_number(result.pe_ratio))
     col6.metric("PD/DD", fmt_number(result.pb_ratio))
+    if ttm.valuation_status == "negative_net_income" or year_end.valuation_status == "missing_or_negative_estimated_net_income":
+        st.warning("Bu şirket zarar açıkladığı için tam değerleme üretilemedi. Temel veriler ve araştırma görünümü aşağıdadır.")
+    if result.ratio_sources.get("pb_ratio_source") == "derived":
+        st.info("PD/DD oranı borsapy’den gelmedi; piyasa değeri / özkaynak üzerinden türetildi.")
+    if result.ratio_sources.get("pe_ratio_source") == "not_applicable_negative_income":
+        st.info("F/K oranı negatif net kâr nedeniyle anlamlı değildir.")
 
     tabs = st.tabs(
         [

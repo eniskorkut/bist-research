@@ -69,6 +69,7 @@ Streamlit arayuzunde "Cache Durumu" bolumunde su bilgiler gosterilir:
 Her aggregate metrikte pay ve payda ayni gecerli sirket setinden hesaplanir.
 
 Negatif kar veya negatif ozkaynakta ilgili carpana dayali hedef fiyat hesaplanmaz.
+Negatif net karda sistem hedef fiyat uretmez; kurs modeline gore pozitif gelecek/yil sonu net kar tahmini varsa ayri senaryoda degerleme yapilir.
 
 ## Komutlar
 

@@ -21,6 +21,8 @@ def test_calculate_sector_metrics() -> None:
     # roe_aggregate: all three have equity>0
     # (10+8+(-2))/(50+40+10) = 0.16
     assert metrics["roe_aggregate"] == 0.16
+    assert metrics["negative_income_count"] == 1
+    assert metrics["pe_valid_count"] == 2
 
 
 def test_calculate_sector_metrics_same_valid_set() -> None:

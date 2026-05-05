@@ -9,6 +9,8 @@ from valuation.cache import (
     get_company_snapshot,
     get_sector_metrics,
     init_db,
+    is_snapshot_research_ready,
+    is_snapshot_full_valuation_ready,
     is_snapshot_usable,
     is_snapshot_valuation_ready,
     is_stale,
@@ -218,7 +220,7 @@ def test_should_write_snapshot_protects_usable_from_unusable() -> None:
     }
     should_write, reason = should_write_snapshot(new_snapshot, old_snapshot)
     assert should_write is False
-    assert "worse_than_existing_usable" in reason
+    assert reason == "new_not_research_ready_rejected"
 
 
 def test_should_write_snapshot_writes_partial_over_unusable() -> None:
@@ -228,6 +230,7 @@ def test_should_write_snapshot_writes_partial_over_unusable() -> None:
         "price": 10.0,
         "market_cap": 100.0,
         "shares_outstanding": 10.0,
+        "paid_in_capital": 10.0,
         "equity": None,
         "estimated_net_income": None,
     }
@@ -263,8 +266,8 @@ def test_should_write_snapshot_rejects_non_ready_partial_when_no_old() -> None:
         "pb_ratio": 1.0,
     }
     should_write, reason = should_write_snapshot(new_snapshot, None)
-    assert should_write is False
-    assert reason == "new_snapshot_not_valuation_ready_no_existing_cache"
+    assert should_write is True
+    assert reason == "new_research_ready_written_no_existing_cache"
 
 
 def test_should_write_snapshot_rejects_non_ready_when_old_ready() -> None:
@@ -292,4 +295,24 @@ def test_should_write_snapshot_rejects_non_ready_when_old_ready() -> None:
     }
     should_write, reason = should_write_snapshot(new_snapshot, old_snapshot)
     assert should_write is False
-    assert reason == "new_snapshot_not_valuation_ready_preserved_existing"
+    assert reason == "new_research_only_preserved_existing_full_ready"
+
+
+def test_odine_like_research_ready_but_not_full_ready() -> None:
+    snapshot = {
+        "symbol": "ODINE",
+        "price": 1139.0,
+        "market_cap": 125_859_500_000.0,
+        "shares_outstanding": 110_500_000.0,
+        "paid_in_capital": 110_500_000.0,
+        "equity": 2_206_218_485.0,
+        "estimated_net_income": -21_986_528.0,
+        "pe_ratio": None,
+        "pb_ratio": None,
+    }
+    research_ready, _ = is_snapshot_research_ready(snapshot)
+    full_ready, _ = is_snapshot_full_valuation_ready(snapshot)
+    should_write, _ = should_write_snapshot(snapshot, None)
+    assert research_ready is True
+    assert full_ready is False
+    assert should_write is True

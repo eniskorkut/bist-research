@@ -60,10 +60,19 @@ def calculate_sector_metrics(company_snapshots: list[dict[str, Any]]) -> dict[st
     roe_valid = [s for s in company_snapshots if (s.get("equity") or 0) > 0]
     roe_income_sum = sum(float(s.get("estimated_net_income") or 0) for s in roe_valid)
     roe_equity_sum = sum(float(s["equity"]) for s in roe_valid)
+    negative_income_count = len([s for s in company_snapshots if (s.get("estimated_net_income") or 0) <= 0])
+    missing_multiplier_count = len(
+        [s for s in company_snapshots if (s.get("pe_ratio") in (None, 0)) and (s.get("pb_ratio") in (None, 0))]
+    )
 
     return {
         "member_count": len(company_snapshots),
         "valid_member_count": len([s for s in company_snapshots if not s.get("missing_fields_json")]),
+        "pe_valid_count": len(pe_values),
+        "pb_valid_count": len(pb_values),
+        "roe_valid_count": len(roe_valid),
+        "negative_income_count": negative_income_count,
+        "missing_multiplier_count": missing_multiplier_count,
         "pe_median": median(pe_values) if pe_values else None,
         "pe_aggregate": (pe_market_cap_sum / pe_income_sum) if pe_income_sum > 0 else None,
         "pb_median": median(pb_values) if pb_values else None,

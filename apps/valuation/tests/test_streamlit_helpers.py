@@ -37,6 +37,9 @@ def _scenario() -> ScenarioValuation:
             "final_method": "current_pe_only",
             "included_in_fair_value": True,
         },
+        method_notes={},
+        method_types={"cari_fk": "independent_target"},
+        valuation_status="full",
     )
 
 

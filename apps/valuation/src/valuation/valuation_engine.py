@@ -52,6 +52,9 @@ class ScenarioValuation:
     fair_value_mean_filtered: float | None
     upside_potential_pct: float | None
     paid_capital_details: dict[str, float | None | str]
+    method_notes: dict[str, str]
+    method_types: dict[str, str]
+    valuation_status: str
 
 
 @dataclass
@@ -72,6 +75,7 @@ class ValuationResult:
     equity_source: str
     data_quality_status: str
     missing_fields: list[str]
+    ratio_sources: dict[str, str]
 
 
 def _build_scenario(
@@ -88,12 +92,66 @@ def _build_scenario(
     pb: float | None,
     historical_pe_median: float | None,
     sector_pe_median: float | None,
+    disable_reason: str | None = None,
 ) -> ScenarioValuation:
+    all_methods = [
+        "cari_fk",
+        "pd_dd",
+        "odenmis_sermaye_x10",
+        "odenmis_sermaye_historical_pe",
+        "odenmis_sermaye_sector_pe",
+        "odenmis_sermaye_current_pe",
+        "odenmis_sermaye_final",
+        "potansiyel_piyasa_degeri",
+        "ozsermaye_karliligi",
+    ]
+    if disable_reason is not None:
+        target_prices = {method: None for method in all_methods}
+        return ScenarioValuation(
+            scenario_key=scenario_key,
+            period_label=period_label,
+            net_income=net_income,
+            net_income_source=net_income_source,
+            historical_pe_median=historical_pe_median,
+            target_prices=target_prices,
+            included_methods=[],
+            excluded_methods=list(all_methods),
+            fair_value_median=None,
+            fair_value_mean_filtered=None,
+            upside_potential_pct=None,
+            paid_capital_details={
+                "eps": None,
+                "x10": None,
+                "historical_pe_median": historical_pe_median,
+                "historical_pe_value": None,
+                "sector_pe_median": sector_pe_median,
+                "sector_pe_value": None,
+                "current_pe_value": None,
+                "final": None,
+                "final_method": "skipped",
+                "included_in_fair_value": False,
+            },
+            method_notes={method: disable_reason for method in all_methods},
+            method_types={method: "independent_target" for method in all_methods},
+            valuation_status=disable_reason,
+        )
+
     eps = _safe_div(net_income, shares)
     paid_cap_eps = _safe_div(net_income, paid_in_capital)
 
+    method_notes: dict[str, str] = {}
+    method_types: dict[str, str] = {}
+    if net_income is not None and net_income <= 0:
+        method_notes["cari_fk"] = "negative_net_income"
     cari_fk = _safe_div((net_income * pe) if net_income is not None and net_income > 0 and (pe or 0) > 0 else None, shares)
+    if pe in (None, 0):
+        method_notes["cari_fk"] = "missing_multiplier"
     pd_dd = _safe_div((equity * pb) if (equity or 0) > 0 and (pb or 0) > 0 else None, shares)
+    if (equity or 0) <= 0:
+        method_notes["pd_dd"] = "missing_equity"
+    elif pb in (None, 0):
+        method_notes["pd_dd"] = "missing_multiplier"
+    method_types["pd_dd"] = "independent_target"
 
     odenmis_sermaye_x10 = (paid_cap_eps * 10) if paid_cap_eps is not None and paid_cap_eps > 0 else None
     odenmis_sermaye_historical_pe = (
@@ -121,18 +179,34 @@ def _build_scenario(
         odenmis_sermaye_final = odenmis_sermaye_current_pe
         paid_cap_method = "current_pe_only"
 
+    if net_income is not None and net_income <= 0:
+        for m in [
+            "odenmis_sermaye_x10",
+            "odenmis_sermaye_historical_pe",
+            "odenmis_sermaye_sector_pe",
+            "odenmis_sermaye_current_pe",
+            "odenmis_sermaye_final",
+            "ozsermaye_karliligi",
+        ]:
+            method_notes[m] = "negative_net_income"
     implied_caps = []
     if net_income is not None and net_income > 0 and (pe or 0) > 0:
         implied_caps.append(net_income * pe)
     if (equity or 0) > 0 and (pb or 0) > 0:
         implied_caps.append(equity * pb)
     potansiyel_piyasa_degeri = _safe_div(_mean(implied_caps), shares)
+    if not implied_caps:
+        method_notes["potansiyel_piyasa_degeri"] = "missing_multiplier"
 
     estimated_roe = _safe_div(net_income, equity) if (net_income or 0) > 0 and (equity or 0) > 0 else None
     ozsermaye_karliligi = _safe_div(
         (estimated_roe * equity * pb) if estimated_roe is not None and (pb or 0) > 0 and (equity or 0) > 0 else None,
         shares,
     )
+    if (equity or 0) <= 0:
+        method_notes["ozsermaye_karliligi"] = "missing_equity"
+    elif pb in (None, 0):
+        method_notes["ozsermaye_karliligi"] = "missing_multiplier"
 
     target_prices = {
         "cari_fk": cari_fk,
@@ -154,6 +228,7 @@ def _build_scenario(
             continue
         if method in {"odenmis_sermaye_x10", "odenmis_sermaye_historical_pe", "odenmis_sermaye_sector_pe", "odenmis_sermaye_current_pe"}:
             excluded_methods.append(method)
+            method_notes.setdefault(method, "info_only")
             continue
         if value <= 0:
             excluded_methods.append(method)
@@ -164,12 +239,23 @@ def _build_scenario(
                 continue
         included_methods.append(method)
         fair_values.append(float(value))
+        method_types.setdefault(method, "independent_target")
+        method_notes.setdefault(method, "ok")
 
-    fair_value_median = median(fair_values) if fair_values else None
-    fair_value_mean_filtered = _filtered_mean([float(v) for v in fair_values if v is not None])
-    upside_potential_pct = (
-        ((fair_value_median - price) / price) * 100 if fair_value_median is not None and price not in (None, 0) else None
-    )
+    independent_included = [m for m in included_methods if method_types.get(m) == "independent_target"]
+    valuation_status = "full"
+    if len(independent_included) < 1 or len(included_methods) < 2:
+        fair_values = []
+        fair_value_median = None
+        fair_value_mean_filtered = None
+        upside_potential_pct = None
+        valuation_status = "insufficient_independent_methods"
+    else:
+        fair_value_median = median(fair_values) if fair_values else None
+        fair_value_mean_filtered = _filtered_mean([float(v) for v in fair_values if v is not None])
+        upside_potential_pct = (
+            ((fair_value_median - price) / price) * 100 if fair_value_median is not None and price not in (None, 0) else None
+        )
 
     return ScenarioValuation(
         scenario_key=scenario_key,
@@ -195,7 +281,27 @@ def _build_scenario(
             "final_method": paid_cap_method,
             "included_in_fair_value": odenmis_sermaye_final is not None,
         },
+        method_notes=method_notes,
+        method_types=method_types,
+        valuation_status=valuation_status,
     )
+
+
+def _resolve_ratios(market_cap: float | None, equity: float | None, net_income: float | None, pe: float | None, pb: float | None) -> tuple[float | None, float | None, dict[str, str]]:
+    pe_ratio = pe
+    pb_ratio = pb
+    pe_source = "borsapy" if pe_ratio is not None else "missing"
+    pb_source = "borsapy" if pb_ratio is not None else "missing"
+    if pb_ratio is None and (market_cap or 0) > 0 and (equity or 0) > 0:
+        pb_ratio = market_cap / equity
+        pb_source = "derived"
+    if pe_ratio is None:
+        if net_income is not None and net_income <= 0:
+            pe_source = "not_applicable_negative_income"
+        elif (market_cap or 0) > 0 and (net_income or 0) > 0:
+            pe_ratio = market_cap / net_income
+            pe_source = "derived"
+    return pe_ratio, pb_ratio, {"pe_ratio_source": pe_source, "pb_ratio_source": pb_source}
 
 
 def run_valuation(
@@ -209,6 +315,17 @@ def run_valuation(
     estimation = estimate_net_income_from_snapshot(snapshot)
     historical_pe_median = get_historical_pe_median(symbol)
     sector_pe_median = (sector_metrics or {}).get("pe_median")
+    resolved_pe, resolved_pb, ratio_sources = _resolve_ratios(
+        snapshot.market_cap, snapshot.equity, estimation.estimated_net_income, snapshot.pe_ratio, snapshot.pb_ratio
+    )
+    ttm_income = snapshot.net_income_ttm
+    year_end_income = estimation.estimated_net_income
+    ttm_disable_reason = None
+    if (ttm_income is None or ttm_income <= 0) or (year_end_income is None or year_end_income <= 0):
+        ttm_disable_reason = "negative_net_income"
+    year_end_disable_reason = None
+    if year_end_income is None or year_end_income <= 0:
+        year_end_disable_reason = "missing_or_negative_estimated_net_income"
 
     ttm_scenario = _build_scenario(
         scenario_key="ttm",
@@ -219,10 +336,11 @@ def run_valuation(
         shares=snapshot.shares_outstanding,
         paid_in_capital=snapshot.paid_in_capital,
         equity=snapshot.equity,
-        pe=snapshot.pe_ratio,
-        pb=snapshot.pb_ratio,
+        pe=resolved_pe,
+        pb=resolved_pb,
         historical_pe_median=historical_pe_median,
         sector_pe_median=sector_pe_median,
+        disable_reason=ttm_disable_reason,
     )
     year_end_scenario = _build_scenario(
         scenario_key="year_end",
@@ -233,17 +351,18 @@ def run_valuation(
         shares=snapshot.shares_outstanding,
         paid_in_capital=snapshot.paid_in_capital,
         equity=snapshot.equity,
-        pe=snapshot.pe_ratio,
-        pb=snapshot.pb_ratio,
+        pe=resolved_pe,
+        pb=resolved_pb,
         historical_pe_median=historical_pe_median,
         sector_pe_median=sector_pe_median,
+        disable_reason=year_end_disable_reason,
     )
 
     estimated_roe = _safe_div(estimation.estimated_net_income, snapshot.equity) if (estimation.estimated_net_income or 0) > 0 and (snapshot.equity or 0) > 0 else None
     sector_comparison = compare_company_to_sector(
         {
-            "pe_ratio": snapshot.pe_ratio,
-            "pb_ratio": snapshot.pb_ratio,
+            "pe_ratio": resolved_pe,
+            "pb_ratio": resolved_pb,
             "roe": estimated_roe,
             "estimated_net_income": estimation.estimated_net_income,
             "equity": snapshot.equity,
@@ -270,8 +389,8 @@ def run_valuation(
         paid_in_capital=snapshot.paid_in_capital,
         equity=snapshot.equity,
         market_cap=snapshot.market_cap,
-        pe_ratio=snapshot.pe_ratio,
-        pb_ratio=snapshot.pb_ratio,
+        pe_ratio=resolved_pe,
+        pb_ratio=resolved_pb,
         valuation_scenarios={"ttm": ttm_scenario, "year_end": year_end_scenario},
         estimation=estimation,
         sector_comparison=sector_comparison,
@@ -280,6 +399,7 @@ def run_valuation(
         equity_source=snapshot.equity_source,
         data_quality_status=quality_status,
         missing_fields=missing,
+        ratio_sources=ratio_sources,
     )
     if db_path:
         save_valuation_result(
@@ -311,6 +431,17 @@ def run_valuation_from_snapshot(
     quality_status, quality_errors = evaluate_snapshot_quality(snapshot)
     historical_pe_median = get_historical_pe_median(symbol)
     sector_pe_median = (sector_metrics or {}).get("pe_median")
+    resolved_pe, resolved_pb, ratio_sources = _resolve_ratios(
+        snapshot.get("market_cap"), snapshot.get("equity"), snapshot.get("estimated_net_income"), snapshot.get("pe_ratio"), snapshot.get("pb_ratio")
+    )
+    ttm_income = snapshot.get("net_income_ttm")
+    year_end_income = snapshot.get("estimated_net_income")
+    ttm_disable_reason = None
+    if (ttm_income is None or ttm_income <= 0) or (year_end_income is None or year_end_income <= 0):
+        ttm_disable_reason = "negative_net_income"
+    year_end_disable_reason = None
+    if year_end_income is None or year_end_income <= 0:
+        year_end_disable_reason = "missing_or_negative_estimated_net_income"
 
     estimation = ProfitEstimationResult(
         symbol=symbol,
@@ -331,10 +462,11 @@ def run_valuation_from_snapshot(
         shares=snapshot.get("shares_outstanding"),
         paid_in_capital=snapshot.get("paid_in_capital"),
         equity=snapshot.get("equity"),
-        pe=snapshot.get("pe_ratio"),
-        pb=snapshot.get("pb_ratio"),
+        pe=resolved_pe,
+        pb=resolved_pb,
         historical_pe_median=historical_pe_median,
         sector_pe_median=sector_pe_median,
+        disable_reason=ttm_disable_reason,
     )
     year_end_scenario = _build_scenario(
         scenario_key="year_end",
@@ -345,17 +477,18 @@ def run_valuation_from_snapshot(
         shares=snapshot.get("shares_outstanding"),
         paid_in_capital=snapshot.get("paid_in_capital"),
         equity=snapshot.get("equity"),
-        pe=snapshot.get("pe_ratio"),
-        pb=snapshot.get("pb_ratio"),
+        pe=resolved_pe,
+        pb=resolved_pb,
         historical_pe_median=historical_pe_median,
         sector_pe_median=sector_pe_median,
+        disable_reason=year_end_disable_reason,
     )
 
     estimated_roe = _safe_div(snapshot.get("estimated_net_income"), snapshot.get("equity")) if (snapshot.get("estimated_net_income") or 0) > 0 and (snapshot.get("equity") or 0) > 0 else None
     sector_comparison = compare_company_to_sector(
         {
-            "pe_ratio": snapshot.get("pe_ratio"),
-            "pb_ratio": snapshot.get("pb_ratio"),
+            "pe_ratio": resolved_pe,
+            "pb_ratio": resolved_pb,
             "roe": estimated_roe,
             "estimated_net_income": snapshot.get("estimated_net_income"),
             "equity": snapshot.get("equity"),
@@ -374,8 +507,8 @@ def run_valuation_from_snapshot(
         paid_in_capital=snapshot.get("paid_in_capital"),
         equity=snapshot.get("equity"),
         market_cap=snapshot.get("market_cap"),
-        pe_ratio=snapshot.get("pe_ratio"),
-        pb_ratio=snapshot.get("pb_ratio"),
+        pe_ratio=resolved_pe,
+        pb_ratio=resolved_pb,
         valuation_scenarios={"ttm": ttm_scenario, "year_end": year_end_scenario},
         estimation=estimation,
         sector_comparison=sector_comparison,
@@ -384,6 +517,7 @@ def run_valuation_from_snapshot(
         equity_source=snapshot.get("equity_source", "unknown"),
         data_quality_status=quality_status,
         missing_fields=missing,
+        ratio_sources=ratio_sources,
     )
     if db_path and quality_status != "unusable":
         save_valuation_result(

@@ -260,6 +260,51 @@ def is_snapshot_usable(snapshot: dict[str, Any]) -> bool:
 
 
 def is_snapshot_valuation_ready(snapshot: dict[str, Any]) -> tuple[bool, list[str]]:
+    return is_snapshot_full_valuation_ready(snapshot)
+
+
+def is_snapshot_storable(snapshot: dict[str, Any]) -> tuple[bool, list[str]]:
+    def _pos(name: str) -> bool:
+        value = snapshot.get(name)
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return False
+        return not math.isnan(numeric) and not math.isinf(numeric) and numeric > 0
+
+    errors: list[str] = []
+    if not snapshot.get("symbol"):
+        errors.append("symbol_missing")
+    if not (_pos("price") or _pos("market_cap")):
+        errors.append("price_or_market_cap_missing_or_nonpositive")
+    if not (_pos("shares_outstanding") or _pos("paid_in_capital")):
+        errors.append("shares_or_paid_in_capital_missing_or_nonpositive")
+    if not _pos("equity"):
+        errors.append("equity_missing_or_nonpositive")
+    fatal = {"symbol_missing", "price_or_market_cap_missing_or_nonpositive", "shares_or_paid_in_capital_missing_or_nonpositive"}
+    return len([e for e in errors if e in fatal]) == 0, errors
+
+
+def is_snapshot_research_ready(snapshot: dict[str, Any]) -> tuple[bool, list[str]]:
+    def _pos(name: str) -> bool:
+        value = snapshot.get(name)
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return False
+        return not math.isnan(numeric) and not math.isinf(numeric) and numeric > 0
+
+    errors: list[str] = []
+    if not _pos("price"):
+        errors.append("price_missing_or_nonpositive")
+    if not (_pos("market_cap") or _pos("shares_outstanding")):
+        errors.append("market_cap_or_shares_missing_or_nonpositive")
+    if not (_pos("equity") or _pos("paid_in_capital")):
+        errors.append("equity_or_paid_in_capital_missing_or_nonpositive")
+    return len(errors) == 0, errors
+
+
+def is_snapshot_full_valuation_ready(snapshot: dict[str, Any]) -> tuple[bool, list[str]]:
     def _pos(name: str) -> bool:
         value = snapshot.get(name)
         try:
@@ -295,15 +340,22 @@ def should_write_snapshot(new_snapshot: dict[str, Any], old_snapshot: dict[str, 
     if old_snapshot is None:
         if new_status == "unusable":
             return False, "new_snapshot_unusable_no_existing_cache"
-        new_ready, _ = is_snapshot_valuation_ready(new_snapshot)
-        if not new_ready:
-            return False, "new_snapshot_not_valuation_ready_no_existing_cache"
-        return True, "new_snapshot_written_no_existing_cache"
+        new_research_ready, _ = is_snapshot_research_ready(new_snapshot)
+        if not new_research_ready:
+            return False, "new_not_research_ready_rejected"
+        new_full_ready, _ = is_snapshot_full_valuation_ready(new_snapshot)
+        if new_full_ready:
+            return True, "new_full_valuation_ready_written_no_existing_cache"
+        return True, "new_research_ready_written_no_existing_cache"
 
-    new_ready, _ = is_snapshot_valuation_ready(new_snapshot)
-    old_ready, _ = is_snapshot_valuation_ready(old_snapshot)
-    if old_ready and not new_ready:
-        return False, "new_snapshot_not_valuation_ready_preserved_existing"
+    new_research_ready, _ = is_snapshot_research_ready(new_snapshot)
+    old_research_ready, _ = is_snapshot_research_ready(old_snapshot)
+    if not new_research_ready:
+        return False, "new_not_research_ready_rejected"
+    new_full_ready, _ = is_snapshot_full_valuation_ready(new_snapshot)
+    old_full_ready, _ = is_snapshot_full_valuation_ready(old_snapshot)
+    if old_full_ready and not new_full_ready:
+        return False, "new_research_only_preserved_existing_full_ready"
 
     if priority[new_status] < priority[old_status]:
         return False, f"new_snapshot_{new_status}_worse_than_existing_{old_status}"
@@ -311,7 +363,11 @@ def should_write_snapshot(new_snapshot: dict[str, Any], old_snapshot: dict[str, 
     if old_status == "usable" and new_status == "partial":
         return False, "new_snapshot_partial_worse_than_existing_usable"
 
-    if old_status == "partial" and not new_ready:
-        return False, "new_snapshot_not_valuation_ready_worse_than_existing_partial"
+    if not old_research_ready and new_research_ready:
+        return True, "new_research_ready_written_over_non_research_existing"
+    if old_status == "partial" and new_full_ready:
+        return True, "new_full_valuation_ready_written"
+    if old_status == "partial" and new_research_ready:
+        return True, "new_research_ready_written"
 
     return True, f"new_snapshot_{new_status}_written_over_existing_{old_status}"

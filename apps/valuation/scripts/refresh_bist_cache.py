@@ -8,6 +8,8 @@ from valuation.cache import (
     evaluate_snapshot_quality,
     get_company_snapshot,
     init_db,
+    is_snapshot_full_valuation_ready,
+    is_snapshot_research_ready,
     is_stale,
     should_write_snapshot,
     upsert_company_snapshot,
@@ -45,26 +47,36 @@ def main() -> None:
     by_sector: dict[str, list[dict]] = {}
     sector_name_map = get_bist_sector_map()
     refreshed_symbols: list[str] = []
-    skipped_fresh_symbols: list[str] = []
+    skipped_fresh_full_ready_symbols: list[str] = []
+    skipped_fresh_research_only_symbols: list[str] = []
     usable_symbols: list[str] = []
     partial_symbols: list[str] = []
     unusable_symbols: list[str] = []
     rejected_unusable_refresh: list[str] = []
     preserved_existing_cache: list[str] = []
     overwritten_symbols: list[str] = []
+    refreshed_not_research_ready_symbols: list[str] = []
+    refreshed_research_ready_symbols: list[str] = []
+    refreshed_full_ready_symbols: list[str] = []
 
     for symbol in symbols:
         try:
             # Check cache freshness before calling borsapy
             existing = get_company_snapshot(args.db_path, symbol)
-            existing_status = (existing or {}).get("data_quality_status")
-            if (
-                existing is not None
-                and not is_stale(existing.get("updated_at"))
-                and existing_status in {"usable", "partial"}
-                and not args.force
-            ):
-                skipped_fresh_symbols.append(symbol)
+            existing_fresh = existing is not None and not is_stale(existing.get("updated_at"))
+            existing_full_ready = False
+            existing_research_ready = False
+            if existing is not None:
+                existing_full_ready, _ = is_snapshot_full_valuation_ready(existing)
+                existing_research_ready, _ = is_snapshot_research_ready(existing)
+            if existing_fresh and not args.force and existing_full_ready:
+                skipped_fresh_full_ready_symbols.append(symbol)
+                sector_index = existing.get("sector_index")
+                if sector_index:
+                    by_sector.setdefault(sector_index, []).append(existing)
+                continue
+            if existing_fresh and not args.force and existing_research_ready:
+                skipped_fresh_research_only_symbols.append(symbol)
                 sector_index = existing.get("sector_index")
                 if sector_index:
                     by_sector.setdefault(sector_index, []).append(existing)
@@ -111,6 +123,14 @@ def main() -> None:
             if should_write:
                 upsert_company_snapshot(args.db_path, payload)
                 refreshed_symbols.append(symbol)
+                is_research_ready, _ = is_snapshot_research_ready(payload)
+                is_full_ready, _ = is_snapshot_full_valuation_ready(payload)
+                if is_full_ready:
+                    refreshed_full_ready_symbols.append(symbol)
+                elif is_research_ready:
+                    refreshed_research_ready_symbols.append(symbol)
+                else:
+                    refreshed_not_research_ready_symbols.append(symbol)
                 if existing is not None:
                     overwritten_symbols.append(symbol)
                 if quality_status == "usable":
@@ -141,7 +161,11 @@ def main() -> None:
 
     print(f"processed_symbols={len(symbols)}")
     print(f"refreshed_symbols={len(refreshed_symbols)}")
-    print(f"skipped_fresh_symbols={len(skipped_fresh_symbols)}")
+    print(f"skipped_fresh_full_ready_symbols={len(skipped_fresh_full_ready_symbols)}")
+    print(f"skipped_fresh_research_only_symbols={len(skipped_fresh_research_only_symbols)}")
+    print(f"refreshed_not_research_ready_symbols={len(refreshed_not_research_ready_symbols)}")
+    print(f"refreshed_research_ready_symbols={len(refreshed_research_ready_symbols)}")
+    print(f"refreshed_full_ready_symbols={len(refreshed_full_ready_symbols)}")
     print(f"usable_symbols={len(usable_symbols)}")
     print(f"partial_symbols={len(partial_symbols)}")
     print(f"unusable_symbols={len(unusable_symbols)}")
@@ -152,8 +176,10 @@ def main() -> None:
     if errors:
         for item in errors:
             print(f"warning={item}")
-    if skipped_fresh_symbols:
-        print(f"skipped_list={','.join(skipped_fresh_symbols)}")
+    if skipped_fresh_full_ready_symbols:
+        print(f"skipped_full_ready_list={','.join(skipped_fresh_full_ready_symbols)}")
+    if skipped_fresh_research_only_symbols:
+        print(f"skipped_research_only_list={','.join(skipped_fresh_research_only_symbols)}")
     if unusable_symbols:
         print(f"unusable_list={','.join(unusable_symbols)}")
     print(f"sector_metrics_computed={sector_count}")

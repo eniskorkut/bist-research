@@ -152,5 +152,85 @@ def test_only_x10_available_is_info_only(monkeypatch) -> None:
     result = run_valuation_from_snapshot(cached, sector_metrics={"pe_median": None})
     scenario = result.valuation_scenarios["year_end"]
     assert scenario.paid_capital_details["x10"] is not None
-    assert scenario.paid_capital_details["final"] is None
-    assert scenario.paid_capital_details["included_in_fair_value"] is False
+    assert scenario.paid_capital_details["final"] is not None
+    assert scenario.paid_capital_details["final_method"] == "current_pe_only"
+
+
+def test_negative_income_excludes_pe_eps_methods() -> None:
+    cached = {
+        "symbol": "ODINE",
+        "price": 1139.0,
+        "market_cap": 125_859_500_000.0,
+        "shares_outstanding": 110_500_000.0,
+        "paid_in_capital": 110_500_000.0,
+        "pe_ratio": None,
+        "pb_ratio": None,
+        "equity": 2_206_218_485.0,
+        "estimated_net_income": -21_986_528.0,
+        "net_income_ttm": -21_986_528.0,
+        "period_type": "interim",
+        "financial_period": "2025",
+        "data_quality_status": "usable",
+        "missing_fields_json": [],
+        "net_income_source": "financial_statement",
+        "equity_source": "financial_statement",
+    }
+    result = run_valuation_from_snapshot(cached)
+    scenario = result.valuation_scenarios["year_end"]
+    assert scenario.target_prices["cari_fk"] is None
+    assert scenario.target_prices["odenmis_sermaye_x10"] is None
+    assert scenario.target_prices["odenmis_sermaye_final"] is None
+    assert scenario.valuation_status == "missing_or_negative_estimated_net_income"
+    assert scenario.fair_value_median is None
+    assert result.ratio_sources["pe_ratio_source"] == "not_applicable_negative_income"
+
+
+def test_negative_ttm_with_positive_year_end_runs_only_year_end() -> None:
+    cached = {
+        "symbol": "ODINE",
+        "price": 100.0,
+        "market_cap": 1_000_000.0,
+        "shares_outstanding": 10_000.0,
+        "paid_in_capital": 10_000.0,
+        "pe_ratio": 4.0,
+        "pb_ratio": 1.2,
+        "equity": 800_000.0,
+        "estimated_net_income": 120_000.0,
+        "net_income_ttm": -10_000.0,
+        "period_type": "interim",
+        "financial_period": "2025",
+        "data_quality_status": "usable",
+        "missing_fields_json": [],
+        "net_income_source": "auto_estimate",
+        "equity_source": "financial_statement",
+    }
+    result = run_valuation_from_snapshot(cached)
+    ttm = result.valuation_scenarios["ttm"]
+    year_end = result.valuation_scenarios["year_end"]
+    assert ttm.valuation_status == "negative_net_income"
+    assert ttm.fair_value_median is None
+    assert year_end.valuation_status in {"full", "partial", "insufficient_independent_methods"}
+
+
+def test_derived_pb_ratio_used_when_missing() -> None:
+    cached = {
+        "symbol": "TEST",
+        "price": 100.0,
+        "market_cap": 1_000_000.0,
+        "shares_outstanding": 10_000.0,
+        "paid_in_capital": 10_000.0,
+        "pe_ratio": 5.0,
+        "pb_ratio": None,
+        "equity": 500_000.0,
+        "estimated_net_income": 200_000.0,
+        "net_income_ttm": 200_000.0,
+        "period_type": "interim",
+        "financial_period": "2025",
+        "data_quality_status": "usable",
+        "missing_fields_json": [],
+        "net_income_source": "financial_statement",
+        "equity_source": "financial_statement",
+    }
+    result = run_valuation_from_snapshot(cached)
+    assert result.pb_ratio == 2.0
+    assert result.ratio_sources["pb_ratio_source"] == "derived"
