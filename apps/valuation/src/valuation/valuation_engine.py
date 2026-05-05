@@ -365,13 +365,41 @@ def _build_scenario(
     independent_included = [m for m in included_methods if method_types.get(m) == "independent_target"]
     valuation_status = "full"
     if len(independent_included) < 2:
-        fair_values = []
-        fair_value_median = None
-        fair_value_mean_filtered = None
-        upside_potential_pct = None
-        valuation_status = "insufficient_independent_methods"
-        for method in excluded_methods:
-            method_notes.setdefault(method, "insufficient_independent_methods")
+        company_reference_methods = [
+            method
+            for method in ["cari_fk", "pd_dd"]
+            if target_prices.get(method) is not None
+            and method_notes.get(method) not in {"missing_pe_ratio", "missing_pb_ratio", "negative_net_income", "missing_equity", "missing_market_cap", "missing_shares"}
+        ]
+        company_reference_values = [
+            float(target_prices[method])
+            for method in company_reference_methods
+            if target_prices.get(method) is not None and float(target_prices[method]) > 0
+        ]
+        can_use_company_reference_fallback = (
+            len(company_reference_values) >= 2
+            and str(net_income_source).startswith("implied_from_")
+        )
+        if can_use_company_reference_fallback:
+            fair_values = company_reference_values
+            fair_value_median = median(fair_values)
+            fair_value_mean_filtered = _filtered_mean([float(v) for v in fair_values if v is not None])
+            upside_potential_pct = (
+                ((fair_value_median - price) / price) * 100 if fair_value_median is not None and price not in (None, 0) else None
+            )
+            valuation_status = "full"
+            for method in company_reference_methods:
+                method_types[method] = "current_implied"
+                method_notes.setdefault(method, "info_only")
+                method_sources.setdefault(method, "cari_company_multiple")
+        else:
+            fair_values = []
+            fair_value_median = None
+            fair_value_mean_filtered = None
+            upside_potential_pct = None
+            valuation_status = "insufficient_independent_methods"
+            for method in excluded_methods:
+                method_notes.setdefault(method, "insufficient_independent_methods")
     else:
         fair_value_median = median(fair_values) if fair_values else None
         fair_value_mean_filtered = _filtered_mean([float(v) for v in fair_values if v is not None])

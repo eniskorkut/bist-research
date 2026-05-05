@@ -61,12 +61,13 @@ services:
 
   valuation-app:
     build:
-      context: ./apps/valuation
+      context: .
+      dockerfile: apps/valuation/Dockerfile
     container_name: valuation-app
     command:
       - streamlit
       - run
-      - src/valuation/streamlit_app.py
+      - apps/valuation/src/valuation/streamlit_app.py
       - --server.address=0.0.0.0
       - --server.port=8502
     ports:
@@ -77,7 +78,8 @@ services:
 
   valuation-refresh:
     build:
-      context: ./apps/valuation
+      context: .
+      dockerfile: apps/valuation/Dockerfile
     container_name: valuation-refresh
     command:
       - python

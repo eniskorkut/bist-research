@@ -7,6 +7,7 @@ from typing import Any
 import pandas as pd
 import streamlit as st
 
+from market_radar.streamlit_app import render_positive_interest_radar_page
 from valuation.cache import (
     evaluate_snapshot_quality,
     get_company_snapshot,
@@ -326,8 +327,9 @@ def _render_scenario_tab(scenario: Any, title: str) -> None:
     )
 
 
-def main() -> None:
-    st.set_page_config(page_title="BIST Otomatik Değerleme", layout="wide")
+def render_company_valuation_page(*, embedded: bool = False) -> None:
+    if not embedded:
+        st.set_page_config(page_title="BIST Otomatik Değerleme", layout="wide")
     st.markdown(
         """
         <style>
@@ -657,6 +659,15 @@ def main() -> None:
             st.json(to_plain_dict(result))
 
     st.info("Yatırım tavsiyesi değildir.")
+
+
+def main() -> None:
+    st.set_page_config(page_title="BIST Araştırma Paneli", layout="wide")
+    page = st.sidebar.radio("Modül", ["Şirket Değerleme", "Pozitif İlgi Radarı"])
+    if page == "Şirket Değerleme":
+        render_company_valuation_page(embedded=True)
+    else:
+        render_positive_interest_radar_page(embedded=True)
 
 
 if __name__ == "__main__":
