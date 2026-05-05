@@ -3,6 +3,8 @@ from __future__ import annotations
 import argparse
 import sqlite3
 
+from valuation.symbols import normalize_bist_symbol
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
@@ -20,7 +22,10 @@ def main() -> None:
     cur = conn.cursor()
 
     if args.symbol:
-        rows = cur.execute("SELECT * FROM company_snapshot WHERE symbol = ?", (args.symbol.upper(),)).fetchall()
+        normalized_symbol = normalize_bist_symbol(args.symbol)
+        print(f"Input symbol: {args.symbol}")
+        print(f"Normalized symbol: {normalized_symbol}")
+        rows = cur.execute("SELECT * FROM company_snapshot WHERE symbol = ?", (normalized_symbol,)).fetchall()
     else:
         rows = cur.execute("SELECT * FROM company_snapshot ORDER BY updated_at DESC LIMIT ?", (args.limit,)).fetchall()
     print("== company_snapshot ==")

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from valuation.valuation_engine import run_valuation
+from valuation.symbols import normalize_bist_symbol
 
 
 def main() -> None:
-    for symbol in ["THYAO", "ASELS", "TUPRS"]:
+    for raw_symbol in ["thyao", "asels", "tuprs"]:
+        symbol = normalize_bist_symbol(raw_symbol)
         print(f"\n=== {symbol} ===")
         try:
             result = run_valuation(symbol)

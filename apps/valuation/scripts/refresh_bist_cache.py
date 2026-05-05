@@ -22,6 +22,7 @@ from valuation.sector_analysis import (
     get_bist_sector_map,
     get_sector_index_for_symbol,
 )
+from valuation.symbols import normalize_bist_symbol, validate_bist_symbol
 
 
 def parse_args() -> argparse.Namespace:
@@ -38,7 +39,13 @@ def main() -> None:
     args = parse_args()
     init_db(args.db_path)
     symbols = args.symbols or list(getattr(bp.Index(args.index), "component_symbols", []) or [])
-    symbols = sorted({str(s).strip().upper() for s in symbols if s})
+    normalized_symbols: list[str] = []
+    for raw in symbols:
+        normalized = normalize_bist_symbol(str(raw))
+        ok, _ = validate_bist_symbol(normalized)
+        if ok:
+            normalized_symbols.append(normalized)
+    symbols = sorted(set(normalized_symbols))
     if args.max_symbols:
         symbols = symbols[: args.max_symbols]
 

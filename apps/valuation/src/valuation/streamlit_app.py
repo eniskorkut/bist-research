@@ -29,6 +29,7 @@ from valuation.sector_analysis import (
     get_sector_index_for_symbol,
     get_sector_symbols,
 )
+from valuation.symbols import normalize_bist_symbol, validate_bist_symbol
 from valuation.valuation_engine import run_valuation_from_snapshot
 
 DB_PATH = "/data/valuation_cache.sqlite"
@@ -351,7 +352,10 @@ def main() -> None:
 
     with st.sidebar:
         st.header("Girdi")
-        symbol = st.text_input("Hisse kodu", value="THYAO").strip().upper()
+        raw_symbol = st.text_input("Hisse kodu", value="THYAO")
+        symbol = normalize_bist_symbol(raw_symbol)
+        if raw_symbol.strip() and raw_symbol.strip() != symbol:
+            st.caption(f"{raw_symbol} girdisi {symbol} olarak normalize edildi.")
         analyze = st.button("Analiz")
         refresh = st.button("Cache’i yenile")
         st.markdown("<div class='small-note'>Cache taze ise borsapy yeniden çağrılmaz.</div>", unsafe_allow_html=True)
@@ -360,13 +364,24 @@ def main() -> None:
         st.session_state["analyze_requested"] = True
 
     if refresh and symbol:
+        valid_symbol, _ = validate_bist_symbol(symbol)
+        if not valid_symbol:
+            st.error("Geçerli bir BIST işlem kodu girin. Örnek: ASELS, THYAO, ODINE")
+            return
         try:
             with st.spinner("Cache yenileniyor..."):
                 _, _, _, refresh_meta = _refresh_symbol_and_sector(symbol, DB_PATH, force=True)
             st.session_state["last_refresh_meta"] = refresh_meta
             st.rerun()
         except Exception as exc:  # noqa: BLE001
-            st.error(f"Cache yenileme hatası: {exc}")
+            if "No financial data available for" in str(exc):
+                st.error("Veri kaynağı bu sembol için finansal tablo döndürmedi.")
+                st.info(f"Normalize edilen sembol: {symbol}")
+                st.warning("Kontrol: BIST işlem kodunu doğru girdiğinizden emin olun.")
+            else:
+                st.error(f"Cache yenileme hatası: {exc}")
+            if len(symbol) > 6:
+                st.info(f"{symbol} için veri bulunamadı. Şirket adı yerine BIST işlem kodu girin. Örnek: ASELS.")
             return
 
     if not st.session_state["analyze_requested"]:
@@ -374,6 +389,12 @@ def main() -> None:
         return
     if not symbol:
         st.error("Hisse kodu girin.")
+        return
+    valid_symbol, validation_error = validate_bist_symbol(symbol)
+    if not valid_symbol:
+        st.error("Geçerli bir BIST işlem kodu girin. Örnek: ASELS, THYAO, ODINE")
+        if validation_error:
+            st.caption(validation_error)
         return
 
     cached = get_company_snapshot(DB_PATH, symbol)
@@ -396,7 +417,14 @@ def main() -> None:
             sector_fresh = sector_metrics is not None and not is_stale(sector_metrics.get("calculated_at"))
             valuation_source = "borsapy_refresh"
         except Exception as exc:  # noqa: BLE001
-            st.error(f"Veri çekme hatası: {exc}")
+            if "No financial data available for" in str(exc):
+                st.error("Veri kaynağı bu sembol için finansal tablo döndürmedi.")
+                st.info(f"Normalize edilen sembol: {symbol}")
+                st.warning("Kontrol: BIST işlem kodunu doğru girdiğinizden emin olun.")
+                if len(symbol) > 6:
+                    st.info(f"{symbol} için veri bulunamadı. Şirket adı yerine BIST işlem kodu girin. Örnek: ASELS.")
+            else:
+                st.error(f"Veri çekme hatası: {exc}")
             return
     elif not sector_fresh:
         try:

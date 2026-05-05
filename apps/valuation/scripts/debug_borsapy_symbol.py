@@ -6,6 +6,7 @@ from pprint import pprint
 import borsapy as bp
 
 from valuation.data_access import BorsapyFinancialClient
+from valuation.symbols import normalize_bist_symbol, validate_bist_symbol
 
 
 def _safe_mapping(obj):
@@ -36,7 +37,14 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    symbol = args.symbol.strip().upper()
+    raw_symbol = args.symbol
+    symbol = normalize_bist_symbol(raw_symbol)
+    valid_symbol, validation_error = validate_bist_symbol(symbol)
+    print(f"Input symbol: {raw_symbol}")
+    print(f"Normalized symbol: {symbol}")
+    if not valid_symbol:
+        print(validation_error or "Gecersiz sembol")
+        return
     ticker = bp.Ticker(symbol)
 
     info = _safe_mapping(getattr(ticker, "info", None))
