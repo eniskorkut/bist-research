@@ -338,6 +338,74 @@ def test_asels_like_missing_pe_explained_with_derived_pe() -> None:
     assert scenario.method_notes["cari_fk"] == "derived_multiplier_current_implied"
     assert "cari_fk" not in scenario.included_methods
     assert scenario.method_notes["odenmis_sermaye_historical_pe"] == "missing_historical_pe"
+    assert scenario.valuation_status == "insufficient_independent_methods"
+    assert scenario.fair_value_median is None
+    assert scenario.upside_potential_pct is None
+
+
+def test_sector_targets_enable_independent_fair_value() -> None:
+    cached = {
+        "symbol": "ASELS",
+        "price": 120.0,
+        "market_cap": 240_000.0,
+        "shares_outstanding": 2_000.0,
+        "paid_in_capital": 2_000.0,
+        "pe_ratio": None,
+        "pb_ratio": 2.4,
+        "equity": 100_000.0,
+        "estimated_net_income": 18_000.0,
+        "net_income_ttm": 18_000.0,
+        "period_type": "interim",
+        "financial_period": "2025/06",
+        "data_quality_status": "usable",
+        "missing_fields_json": [],
+        "net_income_source": "financial_statement",
+        "equity_source": "financial_statement",
+    }
+    result = run_valuation_from_snapshot(
+        cached,
+        sector_metrics={"pe_median": 3.0, "pb_median": 1.5},
+    )
+    scenario = result.valuation_scenarios["year_end"]
+    assert scenario.target_prices["sektor_fk_hedef"] is not None
+    assert scenario.target_prices["sektor_pd_dd_hedef"] is not None
+    assert "sektor_fk_hedef" in scenario.included_methods
+    assert "sektor_pd_dd_hedef" in scenario.included_methods
+    assert scenario.fair_value_median is not None
+    assert scenario.valuation_status in {"full", "partial"}
+
+
+def test_current_multiples_do_not_count_as_independent() -> None:
+    cached = {
+        "symbol": "ASELS",
+        "price": 120.0,
+        "market_cap": 240_000.0,
+        "shares_outstanding": 2_000.0,
+        "paid_in_capital": 2_000.0,
+        "pe_ratio": 12.0,
+        "pb_ratio": 2.4,
+        "equity": 100_000.0,
+        "estimated_net_income": 18_000.0,
+        "net_income_ttm": 18_000.0,
+        "period_type": "interim",
+        "financial_period": "2025/06",
+        "data_quality_status": "usable",
+        "missing_fields_json": [],
+        "net_income_source": "financial_statement",
+        "equity_source": "financial_statement",
+    }
+    result = run_valuation_from_snapshot(cached)
+    scenario = result.valuation_scenarios["year_end"]
+    assert scenario.target_prices["cari_fk"] is not None
+    assert scenario.target_prices["pd_dd"] is not None
+    assert scenario.target_prices["potansiyel_piyasa_degeri"] is not None
+    assert "cari_fk" not in scenario.included_methods
+    assert "pd_dd" not in scenario.included_methods
+    assert "potansiyel_piyasa_degeri" not in scenario.included_methods
+    assert scenario.fair_value_median is None
+    assert scenario.valuation_status == "insufficient_independent_methods"
+    assert scenario.method_sources["cari_fk"] == "cari_company_multiple"
+    assert scenario.method_sources["pd_dd"] == "cari_company_multiple"
 
 
 def test_thyao_full_valuation_not_broken() -> None:

@@ -90,6 +90,7 @@ def build_target_price_dataframe(scenario: Any) -> pd.DataFrame:
     rows: list[dict[str, str]] = []
     included = set(scenario.included_methods or [])
     notes = scenario.method_notes or {}
+    sources = getattr(scenario, "method_sources", {}) or {}
     status_map = {
         "missing_ttm_net_income": "Atlandı: TTM net kâr verisi yok",
         "missing_estimated_net_income": "Atlandı: tahmini net kâr yok",
@@ -110,6 +111,7 @@ def build_target_price_dataframe(scenario: Any) -> pd.DataFrame:
         label, formula = method_map.get(method, (method, "-"))
         in_fair_value = "Evet" if method in included else "Hayır"
         note = notes.get(method)
+        source = sources.get(method, "unavailable")
         if note in status_map:
             status = status_map[note]
         elif value is None:
@@ -123,6 +125,7 @@ def build_target_price_dataframe(scenario: Any) -> pd.DataFrame:
                 "Yöntem": label,
                 "Formül": formula,
                 "Hedef Fiyat": fmt_money(value),
+                "Kaynak": source,
                 "Adil Değere Dahil": in_fair_value,
                 "Durum": status,
             }
@@ -298,7 +301,7 @@ def _render_scenario_tab(scenario: Any, title: str) -> None:
     elif scenario.valuation_status == "missing_estimated_net_income":
         st.warning("Yıl sonu pozitif net kâr tahmini üretilemediği için hedef fiyat hesaplanmadı.")
     elif scenario.valuation_status == "insufficient_independent_methods":
-        st.warning("Yeterli bağımsız yöntem oluşmadığı için adil değer hesaplanamadı.")
+        st.warning("Yeterli bağımsız değerleme yöntemi oluşmadı. Gösterilen değerler bilgi amaçlıdır.")
 
     st.markdown("#### Ödenmiş Sermaye Detayı")
     details = scenario.paid_capital_details

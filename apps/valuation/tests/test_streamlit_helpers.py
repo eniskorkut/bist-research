@@ -39,6 +39,7 @@ def _scenario() -> ScenarioValuation:
         },
         method_notes={},
         method_types={"cari_fk": "independent_target"},
+        method_sources={"cari_fk": "historical_multiple", "odenmis_sermaye_final": "historical_multiple"},
         valuation_status="full",
     )
 
@@ -57,6 +58,7 @@ def test_build_target_price_dataframe_included_excluded() -> None:
     excluded = df[df["Yöntem"] == "Ödenmiş Sermaye: EPS × 10"].iloc[0]
     assert included["Adil Değere Dahil"] == "Evet"
     assert excluded["Adil Değere Dahil"] == "Hayır"
+    assert "Kaynak" in df.columns
 
 
 def test_to_plain_dict_dataclass() -> None:
