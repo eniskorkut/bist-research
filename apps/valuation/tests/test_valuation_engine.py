@@ -283,6 +283,7 @@ def test_derived_pb_not_independent_target() -> None:
     assert result.ratio_sources["pb_ratio_source"] == "derived"
     assert scenario.method_types["pd_dd"] == "current_implied"
     assert "pd_dd" not in scenario.included_methods
+    assert scenario.method_notes["pd_dd"] == "derived_multiplier_current_implied"
 
 
 def test_derived_pb_ratio_used_when_missing() -> None:
@@ -307,6 +308,36 @@ def test_derived_pb_ratio_used_when_missing() -> None:
     result = run_valuation_from_snapshot(cached)
     assert result.pb_ratio == 2.0
     assert result.ratio_sources["pb_ratio_source"] == "derived"
+
+
+def test_asels_like_missing_pe_explained_with_derived_pe() -> None:
+    cached = {
+        "symbol": "ASELS",
+        "price": 120.0,
+        "market_cap": 240_000.0,
+        "shares_outstanding": 2_000.0,
+        "paid_in_capital": 2_000.0,
+        "pe_ratio": None,
+        "pb_ratio": 2.4,
+        "equity": 100_000.0,
+        "estimated_net_income": 18_000.0,
+        "net_income_ttm": 18_000.0,
+        "period_type": "interim",
+        "financial_period": "2025/06",
+        "data_quality_status": "usable",
+        "missing_fields_json": [],
+        "net_income_source": "financial_statement",
+        "equity_source": "financial_statement",
+    }
+    result = run_valuation_from_snapshot(cached, sector_metrics={"pe_median": None})
+    scenario = result.valuation_scenarios["year_end"]
+    assert result.ratio_sources["pe_ratio_source"] == "derived"
+    assert result.ratio_sources["derived_pe_ratio_year_end"] is not None
+    assert scenario.target_prices["cari_fk"] is not None
+    assert scenario.method_types["cari_fk"] == "current_implied"
+    assert scenario.method_notes["cari_fk"] == "derived_multiplier_current_implied"
+    assert "cari_fk" not in scenario.included_methods
+    assert scenario.method_notes["odenmis_sermaye_historical_pe"] == "missing_historical_pe"
 
 
 def test_thyao_full_valuation_not_broken() -> None:

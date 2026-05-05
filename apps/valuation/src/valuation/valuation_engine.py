@@ -143,16 +143,26 @@ def _build_scenario(
 
     method_notes: dict[str, str] = {}
     method_types: dict[str, str] = {}
+    if shares in (None, 0):
+        for m in ["cari_fk", "pd_dd", "potansiyel_piyasa_degeri", "ozsermaye_karliligi"]:
+            method_notes.setdefault(m, "missing_shares")
+    if price in (None, 0):
+        method_notes.setdefault("cari_fk", "missing_market_cap")
     if net_income is not None and net_income <= 0:
         method_notes["cari_fk"] = "negative_net_income"
     cari_fk = _safe_div((net_income * pe) if net_income is not None and net_income > 0 and (pe or 0) > 0 else None, shares)
     if pe in (None, 0):
-        method_notes["cari_fk"] = "missing_multiplier"
+        method_notes["cari_fk"] = "missing_pe_ratio"
+    elif pe_source == "derived":
+        method_notes["cari_fk"] = "derived_multiplier_current_implied"
+        method_types["cari_fk"] = "current_implied"
     pd_dd = _safe_div((equity * pb) if (equity or 0) > 0 and (pb or 0) > 0 else None, shares)
     if (equity or 0) <= 0:
         method_notes["pd_dd"] = "missing_equity"
     elif pb in (None, 0):
-        method_notes["pd_dd"] = "missing_multiplier"
+        method_notes["pd_dd"] = "missing_pb_ratio"
+    elif pb_source == "derived":
+        method_notes["pd_dd"] = "derived_multiplier_current_implied"
     method_types["pd_dd"] = "current_implied" if pb_source == "derived" else "independent_target"
 
     odenmis_sermaye_x10 = (paid_cap_eps * 10) if paid_cap_eps is not None and paid_cap_eps > 0 else None
@@ -161,6 +171,8 @@ def _build_scenario(
         if paid_cap_eps is not None and paid_cap_eps > 0 and (historical_pe_median or 0) > 0
         else None
     )
+    if historical_pe_median is None:
+        method_notes["odenmis_sermaye_historical_pe"] = "missing_historical_pe"
     odenmis_sermaye_sector_pe = (
         paid_cap_eps * sector_pe_median
         if paid_cap_eps is not None and paid_cap_eps > 0 and (sector_pe_median or 0) > 0
@@ -202,13 +214,20 @@ def _build_scenario(
         pb_cap_added = True
     potansiyel_piyasa_degeri = _safe_div(_mean(implied_caps), shares)
     if not implied_caps:
-        method_notes["potansiyel_piyasa_degeri"] = "missing_multiplier"
+        if pe in (None, 0) and pb in (None, 0):
+            method_notes["potansiyel_piyasa_degeri"] = "missing_pe_ratio"
+        elif pb in (None, 0):
+            method_notes["potansiyel_piyasa_degeri"] = "missing_pb_ratio"
+        elif pe in (None, 0):
+            method_notes["potansiyel_piyasa_degeri"] = "missing_pe_ratio"
     if pe_cap_added or pb_cap_added:
         pe_is_independent = pe_cap_added and pe_source == "borsapy"
         pb_is_independent = pb_cap_added and pb_source == "borsapy"
         method_types["potansiyel_piyasa_degeri"] = (
             "independent_target" if (pe_is_independent or pb_is_independent) else "current_implied"
         )
+        if method_types["potansiyel_piyasa_degeri"] == "current_implied":
+            method_notes["potansiyel_piyasa_degeri"] = "derived_multiplier_current_implied"
 
     estimated_roe = _safe_div(net_income, equity) if (net_income or 0) > 0 and (equity or 0) > 0 else None
     ozsermaye_karliligi = _safe_div(
@@ -218,7 +237,10 @@ def _build_scenario(
     if (equity or 0) <= 0:
         method_notes["ozsermaye_karliligi"] = "missing_equity"
     elif pb in (None, 0):
-        method_notes["ozsermaye_karliligi"] = "missing_multiplier"
+        method_notes["ozsermaye_karliligi"] = "missing_pb_ratio"
+    elif pb_source == "derived":
+        method_notes["ozsermaye_karliligi"] = "derived_multiplier_current_implied"
+        method_types["ozsermaye_karliligi"] = "current_implied"
 
     target_prices = {
         "cari_fk": cari_fk,
@@ -240,7 +262,7 @@ def _build_scenario(
             continue
         if method_types.get(method) == "current_implied":
             excluded_methods.append(method)
-            method_notes.setdefault(method, "info_only")
+            method_notes.setdefault(method, "derived_multiplier_current_implied")
             continue
         if method in {"odenmis_sermaye_x10", "odenmis_sermaye_historical_pe", "odenmis_sermaye_sector_pe", "odenmis_sermaye_current_pe"}:
             excluded_methods.append(method)
@@ -266,6 +288,8 @@ def _build_scenario(
         fair_value_mean_filtered = None
         upside_potential_pct = None
         valuation_status = "insufficient_independent_methods"
+        for method in excluded_methods:
+            method_notes.setdefault(method, "insufficient_independent_methods")
     else:
         fair_value_median = median(fair_values) if fair_values else None
         fair_value_mean_filtered = _filtered_mean([float(v) for v in fair_values if v is not None])
@@ -343,6 +367,9 @@ def run_valuation(
         "ttm_pe_ratio_source": ttm_pe_source,
         "year_end_pe_ratio_source": year_end_pe_source,
         "pb_ratio_source": pb_source,
+        "derived_pe_ratio_ttm": ttm_pe if ttm_pe_source == "derived" else None,
+        "derived_pe_ratio_year_end": year_end_pe if year_end_pe_source == "derived" else None,
+        "derived_pb_ratio": resolved_pb if pb_source == "derived" else None,
     }
     ttm_income = snapshot.net_income_ttm
     year_end_income = estimation.estimated_net_income
@@ -473,6 +500,9 @@ def run_valuation_from_snapshot(
         "ttm_pe_ratio_source": ttm_pe_source,
         "year_end_pe_ratio_source": year_end_pe_source,
         "pb_ratio_source": pb_source,
+        "derived_pe_ratio_ttm": ttm_pe if ttm_pe_source == "derived" else None,
+        "derived_pe_ratio_year_end": year_end_pe if year_end_pe_source == "derived" else None,
+        "derived_pb_ratio": resolved_pb if pb_source == "derived" else None,
     }
     ttm_income = snapshot.get("net_income_ttm")
     year_end_income = snapshot.get("estimated_net_income")

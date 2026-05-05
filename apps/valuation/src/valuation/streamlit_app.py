@@ -93,9 +93,16 @@ def build_target_price_dataframe(scenario: Any) -> pd.DataFrame:
     status_map = {
         "missing_ttm_net_income": "Atlandı: TTM net kâr verisi yok",
         "missing_estimated_net_income": "Atlandı: tahmini net kâr yok",
+        "missing_pe_ratio": "Atlandı: F/K oranı yok",
+        "missing_historical_pe": "Atlandı: geçmiş F/K hesaplanmadı",
+        "missing_pb_ratio": "Atlandı: PD/DD oranı yok",
         "negative_net_income": "Atlandı: net kâr negatif",
         "missing_multiplier": "Atlandı: çarpan yok",
         "missing_equity": "Atlandı: özkaynak yok",
+        "missing_market_cap": "Atlandı: piyasa değeri yok",
+        "missing_shares": "Atlandı: hisse sayısı yok",
+        "derived_multiplier_current_implied": "Bilgi amaçlı: çarpan piyasa değerinden türetildi",
+        "insufficient_independent_methods": "Yeterli bağımsız yöntem yok",
         "info_only": "Bilgi amaçlı",
         "ok": "Kullanıldı",
     }
@@ -299,7 +306,7 @@ def _render_scenario_tab(scenario: Any, title: str) -> None:
         [
             ("EPS", fmt_money(details.get("eps"))),
             ("Kurs formülü: EPS × 10", fmt_money(details.get("x10"))),
-            ("Geçmiş F/K medyan", fmt_number(details.get("historical_pe_median"))),
+            ("Geçmiş F/K medyan", "hesaplanmadı" if details.get("historical_pe_median") is None else fmt_number(details.get("historical_pe_median"))),
             ("EPS × Geçmiş F/K", fmt_money(details.get("historical_pe_value"))),
             ("Sektör F/K medyan", fmt_number(details.get("sector_pe_median"))),
             ("EPS × Sektör F/K", fmt_money(details.get("sector_pe_value"))),
@@ -493,6 +500,8 @@ def main() -> None:
         st.warning("Bu şirket zarar açıkladığı için tam değerleme üretilemedi. Temel veriler ve araştırma görünümü aşağıdadır.")
     if result.ratio_sources.get("pb_ratio_source") == "derived":
         st.info("PD/DD borsapy'den gelmedi; piyasa değeri / özkaynak üzerinden türetildiği için bağımsız hedef değildir.")
+    if result.ratio_sources.get("pe_ratio_source") == "derived" or result.ratio_sources.get("ttm_pe_ratio_source") == "derived":
+        st.info("F/K oranı veri kaynağından gelmedi; piyasa değeri / net kâr üzerinden türetildiği için bağımsız hedef olarak kullanılmadı.")
     if result.ratio_sources.get("pe_ratio_source") == "not_applicable_negative_income":
         st.info("F/K oranı negatif net kâr nedeniyle anlamlı değildir.")
 
@@ -598,6 +607,15 @@ def main() -> None:
             ("net_income_source", cached.get("net_income_source")),
             ("equity_source", cached.get("equity_source")),
             ("revenue_source", cached.get("revenue_source")),
+            ("pe_ratio", result.pe_ratio),
+            ("pe_ratio_source", result.ratio_sources.get("pe_ratio_source")),
+            ("ttm_pe_ratio_source", result.ratio_sources.get("ttm_pe_ratio_source")),
+            ("year_end_pe_ratio_source", result.ratio_sources.get("year_end_pe_ratio_source")),
+            ("derived_pe_ratio_ttm", result.ratio_sources.get("derived_pe_ratio_ttm")),
+            ("derived_pe_ratio_year_end", result.ratio_sources.get("derived_pe_ratio_year_end")),
+            ("pb_ratio", result.pb_ratio),
+            ("pb_ratio_source", result.ratio_sources.get("pb_ratio_source")),
+            ("derived_pb_ratio", result.ratio_sources.get("derived_pb_ratio")),
             ("refresh.wrote_to_cache", refresh_meta.get("wrote_to_cache")),
             ("refresh.preserved_existing_cache", refresh_meta.get("preserved_existing_cache")),
             ("refresh.rejected_unusable_refresh", refresh_meta.get("rejected_unusable_refresh")),
@@ -606,6 +624,26 @@ def main() -> None:
         st.dataframe(pd.DataFrame(quality_rows, columns=["Alan", "Değer"]), use_container_width=True, hide_index=True)
 
     with tabs[5]:
+        st.markdown("#### Snapshot Özet Alanları")
+        st.dataframe(
+            pd.DataFrame(
+                [
+                    ("price", cached.get("price")),
+                    ("market_cap", cached.get("market_cap")),
+                    ("shares_outstanding", cached.get("shares_outstanding")),
+                    ("equity", cached.get("equity")),
+                    ("estimated_net_income", cached.get("estimated_net_income")),
+                    ("net_income_ttm", cached.get("net_income_ttm")),
+                    ("pe_ratio", cached.get("pe_ratio")),
+                    ("pb_ratio", cached.get("pb_ratio")),
+                    ("pe_ratio_source", result.ratio_sources.get("pe_ratio_source")),
+                    ("pb_ratio_source", result.ratio_sources.get("pb_ratio_source")),
+                ],
+                columns=["Alan", "Değer"],
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
         with st.expander("Cached company snapshot"):
             st.json(to_plain_dict(cached))
         with st.expander("Sector metrics"):
