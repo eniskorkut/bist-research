@@ -5,3 +5,4 @@ __pycache__/
 .DS_Store
 .agent/
 data/valuation_cache.sqlite
+data/market_radar_cache.sqlite

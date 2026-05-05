@@ -6,22 +6,8 @@ from typing import Any
 import pandas as pd
 import streamlit as st
 
-from market_radar.data_access import DB_PATH, init_db
+from market_radar.data_access import DB_PATH, DEFAULT_BIST_UNIVERSE_INDEX, init_db, load_bist_universe
 from market_radar.radar_engine import RadarConfig, RadarResult, scan_symbols
-from market_radar.symbols import normalize_bist_symbol, validate_bist_symbol
-
-DEFAULT_SYMBOLS = ["THYAO", "ASELS", "KCHOL", "GARAN", "AKBNK", "EREGL", "TUPRS", "BIMAS", "SAHOL", "ODINE"]
-
-
-def _parse_symbols(text: str) -> list[str]:
-    raw_parts = [item.strip() for chunk in text.splitlines() for item in chunk.split(",")]
-    normalized: list[str] = []
-    for raw in raw_parts:
-        symbol = normalize_bist_symbol(raw)
-        ok, _ = validate_bist_symbol(symbol)
-        if ok:
-            normalized.append(symbol)
-    return sorted(set(normalized))
 
 
 def _threshold_select(label: str, options: list[float], default: float) -> float:
@@ -136,12 +122,9 @@ def render_positive_interest_radar_page(*, embedded: bool = False) -> None:
 
     with st.sidebar:
         st.header("Girdi")
-        raw_text = st.text_area(
-            "Hisse listesi",
-            value="\n".join(DEFAULT_SYMBOLS),
-            height=180,
-            help="Boş bırakılırsa varsayılan liste kullanılır. Virgül veya satır sonu ile ayırabilirsiniz.",
-        )
+        universe_index = DEFAULT_BIST_UNIVERSE_INDEX
+        st.caption(f"Tarama evreni: Tüm Borsa İstanbul ({universe_index})")
+        st.caption("Manuel sembol girişi yok; semboller borsapy endeks bileşenlerinden otomatik alınır.")
         lookback_days = st.number_input("Lookback days", min_value=60, value=260, step=10)
         force_refresh = st.checkbox("Cache’i yenile", value=False)
         st.markdown("#### Filtreler")
@@ -190,9 +173,16 @@ def render_positive_interest_radar_page(*, embedded: bool = False) -> None:
             )
         )
 
-    raw_symbols = _parse_symbols(raw_text)
+    try:
+        raw_symbols = load_bist_universe(universe_index)
+    except Exception as exc:
+        st.error("BIST hisse evreni alınamadı. borsapy XUTUM bileşenlerini döndürmedi.")
+        st.caption(str(exc))
+        return
     if not raw_symbols:
-        raw_symbols = DEFAULT_SYMBOLS
+        st.error("BIST hisse evreni boş döndü. Tarama başlatılamadı.")
+        return
+    st.caption(f"Tarama evreni: {len(raw_symbols)} BIST hissesi")
     config = RadarConfig(
         lookback_days=int(lookback_days),
         min_avg_turnover_try_active=min_avg_turnover_try_active,
@@ -217,11 +207,19 @@ def render_positive_interest_radar_page(*, embedded: bool = False) -> None:
         db_path=DB_PATH,
     )
 
-    if start_scan or "radar_results" not in st.session_state or not st.session_state["radar_results"]:
+    if start_scan:
         with st.spinner("Pozitif ilgi taraması yapılıyor..."):
-            results, raw_results = scan_symbols(raw_symbols, config=config)
-            st.session_state["radar_results"] = results
-            st.session_state["radar_raw_results"] = raw_results
+            try:
+                results, raw_results = scan_symbols(raw_symbols, config=config)
+                st.session_state["radar_results"] = results
+                st.session_state["radar_raw_results"] = raw_results
+            except Exception as exc:
+                st.session_state["radar_results"] = []
+                st.session_state["radar_raw_results"] = []
+                st.error("Radar verisi alınamadı. borsapy geçici olarak veri döndürmemiş olabilir.")
+                st.caption(str(exc))
+    elif not st.session_state.get("radar_results"):
+        st.info("Filtreleri ayarla ve tüm Borsa İstanbul evrenini taramak için Taramayı Başlat'a bas.")
 
     results: list[RadarResult] = st.session_state.get("radar_results", [])
     scanned_count = len(raw_symbols)

@@ -9,7 +9,21 @@ Iki parcali BIST arastirma ortami + US research modulu.
 - `apps/us_research`: ABD hisseleri icin OpenBB + edgartools arastirma modulu.
 - `openbb-mcp`: OpenBB endpointlerini MCP server olarak sunar.
 - `apps/valuation`: BIST hisseleri icin otomatik 5 yontemli degerleme + sektor karsilastirma modulu (Streamlit, SQLite cache).
+- `apps/market_radar`: BIST pozitif ilgi radari hesaplama modulu. Unified dashboard icinde kullanilir ve varsayilan olarak `XUTUM` ile tum Borsa Istanbul hisselerini tarar.
 - Telegram yok. Al-sat yok. Sadece arastirma, veri izleme ve analiz.
+
+## Tek Kullanici Arayuzu
+
+Ana Streamlit dashboard tek porttan calisir:
+
+```text
+http://localhost:8502
+```
+
+Sidebar'daki `Modul` secimi ile sayfalar arasinda gecilir:
+
+- `Sirket Degerleme`
+- `Pozitif Ilgi Radari`
 
 ## borsapy-alert
 
@@ -51,7 +65,7 @@ python scripts/run_volume_alert.py --index XU030 --dry-run --check-interval 5
 borsa-mcp
 python scripts/test_openbb.py
 openbb-mcp --transport streamable-http --port 8001 --host 0.0.0.0
-streamlit run src/valuation/streamlit_app.py --server.port 8502
+streamlit run apps/valuation/src/valuation/streamlit_app.py --server.port 8502
 python scripts/refresh_bist_cache.py --index XU100 --db-path /data/valuation_cache.sqlite
 ```
 
@@ -111,6 +125,8 @@ docker compose run --rm valuation-app python scripts/refresh_bist_cache.py --sym
 docker compose run --rm valuation-app python scripts/inspect_cache.py --db-path /data/valuation_cache.sqlite --limit 10
 docker compose up valuation-app
 ```
+
+`valuation-app` tek kullanici arayuzudur. Ayni ekranda `Sirket Degerleme` ve `Pozitif Ilgi Radari` sayfalari bulunur.
 
 ## Codex/MCP Kullanimi
 

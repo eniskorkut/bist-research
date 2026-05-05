@@ -4,6 +4,8 @@ from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 
+from market_radar.data_access import BorsapyMarketDataClient, load_bist_universe
+import market_radar.data_access as data_access
 from market_radar.radar_engine import RadarConfig, calculate_interest_score, evaluate_filters, evaluate_symbol
 from market_radar.symbols import normalize_bist_symbol
 
@@ -105,6 +107,45 @@ def test_normalize_symbols() -> None:
     assert normalize_bist_symbol("ODİNE") == "ODINE"
 
 
+def test_borsapy_fetch_uses_naive_start_datetime(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeTicker:
+        def __init__(self, symbol: str) -> None:
+            captured["symbol"] = symbol
+
+        def history(self, *, start, interval: str):
+            captured["start"] = start
+            captured["interval"] = interval
+            return pd.DataFrame(
+                {"open": [1], "high": [2], "low": [1], "close": [2], "volume": [100]},
+                index=pd.date_range("2026-01-01", periods=1, freq="D"),
+            )
+
+    monkeypatch.setattr(data_access.bp, "Ticker", FakeTicker)
+
+    frame = BorsapyMarketDataClient()._fetch_history("thyao", 60)
+
+    assert not frame.empty
+    assert captured["symbol"] == "THYAO"
+    assert captured["interval"] == "1d"
+    assert captured["start"].tzinfo is None
+
+
+def test_load_bist_universe_uses_xutum_components(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeIndex:
+        def __init__(self, symbol: str) -> None:
+            captured["index"] = symbol
+            self.component_symbols = ["thyao", "ASELS", "ODİNE", "INVALIDLONG"]
+
+    monkeypatch.setattr(data_access.bp, "Index", FakeIndex)
+
+    assert load_bist_universe("xutum") == ["ASELS", "ODINE", "THYAO"]
+    assert captured["index"] == "XUTUM"
+
+
 def test_filter_evaluation_min_score() -> None:
     metrics = {
         "avg_turnover_20d": 20_000_000.0,
@@ -122,4 +163,3 @@ def test_filter_evaluation_min_score() -> None:
     assert "min_interest_score" in passed
     assert "min_avg_turnover_try" in passed
     assert not failed or "above_ma50" in failed
-

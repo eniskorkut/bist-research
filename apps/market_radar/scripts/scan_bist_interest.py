@@ -2,9 +2,7 @@ from __future__ import annotations
 
 import argparse
 
-import borsapy as bp
-
-from market_radar.data_access import DB_PATH, init_db
+from market_radar.data_access import DB_PATH, DEFAULT_BIST_UNIVERSE_INDEX, init_db, load_bist_universe
 from market_radar.radar_engine import RadarConfig, scan_symbols
 from market_radar.symbols import normalize_bist_symbol, validate_bist_symbol
 
@@ -12,7 +10,7 @@ from market_radar.symbols import normalize_bist_symbol, validate_bist_symbol
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--symbols", nargs="+")
-    parser.add_argument("--index", default="XU100")
+    parser.add_argument("--index", default=DEFAULT_BIST_UNIVERSE_INDEX)
     parser.add_argument("--lookback-days", type=int, default=260)
     parser.add_argument("--min-score", type=float, default=50.0)
     parser.add_argument("--min-volume-ratio", type=float, default=1.5)
@@ -29,7 +27,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     init_db(args.db_path)
-    symbols = args.symbols or list(getattr(bp.Index(args.index), "component_symbols", []) or [])
+    symbols = args.symbols or load_bist_universe(args.index)
     normalized: list[str] = []
     for raw in symbols:
         symbol = normalize_bist_symbol(str(raw))

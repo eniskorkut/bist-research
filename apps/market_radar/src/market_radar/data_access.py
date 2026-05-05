@@ -13,6 +13,7 @@ import pandas as pd
 from market_radar.symbols import normalize_bist_symbol
 
 DB_PATH = "/data/market_radar_cache.sqlite"
+DEFAULT_BIST_UNIVERSE_INDEX = "XUTUM"
 
 
 def _to_float(value: Any) -> float | None:
@@ -167,10 +168,21 @@ def save_radar_result(db_path: str, result: dict[str, Any]) -> None:
         )
 
 
+def load_bist_universe(index_symbol: str = DEFAULT_BIST_UNIVERSE_INDEX) -> list[str]:
+    index = bp.Index(normalize_bist_symbol(index_symbol))
+    components = getattr(index, "component_symbols", []) or []
+    if callable(components):
+        components = components()
+    symbols = {normalize_bist_symbol(str(symbol)) for symbol in components}
+    return sorted(symbol for symbol in symbols if 3 <= len(symbol) <= 6 and symbol.isalnum())
+
+
 class BorsapyMarketDataClient:
     def _fetch_history(self, symbol: str, lookback_days: int) -> pd.DataFrame:
         ticker = bp.Ticker(normalize_bist_symbol(symbol))
-        start = datetime.now(UTC) - timedelta(days=max(int(lookback_days * 1.8), lookback_days + 30))
+        # borsapy subtracts this value from datetime.now() internally, so keep
+        # it offset-naive to avoid mixed timezone arithmetic.
+        start = datetime.now().replace(tzinfo=None) - timedelta(days=max(int(lookback_days * 1.8), lookback_days + 30))
         frame = ticker.history(start=start, interval="1d")
         return _normalize_history_frame(frame)
 
@@ -196,4 +208,3 @@ class BorsapyMarketDataClient:
                 return cached_frame
             raise
         return cached_frame
-
