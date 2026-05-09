@@ -4,6 +4,7 @@ from datetime import UTC, datetime, timedelta
 import json
 import math
 import sqlite3
+import time
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -75,6 +76,8 @@ def _payload_to_frame(payload: dict[str, Any] | None) -> pd.DataFrame:
 def init_db(db_path: str) -> None:
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(db_path) as conn:
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA busy_timeout=5000;")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS daily_ohlcv_cache (
@@ -403,13 +406,21 @@ class BorsapyMarketDataClient:
         ttl_minutes = cache_ttl_minutes if cache_ttl_minutes is not None else get_default_ohlcv_cache_ttl_minutes()
         if not force and meta is not None and not is_stale(meta.get("fetched_at"), max_age_minutes=ttl_minutes):
             return cached_frame
-        try:
-            frame = self._fetch_history(normalized, lookback_days)
-            if not frame.empty:
-                upsert_cached_history(db_path, normalized, frame)
-                return frame
-        except Exception:
-            if not cached_frame.empty:
-                return cached_frame
-            raise
+        retries = [2, 5]
+        for attempt in range(len(retries) + 1):
+            try:
+                frame = self._fetch_history(normalized, lookback_days)
+                if not frame.empty:
+                    upsert_cached_history(db_path, normalized, frame)
+                    return frame
+                break
+            except Exception as exc:
+                message = str(exc)
+                is_rate_limited = ("429" in message) or ("Too Many Requests" in message)
+                if is_rate_limited and attempt < len(retries):
+                    time.sleep(retries[attempt])
+                    continue
+                if not cached_frame.empty:
+                    return cached_frame
+                raise
         return cached_frame

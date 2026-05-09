@@ -500,7 +500,6 @@ def build_scan_cache_key(symbols: list[str], config: RadarConfig) -> str:
             "min_interest_score": config.min_interest_score,
             "include_negative_moves": config.include_negative_moves,
             "ohlcv_cache_ttl_minutes": config.ohlcv_cache_ttl_minutes,
-            "max_workers": config.max_workers,
         },
     }
     payload_text = json.dumps(key_payload, sort_keys=True)

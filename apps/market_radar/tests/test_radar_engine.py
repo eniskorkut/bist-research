@@ -346,6 +346,13 @@ def test_scan_cache_key_changes_with_config() -> None:
     assert build_scan_cache_key(symbols, c1) != build_scan_cache_key(symbols, c2)
 
 
+def test_scan_cache_key_ignores_max_workers() -> None:
+    symbols = ["THYAO", "ASELS"]
+    c1 = RadarConfig(index_symbol="XU100", min_interest_score=50, max_workers=4)
+    c2 = RadarConfig(index_symbol="XU100", min_interest_score=50, max_workers=16)
+    assert build_scan_cache_key(symbols, c1) == build_scan_cache_key(symbols, c2)
+
+
 def test_scan_cache_roundtrip_and_expiry(tmp_path: Path) -> None:
     db = str(tmp_path / "radar.sqlite")
     init_db(db)
@@ -408,3 +415,35 @@ def test_scan_cache_roundtrip_and_expiry(tmp_path: Path) -> None:
         )
     miss = get_cached_scan_result(db, cache_key, max_age_minutes=30)
     assert miss is None
+
+
+def test_init_db_sets_sqlite_pragmas(tmp_path: Path) -> None:
+    db = str(tmp_path / "radar.sqlite")
+    init_db(db)
+    import sqlite3
+
+    with sqlite3.connect(db) as conn:
+        journal = conn.execute("PRAGMA journal_mode;").fetchone()[0]
+        timeout = conn.execute("PRAGMA busy_timeout;").fetchone()[0]
+    assert str(journal).lower() == "wal"
+    assert int(timeout) == 5000
+
+
+def test_load_history_retries_on_429_then_succeeds(monkeypatch, tmp_path: Path) -> None:
+    db = str(tmp_path / "radar.sqlite")
+    init_db(db)
+    client = BorsapyMarketDataClient()
+    calls = {"count": 0}
+
+    def fake_fetch(symbol: str, lookback_days: int) -> pd.DataFrame:
+        calls["count"] += 1
+        if calls["count"] < 3:
+            raise RuntimeError("429 Too Many Requests")
+        return _history_frame()
+
+    monkeypatch.setattr(client, "_fetch_history", fake_fetch)
+    monkeypatch.setattr(data_access.time, "sleep", lambda _: None)
+
+    frame = client.load_history("THYAO", db_path=db, force=True)
+    assert not frame.empty
+    assert calls["count"] == 3

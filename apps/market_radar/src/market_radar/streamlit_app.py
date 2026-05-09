@@ -260,6 +260,9 @@ def render_positive_interest_radar_page(*, embedded: bool = False) -> None:
         index_symbol=universe_index,
     )
 
+    if universe_index == "XUTUM" and force_refresh and max_workers > 8:
+        st.warning("XUTUM force refresh yüksek worker ile TradingView 429 hatası üretebilir. 4 veya 8 worker önerilir.")
+
     if start_scan:
         progress_bar = st.progress(0, text="Tarama başlatılıyor...")
         status_text = st.empty()
