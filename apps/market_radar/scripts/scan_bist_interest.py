@@ -11,6 +11,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--symbols", nargs="+")
     parser.add_argument("--index", default=DEFAULT_BIST_UNIVERSE_INDEX)
+    parser.add_argument(
+        "--scan-mode",
+        choices=["volume_spike", "positive_money_flow", "silent_accumulation", "strong_momentum"],
+        default="positive_money_flow",
+    )
     parser.add_argument("--lookback-days", type=int, default=260)
     parser.add_argument("--min-score", type=float, default=50.0)
     parser.add_argument("--require-min-score", action=argparse.BooleanOptionalAction, default=True)
@@ -23,6 +28,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--require-close-position", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--require-above-ma20", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--require-xu100-relative", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--min-cmf-20", type=float, default=0.0)
+    parser.add_argument("--require-obv-slope-5d", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--require-obv-slope-20d", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--min-mfi-14", type=float, default=50.0)
+    parser.add_argument("--max-mfi-14", type=float, default=85.0)
+    parser.add_argument("--max-daily-return-pct", type=float, default=2.0)
+    parser.add_argument("--max-price-range-pct", type=float, default=5.0)
+    parser.add_argument("--min-accumulation-score", type=float, default=50.0)
     parser.add_argument("--include-negative-moves", action="store_true")
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--max-workers", type=int, default=8)
@@ -50,6 +63,7 @@ def main() -> None:
         normalized, cache_source = load_bist_universe(args.index, db_path=args.db_path, force=args.force)
 
     config = RadarConfig(
+        scan_mode=args.scan_mode,
         lookback_days=args.lookback_days,
         min_avg_turnover_try_active=True,
         min_avg_turnover_try=args.min_avg_turnover_try,
@@ -66,6 +80,20 @@ def main() -> None:
         require_ma50_active=False,
         min_xu100_relative_active=args.require_xu100_relative,
         min_xu100_relative=0.0,
+        min_cmf_20_active=args.scan_mode in {"positive_money_flow", "silent_accumulation", "strong_momentum"},
+        min_cmf_20=args.min_cmf_20,
+        require_obv_slope_5d_positive=args.require_obv_slope_5d,
+        require_obv_slope_20d_positive=args.require_obv_slope_20d,
+        min_mfi_14_active=args.scan_mode in {"positive_money_flow", "strong_momentum"},
+        min_mfi_14=args.min_mfi_14,
+        max_mfi_14_active=args.scan_mode == "positive_money_flow",
+        max_mfi_14=args.max_mfi_14,
+        max_daily_return_active=args.scan_mode == "silent_accumulation",
+        max_daily_return_pct=args.max_daily_return_pct,
+        max_price_range_active=args.scan_mode == "silent_accumulation",
+        max_price_range_pct=args.max_price_range_pct,
+        min_accumulation_score_active=args.scan_mode in {"positive_money_flow", "silent_accumulation", "strong_momentum"},
+        min_accumulation_score=args.min_accumulation_score,
         min_interest_score_active=args.require_min_score,
         min_interest_score=args.min_score,
         include_negative_moves=args.include_negative_moves,

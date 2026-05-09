@@ -90,3 +90,23 @@ docker compose run --rm valuation-app python apps/market_radar/scripts/scan_bist
   --min-score 30 \
   --max-workers 8
 ```
+
+Pozitif para girişi:
+
+```bash
+docker compose run --rm valuation-app python apps/market_radar/scripts/scan_bist_interest.py \
+  --index XUTUM \
+  --lookback-days 60 \
+  --scan-mode positive_money_flow \
+  --max-workers 8
+```
+
+Sessiz toplama:
+
+```bash
+docker compose run --rm valuation-app python apps/market_radar/scripts/scan_bist_interest.py \
+  --index XUTUM \
+  --lookback-days 60 \
+  --scan-mode silent_accumulation \
+  --max-workers 8
+```

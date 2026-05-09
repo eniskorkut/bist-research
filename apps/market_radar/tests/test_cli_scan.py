@@ -16,6 +16,7 @@ def test_cli_allows_breakout_off() -> None:
     parse_args = _load_parse_args()
     args = parse_args(["--breakout-mode", "off"])
     assert args.breakout_mode == "off"
+    assert args.scan_mode == "positive_money_flow"
 
 
 def test_no_require_close_position_disables_filter() -> None:
@@ -77,3 +78,24 @@ def test_no_require_min_score_keeps_low_score_candidate() -> None:
     passed, failed = evaluate_filters(metrics, config)
     assert "min_volume_ratio" in passed
     assert "min_interest_score" not in failed
+
+
+def test_cli_parses_scan_mode_and_moneyflow_flags() -> None:
+    parse_args = _load_parse_args()
+    args = parse_args(
+        [
+            "--scan-mode",
+            "silent_accumulation",
+            "--require-obv-slope-5d",
+            "--require-obv-slope-20d",
+            "--min-cmf-20",
+            "0.02",
+            "--min-accumulation-score",
+            "55",
+        ]
+    )
+    assert args.scan_mode == "silent_accumulation"
+    assert args.require_obv_slope_5d is True
+    assert args.require_obv_slope_20d is True
+    assert args.min_cmf_20 == 0.02
+    assert args.min_accumulation_score == 55.0

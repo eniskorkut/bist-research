@@ -126,6 +126,16 @@ def _render_details(results: list[RadarResult]) -> None:
                     ("Turnover TRY", result.turnover_try),
                     ("Avg Turnover 20D", result.avg_turnover_20d),
                     ("Turnover Ratio 20D", result.turnover_ratio_20d),
+                    ("CMF 20", result.cmf_20),
+                    ("OBV Slope 5D", result.obv_slope_5d),
+                    ("OBV Slope 20D", result.obv_slope_20d),
+                    ("ADL Slope 5D", result.adl_slope_5d),
+                    ("ADL Slope 20D", result.adl_slope_20d),
+                    ("MFI 14", result.mfi_14),
+                    ("Price Range %", result.price_range_pct),
+                    ("Volume Price Confirmation", result.volume_price_confirmation),
+                    ("Accumulation Score", result.accumulation_score),
+                    ("Accumulation Signals", ", ".join(result.accumulation_signals)),
                     ("Daily Return %", result.daily_return_pct),
                     ("Day Range %", result.day_range_pct),
                     ("Close Position", result.close_position),
@@ -149,6 +159,7 @@ def render_positive_interest_radar_page(*, embedded: bool = False) -> None:
         st.set_page_config(page_title="BIST Pozitif İlgi Radarı", layout="wide")
     st.title("BIST Pozitif İlgi Radarı")
     st.caption("Bu ekran yatırım tavsiyesi değildir. Hacim, fiyat ve teknik hareketlenme metrikleriyle araştırma listesi üretir.")
+    st.info("Bu ekran gerçek net para girişini değil, OHLCV üzerinden hesaplanan para girişi ihtimalini gösterir.")
     init_db(DB_PATH)
     if "radar_scan" not in st.session_state:
         st.session_state["radar_scan"] = None
@@ -158,6 +169,18 @@ def render_positive_interest_radar_page(*, embedded: bool = False) -> None:
     with st.sidebar:
         st.header("Girdi")
         universe_index = st.selectbox("Tarama evreni", ["XU030", "XU100", "XUTUM"], index=2)
+        scan_mode_ui = st.selectbox(
+            "Tarama Tipi",
+            ["Hacim Artışı", "Pozitif Para Girişi", "Sessiz Toplama", "Güçlü Momentum"],
+            index=1,
+        )
+        scan_mode_map = {
+            "Hacim Artışı": "volume_spike",
+            "Pozitif Para Girişi": "positive_money_flow",
+            "Sessiz Toplama": "silent_accumulation",
+            "Güçlü Momentum": "strong_momentum",
+        }
+        scan_mode = scan_mode_map[scan_mode_ui]
         st.caption("Manuel sembol girişi yok; semboller borsapy endeks bileşenlerinden otomatik alınır.")
         lookback_days = st.number_input("Lookback days", min_value=60, value=260, step=10)
         max_workers = int(st.selectbox("Paralel işçi sayısı", [4, 8, 12, 16], index=1))
@@ -191,10 +214,25 @@ def render_positive_interest_radar_page(*, embedded: bool = False) -> None:
         min_xu100_relative = _threshold_select("XU100 Relative Eşiği", [0.0, 1.0, 2.0, 3.0], 0.0)
         min_interest_score_active = st.checkbox("Minimum İlgi Skoru", value=True)
         min_interest_score = _threshold_select("İlgi Skoru Eşiği", [40.0, 50.0, 60.0, 70.0, 80.0], 50.0)
+        min_cmf_20_active = st.checkbox("CMF 20 filtresi aktif", value=scan_mode in {"positive_money_flow", "silent_accumulation", "strong_momentum"})
+        min_cmf_20 = st.number_input("Minimum CMF 20", value=0.0, step=0.01, format="%.2f")
+        require_obv_slope_5d_positive = st.checkbox("OBV Slope 5G pozitif", value=scan_mode in {"positive_money_flow", "silent_accumulation", "strong_momentum"})
+        require_obv_slope_20d_positive = st.checkbox("OBV Slope 20G pozitif", value=scan_mode == "silent_accumulation")
+        min_mfi_14_active = st.checkbox("MFI alt sınır aktif", value=scan_mode in {"positive_money_flow", "strong_momentum"})
+        min_mfi_14 = st.number_input("Minimum MFI 14", value=50.0, step=1.0)
+        max_mfi_14_active = st.checkbox("MFI üst sınır aktif", value=scan_mode == "positive_money_flow")
+        max_mfi_14 = st.number_input("Maksimum MFI 14", value=85.0, step=1.0)
+        max_daily_return_active = st.checkbox("Maks günlük getiri filtresi", value=scan_mode == "silent_accumulation")
+        max_daily_return_pct = st.number_input("Maks günlük getiri %", value=2.0, step=0.5)
+        max_price_range_active = st.checkbox("Maks fiyat aralığı filtresi", value=scan_mode == "silent_accumulation")
+        max_price_range_pct = st.number_input("Maks fiyat aralığı %", value=5.0, step=0.5)
+        min_accumulation_score_active = st.checkbox("Minimum accumulation score aktif", value=scan_mode in {"positive_money_flow", "silent_accumulation", "strong_momentum"})
+        min_accumulation_score = st.number_input("Minimum Accumulation Score", value=50.0, step=5.0)
         include_negative_moves = st.checkbox("Negatif fiyat hareketlerini dahil et", value=False)
         start_scan = st.button("Taramayı Başlat")
         _render_filters_panel(
             RadarConfig(
+                scan_mode=scan_mode,
                 lookback_days=int(lookback_days),
                 min_avg_turnover_try_active=min_avg_turnover_try_active,
                 min_avg_turnover_try=float(min_avg_turnover_try),
@@ -211,6 +249,20 @@ def render_positive_interest_radar_page(*, embedded: bool = False) -> None:
                 require_ma50_active=require_ma50_active,
                 min_xu100_relative_active=min_xu100_relative_active,
                 min_xu100_relative=float(min_xu100_relative),
+                min_cmf_20_active=min_cmf_20_active,
+                min_cmf_20=float(min_cmf_20),
+                require_obv_slope_5d_positive=require_obv_slope_5d_positive,
+                require_obv_slope_20d_positive=require_obv_slope_20d_positive,
+                min_mfi_14_active=min_mfi_14_active,
+                min_mfi_14=float(min_mfi_14),
+                max_mfi_14_active=max_mfi_14_active,
+                max_mfi_14=float(max_mfi_14),
+                max_daily_return_active=max_daily_return_active,
+                max_daily_return_pct=float(max_daily_return_pct),
+                max_price_range_active=max_price_range_active,
+                max_price_range_pct=float(max_price_range_pct),
+                min_accumulation_score_active=min_accumulation_score_active,
+                min_accumulation_score=float(min_accumulation_score),
                 min_interest_score_active=min_interest_score_active,
                 min_interest_score=float(min_interest_score),
                 include_negative_moves=include_negative_moves,
@@ -237,6 +289,7 @@ def render_positive_interest_radar_page(*, embedded: bool = False) -> None:
     st.caption(f"Tarama evreni: {len(raw_symbols)} BIST hissesi | Evren kaynağı: `{cache_source}`")
 
     config = RadarConfig(
+        scan_mode=scan_mode,
         lookback_days=int(lookback_days),
         min_avg_turnover_try_active=min_avg_turnover_try_active,
         min_avg_turnover_try=float(min_avg_turnover_try),
@@ -253,6 +306,20 @@ def render_positive_interest_radar_page(*, embedded: bool = False) -> None:
         require_ma50_active=require_ma50_active,
         min_xu100_relative_active=min_xu100_relative_active,
         min_xu100_relative=float(min_xu100_relative),
+        min_cmf_20_active=min_cmf_20_active,
+        min_cmf_20=float(min_cmf_20),
+        require_obv_slope_5d_positive=require_obv_slope_5d_positive,
+        require_obv_slope_20d_positive=require_obv_slope_20d_positive,
+        min_mfi_14_active=min_mfi_14_active,
+        min_mfi_14=float(min_mfi_14),
+        max_mfi_14_active=max_mfi_14_active,
+        max_mfi_14=float(max_mfi_14),
+        max_daily_return_active=max_daily_return_active,
+        max_daily_return_pct=float(max_daily_return_pct),
+        max_price_range_active=max_price_range_active,
+        max_price_range_pct=float(max_price_range_pct),
+        min_accumulation_score_active=min_accumulation_score_active,
+        min_accumulation_score=float(min_accumulation_score),
         min_interest_score_active=min_interest_score_active,
         min_interest_score=float(min_interest_score),
         include_negative_moves=include_negative_moves,

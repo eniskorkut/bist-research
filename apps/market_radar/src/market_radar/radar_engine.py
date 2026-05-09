@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 import hashlib
 import json
@@ -33,6 +33,7 @@ def _safe_float(value: Any) -> float | None:
 
 @dataclass
 class RadarConfig:
+    scan_mode: str = "positive_money_flow"
     lookback_days: int = 260
     min_avg_turnover_try_active: bool = True
     min_avg_turnover_try: float = 10_000_000.0
@@ -51,6 +52,20 @@ class RadarConfig:
     min_xu100_relative: float = 0.0
     min_interest_score_active: bool = True
     min_interest_score: float = 50.0
+    min_cmf_20_active: bool = False
+    min_cmf_20: float = 0.0
+    require_obv_slope_5d_positive: bool = False
+    require_obv_slope_20d_positive: bool = False
+    min_mfi_14_active: bool = False
+    min_mfi_14: float = 50.0
+    max_mfi_14_active: bool = False
+    max_mfi_14: float = 85.0
+    max_daily_return_active: bool = False
+    max_daily_return_pct: float = 2.0
+    max_price_range_active: bool = False
+    max_price_range_pct: float = 5.0
+    min_accumulation_score_active: bool = False
+    min_accumulation_score: float = 50.0
     include_negative_moves: bool = False
     force_refresh: bool = False
     db_path: str = "/data/market_radar_cache.sqlite"
@@ -91,7 +106,17 @@ class RadarResult:
     xu100_daily_return_pct: float | None
     xu100_relative_return_pct: float | None
     sector_relative_return_pct: float | None
+    cmf_20: float | None
+    adl_slope_5d: float | None
+    adl_slope_20d: float | None
+    obv_slope_5d: float | None
+    obv_slope_20d: float | None
+    mfi_14: float | None
+    price_range_pct: float | None
+    volume_price_confirmation: bool
+    accumulation_score: float
     interest_score: float
+    accumulation_signals: list[str] = field(default_factory=list)
     signals: list[str] = field(default_factory=list)
     passed_filters: list[str] = field(default_factory=list)
     failed_filters: list[str] = field(default_factory=list)
@@ -112,6 +137,15 @@ class RadarResult:
             "Daily Return %": self.daily_return_pct,
             "Volume Ratio 20D": self.volume_ratio_20d,
             "Turnover Ratio 20D": self.turnover_ratio_20d,
+            "CMF 20": self.cmf_20,
+            "OBV Slope 5D": self.obv_slope_5d,
+            "OBV Slope 20D": self.obv_slope_20d,
+            "ADL Slope 5D": self.adl_slope_5d,
+            "ADL Slope 20D": self.adl_slope_20d,
+            "MFI 14": self.mfi_14,
+            "Price Range %": self.price_range_pct,
+            "Accumulation Score": self.accumulation_score,
+            "Accumulation Signals": ", ".join(self.accumulation_signals),
             "XU100 Relative %": self.xu100_relative_return_pct,
             "Close Position": self.close_position,
             "Breakout 20D": self.breakout_20d,
@@ -146,6 +180,212 @@ def _daily_return_from_frame(df: pd.DataFrame | None) -> float | None:
     if prev_close in (None, 0) or pd.isna(prev_close):
         return None
     return ((last_close / prev_close) - 1) * 100
+
+
+def _money_flow_multiplier(df: pd.DataFrame) -> pd.Series:
+    spread = (df["high"] - df["low"]).replace(0, pd.NA)
+    mfm = (((df["close"] - df["low"]) - (df["high"] - df["close"])) / spread).fillna(0.0)
+    return mfm.astype(float)
+
+
+def _cmf_20(df: pd.DataFrame) -> float | None:
+    if len(df) < 20:
+        return None
+    mfm = _money_flow_multiplier(df)
+    mfv = mfm * df["volume"].astype(float)
+    mfv20 = mfv.tail(20).sum()
+    vol20 = df["volume"].astype(float).tail(20).sum()
+    if vol20 == 0:
+        return None
+    return _safe_float(mfv20 / vol20)
+
+
+def _adl_series(df: pd.DataFrame) -> pd.Series:
+    mfm = _money_flow_multiplier(df)
+    mfv = mfm * df["volume"].astype(float)
+    return mfv.cumsum()
+
+
+def _obv_series(df: pd.DataFrame) -> pd.Series:
+    close = df["close"].astype(float)
+    volume = df["volume"].astype(float)
+    delta = close.diff()
+    direction = delta.apply(lambda x: 1.0 if x > 0 else (-1.0 if x < 0 else 0.0)).fillna(0.0)
+    return (direction * volume).cumsum()
+
+
+def _series_slope(series: pd.Series, days: int) -> float | None:
+    needed = days + 1
+    clean = series.dropna()
+    if len(clean) < needed:
+        return None
+    return _safe_float(clean.iloc[-1] - clean.iloc[-needed])
+
+
+def _mfi_14(df: pd.DataFrame) -> float | None:
+    if len(df) < 15:
+        return None
+    tp = (df["high"].astype(float) + df["low"].astype(float) + df["close"].astype(float)) / 3.0
+    rmf = tp * df["volume"].astype(float)
+    tp_prev = tp.shift(1)
+    pos = rmf.where(tp > tp_prev, 0.0)
+    neg = rmf.where(tp < tp_prev, 0.0)
+    pos14 = _safe_float(pos.tail(14).sum())
+    neg14 = _safe_float(neg.tail(14).sum())
+    if pos14 is None or neg14 is None:
+        return None
+    if neg14 == 0:
+        if pos14 > 0:
+            return 100.0
+        return None
+    ratio = pos14 / neg14
+    value = 100 - (100 / (1 + ratio))
+    return _safe_float(value)
+
+
+def calculate_accumulation_score(metrics: dict[str, Any]) -> float:
+    score = 0.0
+    v = metrics.get("volume_ratio_20d")
+    t = metrics.get("turnover_ratio_20d")
+    d = metrics.get("daily_return_pct")
+    c = metrics.get("close_position")
+    cmf = metrics.get("cmf_20")
+    obv5 = metrics.get("obv_slope_5d")
+    obv20 = metrics.get("obv_slope_20d")
+    adl5 = metrics.get("adl_slope_5d")
+    mfi = metrics.get("mfi_14")
+    if isinstance(v, (int, float)) and v >= 1.5:
+        score += 10
+    if isinstance(v, (int, float)) and v >= 2.0:
+        score += 10
+    if isinstance(t, (int, float)) and t >= 1.2:
+        score += 10
+    if isinstance(t, (int, float)) and t >= 1.5:
+        score += 5
+    if isinstance(d, (int, float)) and d >= 0:
+        score += 10
+    if isinstance(c, (int, float)) and c >= 0.60:
+        score += 10
+    if isinstance(c, (int, float)) and c >= 0.70:
+        score += 5
+    if isinstance(cmf, (int, float)) and cmf > 0:
+        score += 15
+    if isinstance(cmf, (int, float)) and cmf > 0.05:
+        score += 10
+    if isinstance(obv5, (int, float)) and obv5 > 0:
+        score += 10
+    if isinstance(obv20, (int, float)) and obv20 > 0:
+        score += 5
+    if isinstance(adl5, (int, float)) and adl5 > 0:
+        score += 5
+    if isinstance(mfi, (int, float)) and 50 <= mfi <= 85:
+        score += 10
+    return min(score, 100.0)
+
+
+def build_accumulation_signals(metrics: dict[str, Any]) -> list[str]:
+    signals: list[str] = []
+    if isinstance(metrics.get("volume_ratio_20d"), (int, float)) and metrics["volume_ratio_20d"] >= 1.5:
+        signals.append("rvol_high")
+    if isinstance(metrics.get("turnover_ratio_20d"), (int, float)) and metrics["turnover_ratio_20d"] >= 1.2:
+        signals.append("turnover_high")
+    if isinstance(metrics.get("cmf_20"), (int, float)) and metrics["cmf_20"] > 0:
+        signals.append("cmf_positive")
+    if isinstance(metrics.get("obv_slope_5d"), (int, float)) and metrics["obv_slope_5d"] > 0:
+        signals.append("obv_rising")
+    if isinstance(metrics.get("adl_slope_5d"), (int, float)) and metrics["adl_slope_5d"] > 0:
+        signals.append("adl_rising")
+    if isinstance(metrics.get("close_position"), (int, float)) and metrics["close_position"] >= 0.60:
+        signals.append("strong_close")
+    if isinstance(metrics.get("mfi_14"), (int, float)) and 50 <= metrics["mfi_14"] <= 85:
+        signals.append("mfi_confirmed")
+    return signals
+
+
+def apply_scan_mode_presets(config: RadarConfig) -> RadarConfig:
+    mode = config.scan_mode
+    if mode == "volume_spike":
+        return replace(
+            config,
+            min_volume_ratio_active=True,
+            min_volume_ratio=max(config.min_volume_ratio, 1.5),
+            min_turnover_ratio_active=True,
+            min_turnover_ratio=max(config.min_turnover_ratio, 1.2),
+            min_cmf_20_active=False,
+            require_obv_slope_5d_positive=False,
+            require_obv_slope_20d_positive=False,
+            min_mfi_14_active=False,
+            max_mfi_14_active=False,
+            min_accumulation_score_active=False,
+        )
+    if mode == "positive_money_flow":
+        return replace(
+            config,
+            min_volume_ratio_active=True,
+            min_volume_ratio=max(config.min_volume_ratio, 1.5),
+            min_turnover_ratio_active=True,
+            min_turnover_ratio=max(config.min_turnover_ratio, 1.2),
+            min_daily_return_active=True,
+            min_daily_return=max(config.min_daily_return, 0.0),
+            min_close_position_active=True,
+            min_close_position=max(config.min_close_position, 0.60),
+            min_cmf_20_active=True,
+            min_cmf_20=max(config.min_cmf_20, 0.0),
+            require_obv_slope_5d_positive=True,
+            min_mfi_14_active=True,
+            min_mfi_14=max(config.min_mfi_14, 50.0),
+            max_mfi_14_active=True,
+            max_mfi_14=min(config.max_mfi_14, 85.0),
+            min_accumulation_score_active=True,
+            min_accumulation_score=max(config.min_accumulation_score, 50.0),
+        )
+    if mode == "silent_accumulation":
+        return replace(
+            config,
+            min_volume_ratio_active=True,
+            min_volume_ratio=max(config.min_volume_ratio, 1.5),
+            min_turnover_ratio_active=True,
+            min_turnover_ratio=max(config.min_turnover_ratio, 1.2),
+            min_daily_return_active=True,
+            min_daily_return=max(config.min_daily_return, -1.0),
+            max_daily_return_active=True,
+            max_daily_return_pct=min(config.max_daily_return_pct, 2.0),
+            min_close_position_active=True,
+            min_close_position=max(config.min_close_position, 0.50),
+            min_cmf_20_active=True,
+            min_cmf_20=max(config.min_cmf_20, 0.0),
+            require_obv_slope_5d_positive=True,
+            require_obv_slope_20d_positive=True,
+            max_price_range_active=True,
+            max_price_range_pct=min(config.max_price_range_pct, 5.0),
+            min_accumulation_score_active=True,
+            min_accumulation_score=max(config.min_accumulation_score, 50.0),
+        )
+    if mode == "strong_momentum":
+        return replace(
+            config,
+            min_avg_turnover_try_active=True,
+            min_avg_turnover_try=max(config.min_avg_turnover_try, 30_000_000.0),
+            min_volume_ratio_active=True,
+            min_volume_ratio=max(config.min_volume_ratio, 2.0),
+            min_turnover_ratio_active=True,
+            min_turnover_ratio=max(config.min_turnover_ratio, 1.5),
+            min_daily_return_active=True,
+            min_daily_return=max(config.min_daily_return, 1.0),
+            min_close_position_active=True,
+            min_close_position=max(config.min_close_position, 0.70),
+            min_cmf_20_active=True,
+            min_cmf_20=max(config.min_cmf_20, 0.05),
+            require_obv_slope_5d_positive=True,
+            min_mfi_14_active=True,
+            min_mfi_14=max(config.min_mfi_14, 55.0),
+            require_ma20_active=True,
+            min_xu100_relative_active=True,
+            min_xu100_relative=max(config.min_xu100_relative, 0.0),
+            min_accumulation_score_active=True,
+            min_accumulation_score=max(config.min_accumulation_score, 60.0),
+        )
+    return config
 
 
 def calculate_interest_score(metrics: dict[str, Any]) -> float:
@@ -278,6 +518,12 @@ def evaluate_filters(metrics: dict[str, Any], config: RadarConfig) -> tuple[list
             passed.append("min_daily_return")
         else:
             failed.append("min_daily_return")
+    if config.max_daily_return_active:
+        value = metrics.get("daily_return_pct")
+        if isinstance(value, (int, float)) and value <= config.max_daily_return_pct:
+            passed.append("max_daily_return_pct")
+        else:
+            failed.append("max_daily_return_pct")
 
     if config.min_close_position_active:
         value = metrics.get("close_position")
@@ -315,6 +561,48 @@ def evaluate_filters(metrics: dict[str, Any], config: RadarConfig) -> tuple[list
             passed.append("xu100_relative")
         else:
             failed.append("xu100_relative")
+    if config.min_cmf_20_active:
+        value = metrics.get("cmf_20")
+        if isinstance(value, (int, float)) and value > config.min_cmf_20:
+            passed.append("min_cmf_20")
+        else:
+            failed.append("min_cmf_20")
+    if config.require_obv_slope_5d_positive:
+        value = metrics.get("obv_slope_5d")
+        if isinstance(value, (int, float)) and value > 0:
+            passed.append("obv_slope_5d_positive")
+        else:
+            failed.append("obv_slope_5d_positive")
+    if config.require_obv_slope_20d_positive:
+        value = metrics.get("obv_slope_20d")
+        if isinstance(value, (int, float)) and value > 0:
+            passed.append("obv_slope_20d_positive")
+        else:
+            failed.append("obv_slope_20d_positive")
+    if config.min_mfi_14_active:
+        value = metrics.get("mfi_14")
+        if isinstance(value, (int, float)) and value >= config.min_mfi_14:
+            passed.append("min_mfi_14")
+        else:
+            failed.append("min_mfi_14")
+    if config.max_mfi_14_active:
+        value = metrics.get("mfi_14")
+        if isinstance(value, (int, float)) and value <= config.max_mfi_14:
+            passed.append("max_mfi_14")
+        else:
+            failed.append("max_mfi_14")
+    if config.max_price_range_active:
+        value = metrics.get("price_range_pct")
+        if isinstance(value, (int, float)) and value <= config.max_price_range_pct:
+            passed.append("max_price_range_pct")
+        else:
+            failed.append("max_price_range_pct")
+    if config.min_accumulation_score_active:
+        value = metrics.get("accumulation_score")
+        if isinstance(value, (int, float)) and value >= config.min_accumulation_score:
+            passed.append("min_accumulation_score")
+        else:
+            failed.append("min_accumulation_score")
 
     if config.min_interest_score_active:
         if metrics.get("interest_score", 0) >= config.min_interest_score:
@@ -366,6 +654,7 @@ def evaluate_symbol(
     close_position = None
     if high is not None and low is not None and close is not None and high != low:
         close_position = (close - low) / (high - low)
+    price_range_pct = day_range_pct
 
     avg_volume_20d = _tail_average(df, "volume", 20, exclude_latest=True)
     volume_ratio_20d = (volume / avg_volume_20d) if volume is not None and avg_volume_20d not in (None, 0) else None
@@ -382,6 +671,22 @@ def evaluate_symbol(
     breakout_20d = bool(close is not None and high_20d is not None and close >= high_20d)
     high_52w = _safe_float(df["high"].tail(252).max())
     near_52w_high = bool(close is not None and high_52w is not None and close >= high_52w * 0.95)
+    cmf20 = _cmf_20(df)
+    adl = _adl_series(df)
+    adl_slope_5d = _series_slope(adl, 5)
+    adl_slope_20d = _series_slope(adl, 20)
+    obv = _obv_series(df)
+    obv_slope_5d = _series_slope(obv, 5)
+    obv_slope_20d = _series_slope(obv, 20)
+    mfi14 = _mfi_14(df)
+    volume_price_confirmation = bool(
+        isinstance(volume_ratio_20d, (int, float))
+        and volume_ratio_20d >= 1.5
+        and isinstance(daily_return_pct, (int, float))
+        and daily_return_pct >= 0
+        and isinstance(close_position, (int, float))
+        and close_position >= 0.60
+    )
 
     xu100_daily_return_pct = _daily_return_from_frame(benchmark)
     xu100_relative_return_pct = (
@@ -409,6 +714,14 @@ def evaluate_symbol(
         "turnover_try": turnover_try,
         "avg_turnover_20d": avg_turnover_20d,
         "turnover_ratio_20d": turnover_ratio_20d,
+        "cmf_20": cmf20,
+        "adl_slope_5d": adl_slope_5d,
+        "adl_slope_20d": adl_slope_20d,
+        "obv_slope_5d": obv_slope_5d,
+        "obv_slope_20d": obv_slope_20d,
+        "mfi_14": mfi14,
+        "price_range_pct": price_range_pct,
+        "volume_price_confirmation": volume_price_confirmation,
         "ma20": ma20,
         "ma50": ma50,
         "above_ma20": above_ma20,
@@ -429,8 +742,11 @@ def evaluate_symbol(
         "freshness_warning": bool((history_meta.data_lag_days if history_meta else None) is not None and (history_meta.data_lag_days if history_meta else 0) > 3),
     }
     interest_score = calculate_interest_score(metrics)
+    accumulation_score = calculate_accumulation_score(metrics)
     metrics["interest_score"] = interest_score
+    metrics["accumulation_score"] = accumulation_score
     signals = build_signals(metrics)
+    accumulation_signals = build_accumulation_signals(metrics)
     passed_filters, failed_filters = evaluate_filters(metrics, config)
 
     return RadarResult(
@@ -451,6 +767,16 @@ def evaluate_symbol(
         turnover_try=turnover_try,
         avg_turnover_20d=avg_turnover_20d,
         turnover_ratio_20d=turnover_ratio_20d,
+        cmf_20=cmf20,
+        adl_slope_5d=adl_slope_5d,
+        adl_slope_20d=adl_slope_20d,
+        obv_slope_5d=obv_slope_5d,
+        obv_slope_20d=obv_slope_20d,
+        mfi_14=mfi14,
+        price_range_pct=price_range_pct,
+        volume_price_confirmation=volume_price_confirmation,
+        accumulation_score=accumulation_score,
+        accumulation_signals=accumulation_signals,
         ma20=ma20,
         ma50=ma50,
         above_ma20=above_ma20,
@@ -490,6 +816,16 @@ def _result_to_cache_row(result: RadarResult) -> dict[str, Any]:
 
 
 def _result_from_cache_row(row: dict[str, Any]) -> RadarResult:
+    row.setdefault("cmf_20", None)
+    row.setdefault("adl_slope_5d", None)
+    row.setdefault("adl_slope_20d", None)
+    row.setdefault("obv_slope_5d", None)
+    row.setdefault("obv_slope_20d", None)
+    row.setdefault("mfi_14", None)
+    row.setdefault("price_range_pct", row.get("day_range_pct"))
+    row.setdefault("volume_price_confirmation", False)
+    row.setdefault("accumulation_score", 0.0)
+    row.setdefault("accumulation_signals", [])
     return RadarResult(**row)
 
 
@@ -505,7 +841,7 @@ def _build_scan_cache_payload(scan: ScanResult) -> tuple[list[dict[str, Any]], l
 def build_scan_cache_key(symbols: list[str], config: RadarConfig) -> str:
     normalized_sorted = sorted(normalize_bist_symbol(item) for item in symbols if normalize_bist_symbol(item))
     key_payload = {
-        "cache_schema_version": 2,
+        "cache_schema_version": 3,
         "index_symbol": normalize_bist_symbol(config.index_symbol),
         "symbols_hash": hashlib.sha256(",".join(normalized_sorted).encode("utf-8")).hexdigest(),
         "lookback_days": config.lookback_days,
@@ -527,6 +863,21 @@ def build_scan_cache_key(symbols: list[str], config: RadarConfig) -> str:
             "min_xu100_relative": config.min_xu100_relative,
             "min_interest_score_active": config.min_interest_score_active,
             "min_interest_score": config.min_interest_score,
+            "scan_mode": config.scan_mode,
+            "min_cmf_20_active": config.min_cmf_20_active,
+            "min_cmf_20": config.min_cmf_20,
+            "require_obv_slope_5d_positive": config.require_obv_slope_5d_positive,
+            "require_obv_slope_20d_positive": config.require_obv_slope_20d_positive,
+            "min_mfi_14_active": config.min_mfi_14_active,
+            "min_mfi_14": config.min_mfi_14,
+            "max_mfi_14_active": config.max_mfi_14_active,
+            "max_mfi_14": config.max_mfi_14,
+            "max_daily_return_active": config.max_daily_return_active,
+            "max_daily_return_pct": config.max_daily_return_pct,
+            "max_price_range_active": config.max_price_range_active,
+            "max_price_range_pct": config.max_price_range_pct,
+            "min_accumulation_score_active": config.min_accumulation_score_active,
+            "min_accumulation_score": config.min_accumulation_score,
             "include_negative_moves": config.include_negative_moves,
             "ohlcv_cache_ttl_minutes": config.ohlcv_cache_ttl_minutes,
         },
@@ -676,21 +1027,30 @@ def scan_symbols(
         "newest_data_date": None,
         "oldest_data_date": None,
         "max_data_lag_days": None,
-        "stale_data_count": 0,
-        "fresh_data_count": 0,
+        "scanned_stale_data_count": 0,
+        "scanned_fresh_data_count": 0,
+        "result_stale_data_count": 0,
+        "result_fresh_data_count": 0,
     }
 
     dates = [item.data_latest_date for item in all_results if item.data_latest_date]
     lags = [item.data_lag_days for item in all_results if item.data_lag_days is not None]
-    stale_count = sum(1 for item in all_results if item.freshness_warning)
-    fresh_count = sum(1 for item in all_results if not item.freshness_warning)
+    scanned_stale_count = sum(1 for item in all_results if item.freshness_warning)
+    scanned_fresh_count = sum(1 for item in all_results if not item.freshness_warning)
+    result_stale_count = sum(1 for item in passed if item.freshness_warning)
+    result_fresh_count = sum(1 for item in passed if not item.freshness_warning)
     if dates:
         scan_summary["newest_data_date"] = max(dates)
         scan_summary["oldest_data_date"] = min(dates)
     if lags:
         scan_summary["max_data_lag_days"] = max(lags)
-    scan_summary["stale_data_count"] = stale_count
-    scan_summary["fresh_data_count"] = fresh_count
+    scan_summary["scanned_stale_data_count"] = scanned_stale_count
+    scan_summary["scanned_fresh_data_count"] = scanned_fresh_count
+    scan_summary["result_stale_data_count"] = result_stale_count
+    scan_summary["result_fresh_data_count"] = result_fresh_count
+    # Backward compatibility keys.
+    scan_summary["stale_data_count"] = result_stale_count
+    scan_summary["fresh_data_count"] = result_fresh_count
 
     scan = ScanResult(
         results=passed,

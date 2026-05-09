@@ -20,7 +20,17 @@ from market_radar.data_access import (
     upsert_cached_universe,
 )
 import market_radar.data_access as data_access
-from market_radar.radar_engine import RadarConfig, ScanResult, build_scan_cache_key, calculate_interest_score, evaluate_filters, evaluate_symbol, scan_symbols
+from market_radar.radar_engine import (
+    RadarConfig,
+    ScanResult,
+    apply_scan_mode_presets,
+    build_scan_cache_key,
+    calculate_accumulation_score,
+    calculate_interest_score,
+    evaluate_filters,
+    evaluate_symbol,
+    scan_symbols,
+)
 from market_radar.symbols import normalize_bist_symbol
 
 
@@ -489,3 +499,106 @@ def test_radar_result_to_row_includes_freshness_columns() -> None:
     assert "Data Lag Days" in row
     assert "OHLCV Cache Status" in row
     assert row["Data Date"] == "2026-05-09"
+
+
+def test_cmf_20_positive_on_uptrend() -> None:
+    df = _history_frame()
+    result = evaluate_symbol("THYAO", df, None, config=RadarConfig(include_negative_moves=True))
+    assert result.cmf_20 is not None
+    assert result.cmf_20 > 0
+
+
+def test_cmf_20_negative_on_downtrend() -> None:
+    df = _history_frame().copy()
+    # force closes near low to generate negative money flow
+    df["close"] = df["low"] + 0.1
+    result = evaluate_symbol("THYAO", df, None, config=RadarConfig(include_negative_moves=True))
+    assert result.cmf_20 is not None
+    assert result.cmf_20 < 0
+
+
+def test_obv_slope_5d_positive_on_rising_close() -> None:
+    df = _history_frame()
+    result = evaluate_symbol("THYAO", df, None, config=RadarConfig(include_negative_moves=True))
+    assert result.obv_slope_5d is not None
+    assert result.obv_slope_5d > 0
+
+
+def test_mfi_14_in_expected_range() -> None:
+    df = _history_frame()
+    result = evaluate_symbol("THYAO", df, None, config=RadarConfig(include_negative_moves=True))
+    assert result.mfi_14 is None or (0 <= result.mfi_14 <= 100)
+
+
+def test_accumulation_score_in_range() -> None:
+    df = _history_frame()
+    result = evaluate_symbol("THYAO", df, None, config=RadarConfig(include_negative_moves=True))
+    assert 0 <= result.accumulation_score <= 100
+
+
+def test_positive_money_flow_preset_enables_cmf_obv_mfi_filters() -> None:
+    cfg = apply_scan_mode_presets(RadarConfig(scan_mode="positive_money_flow"))
+    assert cfg.min_cmf_20_active is True
+    assert cfg.require_obv_slope_5d_positive is True
+    assert cfg.min_mfi_14_active is True
+    assert cfg.max_mfi_14_active is True
+    assert cfg.min_accumulation_score_active is True
+
+
+def test_silent_accumulation_preset_applies_max_daily_return() -> None:
+    cfg = apply_scan_mode_presets(RadarConfig(scan_mode="silent_accumulation"))
+    assert cfg.max_daily_return_active is True
+    assert cfg.max_daily_return_pct <= 2.0
+    assert cfg.max_price_range_active is True
+
+
+def test_to_row_includes_accumulation_columns() -> None:
+    result = evaluate_symbol("THYAO", _history_frame(), None, config=RadarConfig(include_negative_moves=True))
+    row = result.to_row()
+    assert "CMF 20" in row
+    assert "OBV Slope 5D" in row
+    assert "MFI 14" in row
+    assert "Accumulation Score" in row
+    assert "Accumulation Signals" in row
+
+
+def test_filter_rejects_when_cmf_required_but_negative() -> None:
+    cfg = RadarConfig(scan_mode="positive_money_flow", min_cmf_20_active=True, min_cmf_20=0.0)
+    cfg = apply_scan_mode_presets(cfg)
+    metrics = {
+        "avg_turnover_20d": 20_000_000.0,
+        "volume_ratio_20d": 2.0,
+        "turnover_ratio_20d": 2.0,
+        "daily_return_pct": 1.0,
+        "close_position": 0.8,
+        "breakout_20d": False,
+        "above_ma20": True,
+        "above_ma50": True,
+        "xu100_relative_return_pct": 0.5,
+        "interest_score": 75.0,
+        "cmf_20": -0.01,
+        "obv_slope_5d": 10.0,
+        "obv_slope_20d": 10.0,
+        "mfi_14": 60.0,
+        "price_range_pct": 2.0,
+        "accumulation_score": 65.0,
+    }
+    _, failed = evaluate_filters(metrics, cfg)
+    assert "min_cmf_20" in failed
+
+
+def test_accumulation_score_helper() -> None:
+    metrics = {
+        "volume_ratio_20d": 2.1,
+        "turnover_ratio_20d": 1.6,
+        "daily_return_pct": 1.0,
+        "close_position": 0.72,
+        "cmf_20": 0.06,
+        "obv_slope_5d": 100.0,
+        "obv_slope_20d": 50.0,
+        "adl_slope_5d": 20.0,
+        "mfi_14": 70.0,
+    }
+    score = calculate_accumulation_score(metrics)
+    assert 0 <= score <= 100
+    assert score >= 60
