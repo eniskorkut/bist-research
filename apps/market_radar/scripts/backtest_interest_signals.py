@@ -18,6 +18,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--lookback-days", type=int, default=520)
     parser.add_argument("--strategies", nargs="+", default=["all"])
     parser.add_argument("--max-workers", type=int, default=8)
+    parser.add_argument("--cooldown-days", type=int, default=15)
+    parser.add_argument("--no-cooldown", action="store_true")
     parser.add_argument("--db-path", default="/data/market_radar_cache.sqlite")
     parser.add_argument("--output-dir", default="/data/backtest_outputs")
     parser.add_argument("--force", action="store_true")
@@ -26,11 +28,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    cooldown_days = 0 if args.no_cooldown else max(0, int(args.cooldown_days))
     cfg = BacktestConfig(
         index_symbol=args.index,
         lookback_days=args.lookback_days,
         strategies=args.strategies,
         max_workers=args.max_workers,
+        cooldown_days=cooldown_days,
         db_path=args.db_path,
         output_dir=args.output_dir,
         force_refresh=args.force,

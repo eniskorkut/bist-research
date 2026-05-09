@@ -24,6 +24,7 @@ class BacktestConfig:
     db_path: str = "/data/market_radar_cache.sqlite"
     force_refresh: bool = False
     output_dir: str = "/data/backtest_outputs"
+    cooldown_days: int = 15
 
 
 @dataclass
@@ -39,19 +40,26 @@ def _safe_return(entry: float | None, exit_: float | None) -> float | None:
     return ((exit_ / entry) - 1.0) * 100.0
 
 
-def _price_on_or_after(df: pd.DataFrame, date: pd.Timestamp) -> tuple[pd.Timestamp | None, float | None]:
-    subset = df[df.index >= date]
-    if subset.empty:
+def _row_close(df: pd.DataFrame, idx: int) -> tuple[pd.Timestamp | None, float | None]:
+    if idx < 0 or idx >= len(df):
         return None, None
-    first_idx = subset.index[0]
-    value = subset.iloc[0].get("close")
+    row = df.iloc[idx]
+    ts = pd.Timestamp(df.index[idx])
+    value = row.get("close")
     try:
         price = float(value)
     except (TypeError, ValueError):
-        return first_idx, None
+        return ts, None
     if pd.isna(price):
-        return first_idx, None
-    return first_idx, price
+        return ts, None
+    return ts, price
+
+
+def _next_trading_index(df: pd.DataFrame, date: pd.Timestamp) -> int | None:
+    idx = df.index.searchsorted(date, side="left")
+    if idx >= len(df):
+        return None
+    return int(idx)
 
 
 def _series_metrics_for_date(symbol: str, hist: pd.DataFrame, bench: pd.DataFrame, asof_idx: int) -> dict[str, Any] | None:
@@ -75,6 +83,8 @@ def _run_symbol_backtest(
     history: pd.DataFrame,
     benchmark: pd.DataFrame,
     strategy_names: list[str],
+    *,
+    cooldown_days: int = 15,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     if history.empty or benchmark.empty or len(history) < 50:
@@ -84,13 +94,17 @@ def _run_symbol_backtest(
     bench = benchmark.copy().sort_index()
     dates = hist.index.to_list()
 
+    last_signal_idx: dict[str, int] = {}
     for i in range(30, len(dates)):
         t_date = pd.Timestamp(dates[i])
         metrics = _series_metrics_for_date(symbol, hist, bench, i)
         if not metrics:
             continue
 
-        entry_date, entry_close = _price_on_or_after(hist, t_date + pd.Timedelta(days=1))
+        entry_idx = _next_trading_index(hist, t_date + pd.Timedelta(days=1))
+        if entry_idx is None:
+            continue
+        entry_date, entry_close = _row_close(hist, entry_idx)
         if entry_date is None or entry_close is None:
             continue
 
@@ -99,12 +113,22 @@ def _run_symbol_backtest(
             if not definition.match(metrics):
                 continue
 
-            exit_15_date, exit_15_close = _price_on_or_after(hist, entry_date + pd.Timedelta(days=15))
-            exit_30_date, exit_30_close = _price_on_or_after(hist, entry_date + pd.Timedelta(days=30))
+            if cooldown_days > 0:
+                prev_idx = last_signal_idx.get(strategy_name)
+                if prev_idx is not None and (i - prev_idx) <= cooldown_days:
+                    continue
+                last_signal_idx[strategy_name] = i
 
-            bench_entry_date, bench_entry_close = _price_on_or_after(bench, entry_date)
-            bench_exit_15_date, bench_exit_15_close = _price_on_or_after(bench, entry_date + pd.Timedelta(days=15))
-            bench_exit_30_date, bench_exit_30_close = _price_on_or_after(bench, entry_date + pd.Timedelta(days=30))
+            exit_15_date, exit_15_close = _row_close(hist, entry_idx + 15)
+            exit_30_date, exit_30_close = _row_close(hist, entry_idx + 30)
+
+            bench_entry_idx = _next_trading_index(bench, entry_date)
+            if bench_entry_idx is None:
+                bench_entry_date, bench_entry_close = None, None
+            else:
+                bench_entry_date, bench_entry_close = _row_close(bench, bench_entry_idx)
+            bench_exit_15_date, bench_exit_15_close = (None, None) if bench_entry_idx is None else _row_close(bench, bench_entry_idx + 15)
+            bench_exit_30_date, bench_exit_30_close = (None, None) if bench_entry_idx is None else _row_close(bench, bench_entry_idx + 30)
 
             return_15d = _safe_return(entry_close, exit_15_close)
             return_30d = _safe_return(entry_close, exit_30_close)
@@ -166,7 +190,7 @@ def run_backtest(config: BacktestConfig, client: BorsapyMarketDataClient | None 
     def _worker(sym: str) -> tuple[str, list[dict[str, Any]] | None, str | None]:
         try:
             hist = radar_client.load_history(sym, lookback_days=config.lookback_days, db_path=config.db_path, force=config.force_refresh)
-            rows = _run_symbol_backtest(sym, hist, benchmark, strategies)
+            rows = _run_symbol_backtest(sym, hist, benchmark, strategies, cooldown_days=max(0, int(config.cooldown_days)))
             return sym, rows, None
         except Exception as exc:  # noqa: BLE001
             return sym, None, str(exc)

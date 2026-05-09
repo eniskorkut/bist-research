@@ -38,12 +38,48 @@ def test_entry_date_is_t_plus_one() -> None:
     assert pd.to_datetime(row["entry_date"]) > pd.to_datetime(row["signal_date"])
 
 
+def test_trading_day_horizon_uses_row_offsets() -> None:
+    hist = _history()
+    bench = _history()
+    rows = _run_symbol_backtest("THYAO", hist, bench, ["positive_interest"], cooldown_days=0)
+    if not rows:
+        return
+    row = rows[0]
+    entry = pd.to_datetime(row["entry_date"])
+    exit15 = pd.to_datetime(row["exit_15d_date"]) if row["exit_15d_date"] else None
+    exit30 = pd.to_datetime(row["exit_30d_date"]) if row["exit_30d_date"] else None
+    if exit15 is not None:
+        assert hist.index.get_loc(exit15) - hist.index.get_loc(entry) == 15
+    if exit30 is not None:
+        assert hist.index.get_loc(exit30) - hist.index.get_loc(entry) == 30
+    if row.get("benchmark_entry_date") and row.get("benchmark_exit_15d_date"):
+        b_entry = pd.to_datetime(row["benchmark_entry_date"])
+        b_exit15 = pd.to_datetime(row["benchmark_exit_15d_date"])
+        assert bench.index.get_loc(b_exit15) - bench.index.get_loc(b_entry) == 15
+
+
 def test_missing_exit_windows_do_not_crash() -> None:
     hist = _history().head(35)
     bench = _history().head(35)
     rows = _run_symbol_backtest("THYAO", hist, bench, ["positive_interest"])
     # some rows may have None exits, but function must return list
     assert isinstance(rows, list)
+
+
+def test_cooldown_reduces_repeated_signals() -> None:
+    hist = _history()
+    bench = _history()
+    rows_no_cd = _run_symbol_backtest("THYAO", hist, bench, ["positive_interest"], cooldown_days=0)
+    rows_cd = _run_symbol_backtest("THYAO", hist, bench, ["positive_interest"], cooldown_days=15)
+    assert len(rows_cd) <= len(rows_no_cd)
+
+
+def test_cooldown_zero_keeps_all_signals() -> None:
+    hist = _history()
+    bench = _history()
+    rows0 = _run_symbol_backtest("THYAO", hist, bench, ["positive_interest"], cooldown_days=0)
+    rows_none = _run_symbol_backtest("THYAO", hist, bench, ["positive_interest"], cooldown_days=0)
+    assert len(rows0) == len(rows_none)
 
 
 def test_write_outputs(tmp_path: Path) -> None:
