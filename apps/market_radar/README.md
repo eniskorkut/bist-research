@@ -55,3 +55,38 @@ docker compose run --rm valuation-app python apps/market_radar/scripts/scan_bist
   --min-score 40 \
   --force
 ```
+
+Sadece hacim ortalamasını geçenler:
+
+```bash
+docker compose run --rm valuation-app python apps/market_radar/scripts/scan_bist_interest.py \
+  --index XUTUM \
+  --lookback-days 60 \
+  --min-volume-ratio 1.0 \
+  --min-turnover-ratio 0 \
+  --min-daily-return -100 \
+  --include-negative-moves \
+  --no-require-above-ma20 \
+  --no-require-xu100-relative \
+  --no-require-close-position \
+  --breakout-mode off \
+  --no-require-min-score \
+  --max-workers 8
+```
+
+Pozitif hacim artışı:
+
+```bash
+docker compose run --rm valuation-app python apps/market_radar/scripts/scan_bist_interest.py \
+  --index XUTUM \
+  --lookback-days 60 \
+  --min-volume-ratio 1.5 \
+  --min-turnover-ratio 1.2 \
+  --min-daily-return 0 \
+  --no-require-above-ma20 \
+  --no-require-xu100-relative \
+  --no-require-close-position \
+  --breakout-mode off \
+  --min-score 30 \
+  --max-workers 8
+```

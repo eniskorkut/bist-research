@@ -7,15 +7,20 @@ from market_radar.radar_engine import RadarConfig, scan_symbols
 from market_radar.symbols import normalize_bist_symbol, validate_bist_symbol
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--symbols", nargs="+")
     parser.add_argument("--index", default=DEFAULT_BIST_UNIVERSE_INDEX)
     parser.add_argument("--lookback-days", type=int, default=260)
     parser.add_argument("--min-score", type=float, default=50.0)
+    parser.add_argument("--require-min-score", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--min-volume-ratio", type=float, default=1.5)
     parser.add_argument("--min-turnover-ratio", type=float, default=1.5)
+    parser.add_argument("--min-avg-turnover-try", type=float, default=10_000_000.0)
     parser.add_argument("--min-daily-return", type=float, default=0.0)
+    parser.add_argument("--breakout-mode", choices=["off", "breakout_20d", "near_20d_high_2pct"], default="off")
+    parser.add_argument("--min-close-position", type=float, default=0.0)
+    parser.add_argument("--require-close-position", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--require-above-ma20", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--require-xu100-relative", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--include-negative-moves", action="store_true")
@@ -25,7 +30,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--use-scan-cache", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--scan-cache-ttl-minutes", type=int, default=15)
     parser.add_argument("--db-path", default=DB_PATH)
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def main() -> None:
@@ -47,21 +52,21 @@ def main() -> None:
     config = RadarConfig(
         lookback_days=args.lookback_days,
         min_avg_turnover_try_active=True,
-        min_avg_turnover_try=10_000_000.0,
+        min_avg_turnover_try=args.min_avg_turnover_try,
         min_volume_ratio_active=True,
         min_volume_ratio=args.min_volume_ratio,
         min_turnover_ratio_active=True,
         min_turnover_ratio=args.min_turnover_ratio,
         min_daily_return_active=True,
         min_daily_return=args.min_daily_return,
-        min_close_position_active=True,
-        min_close_position=0.65,
-        breakout_mode="breakout_20d",
+        min_close_position_active=args.require_close_position,
+        min_close_position=args.min_close_position,
+        breakout_mode=args.breakout_mode,
         require_ma20_active=args.require_above_ma20,
         require_ma50_active=False,
         min_xu100_relative_active=args.require_xu100_relative,
         min_xu100_relative=0.0,
-        min_interest_score_active=True,
+        min_interest_score_active=args.require_min_score,
         min_interest_score=args.min_score,
         include_negative_moves=args.include_negative_moves,
         force_refresh=args.force,
