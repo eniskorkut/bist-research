@@ -146,7 +146,9 @@ def _run_symbol_backtest(
                     "entry_date": entry_date.date().isoformat(),
                     "entry_close": entry_close,
                     "exit_15d_date": None if exit_15_date is None else exit_15_date.date().isoformat(),
+                    "exit_15d_close": exit_15_close,
                     "exit_30d_date": None if exit_30_date is None else exit_30_date.date().isoformat(),
+                    "exit_30d_close": exit_30_close,
                     "return_15d": return_15d,
                     "return_30d": return_30d,
                     "benchmark_symbol": "XU100",
@@ -170,6 +172,10 @@ def _run_symbol_backtest(
                     "mfi_14": metrics.get("mfi_14"),
                     "accumulation_score": metrics.get("accumulation_score"),
                     "relative_return_vs_xu100": metrics.get("relative_return_vs_xu100"),
+                    "interest_score": metrics.get("interest_score"),
+                    "above_ma20": metrics.get("above_ma20"),
+                    "above_ma50": metrics.get("above_ma50"),
+                    "near_20d_high_pct": metrics.get("near_20d_high_pct"),
                 }
             )
     return rows

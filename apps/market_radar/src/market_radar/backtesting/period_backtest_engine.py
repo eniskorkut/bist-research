@@ -1,0 +1,894 @@
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass
+from datetime import UTC, date, datetime, timedelta
+import json
+from pathlib import Path
+from typing import Any
+
+import pandas as pd
+
+from market_radar.backtesting.backtest_engine import BacktestConfig, run_backtest
+from market_radar.data_access import BorsapyMarketDataClient
+from market_radar.symbols import normalize_bist_symbol
+
+
+@dataclass(frozen=True)
+class PeriodWindow:
+    period_start: date
+    period_end: date
+
+
+@dataclass
+class PeriodBacktestConfig:
+    index_symbol: str = "XU100"
+    lookback_days: int = 700
+    strategies: list[str] | None = None
+    max_workers: int = 8
+    cooldown_days: int = 15
+    force_refresh: bool = False
+    db_path: str = "/data/market_radar_cache.sqlite"
+    output_dir: str = "/data/backtest_outputs/period_runs"
+    period_starts: list[str] | None = None
+    period_ends: list[str] | None = None
+    basket_mode: str = "first_signal_per_symbol"
+    as_of_date: str | None = None
+
+
+@dataclass
+class PeriodBacktestResult:
+    holdings: pd.DataFrame
+    period_strategy_summary: pd.DataFrame
+    strategy_stability_summary: pd.DataFrame
+    run_summary: dict[str, Any]
+
+
+def _parse_date(text: str) -> date:
+    return datetime.strptime(text, "%Y-%m-%d").date()
+
+
+def _next_month_start(value: date) -> date:
+    if value.month == 12:
+        return date(value.year + 1, 1, 1)
+    return date(value.year, value.month + 1, 1)
+
+
+def build_period_windows(period_starts: list[str], period_ends: list[str] | None = None) -> list[PeriodWindow]:
+    starts = sorted({_parse_date(item) for item in period_starts})
+    if not starts:
+        return []
+    end_values = [_parse_date(item) for item in (period_ends or [])]
+    windows: list[PeriodWindow] = []
+    for idx, start in enumerate(starts):
+        if idx < len(end_values):
+            end = end_values[idx]
+        elif idx + 1 < len(starts):
+            end = starts[idx + 1]
+        else:
+            end = _next_month_start(start)
+        windows.append(PeriodWindow(period_start=start, period_end=end))
+    return windows
+
+
+def _trimmed_mean(series: pd.Series, proportion: float = 0.1) -> float | None:
+    clean = series.dropna().sort_values()
+    n = len(clean)
+    if n == 0:
+        return None
+    k = int(n * proportion)
+    if k == 0 or n <= (2 * k):
+        value = clean.mean()
+    else:
+        value = clean.iloc[k : n - k].mean()
+    if pd.isna(value):
+        return None
+    return float(value)
+
+
+def _safe_mean(series: pd.Series) -> float | None:
+    clean = series.dropna()
+    if clean.empty:
+        return None
+    value = clean.mean()
+    if pd.isna(value):
+        return None
+    return float(value)
+
+
+def _safe_median(series: pd.Series) -> float | None:
+    clean = series.dropna()
+    if clean.empty:
+        return None
+    value = clean.median()
+    if pd.isna(value):
+        return None
+    return float(value)
+
+
+def _safe_rate_positive(series: pd.Series) -> float | None:
+    clean = series.dropna()
+    if clean.empty:
+        return None
+    return float((clean > 0).mean())
+
+
+def _safe_bool_rate(series: pd.Series) -> float | None:
+    if series is None:
+        return None
+    numeric = pd.to_numeric(series.replace({True: 1, False: 0}), errors="coerce")
+    clean = numeric.dropna()
+    if clean.empty:
+        return None
+    return float(clean.mean())
+
+
+def _to_bool(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if value in (0, 1):
+        return bool(value)
+    return None
+
+
+def _prepare_signals_frame(raw_signals: list[dict[str, Any]]) -> pd.DataFrame:
+    frame = pd.DataFrame(raw_signals).copy()
+    if frame.empty:
+        return frame
+    frame["signal_date"] = pd.to_datetime(frame["signal_date"], errors="coerce")
+    frame["entry_date"] = pd.to_datetime(frame["entry_date"], errors="coerce")
+    frame["exit_15d_date"] = pd.to_datetime(frame["exit_15d_date"], errors="coerce")
+    frame["exit_30d_date"] = pd.to_datetime(frame["exit_30d_date"], errors="coerce")
+    for col in [
+        "return_15d",
+        "return_30d",
+        "benchmark_return_15d",
+        "benchmark_return_30d",
+        "alpha_15d",
+        "alpha_30d",
+        "interest_score",
+        "volume_ratio_20d",
+        "turnover_ratio_20d",
+        "close_position",
+        "daily_return_pct",
+        "near_20d_high_pct",
+    ]:
+        if col in frame.columns:
+            frame[col] = pd.to_numeric(frame[col], errors="coerce")
+    if "beat_xu100_15d" in frame.columns:
+        frame["beat_xu100_15d"] = frame["beat_xu100_15d"].map(_to_bool)
+    if "beat_xu100_30d" in frame.columns:
+        frame["beat_xu100_30d"] = frame["beat_xu100_30d"].map(_to_bool)
+    return frame
+
+
+def _normalize_history(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+    out = df.copy().sort_index()
+    out.index = pd.to_datetime(out.index, errors="coerce").tz_localize(None)
+    out = out[~out.index.isna()]
+    out = out[~out.index.duplicated(keep="last")]
+    return out
+
+
+def _history_latest_date(df: pd.DataFrame) -> pd.Timestamp | None:
+    if df is None or df.empty:
+        return None
+    return pd.Timestamp(df.index.max()).tz_localize(None)
+
+
+def _close_on_or_before(df: pd.DataFrame, target: pd.Timestamp) -> tuple[pd.Timestamp | None, float | None]:
+    if df is None or df.empty:
+        return None, None
+    target = pd.Timestamp(target).tz_localize(None)
+    idx = df.index.searchsorted(target, side="right") - 1
+    if idx < 0 or idx >= len(df):
+        return None, None
+    dt = pd.Timestamp(df.index[idx]).tz_localize(None)
+    val = pd.to_numeric(df.iloc[idx].get("close"), errors="coerce")
+    if pd.isna(val):
+        return dt, None
+    return dt, float(val)
+
+
+def _safe_return(entry: float | None, exit_: float | None) -> float | None:
+    if entry is None or exit_ is None or entry == 0:
+        return None
+    return ((exit_ / entry) - 1.0) * 100.0
+
+
+def _trading_row_index(df: pd.DataFrame, target: pd.Timestamp) -> int | None:
+    if df is None or df.empty:
+        return None
+    target_day = pd.Timestamp(target).tz_localize(None).normalize()
+    index_days = pd.DatetimeIndex(df.index).tz_localize(None).normalize()
+    matches = (index_days >= target_day).nonzero()[0]
+    if len(matches) == 0:
+        return None
+    return int(matches[0])
+
+
+def _row_close(df: pd.DataFrame, idx: int) -> tuple[pd.Timestamp | None, float | None]:
+    if idx < 0 or idx >= len(df):
+        return None, None
+    dt = pd.Timestamp(df.index[idx]).tz_localize(None)
+    val = pd.to_numeric(df.iloc[idx].get("close"), errors="coerce")
+    if pd.isna(val):
+        return dt, None
+    return dt, float(val)
+
+
+def _pick_basket(frame: pd.DataFrame, basket_mode: str) -> pd.DataFrame:
+    if frame.empty:
+        return frame.copy()
+    ordered = frame.sort_values(["signal_date", "entry_date", "symbol"]).copy()
+    if basket_mode == "signal_weighted":
+        return ordered
+    return ordered.drop_duplicates(subset=["symbol"], keep="first")
+
+
+def _contribution_pct(series: pd.Series, top_n: int) -> float | None:
+    clean = series.dropna()
+    if clean.empty:
+        return None
+    total = clean.sum()
+    if total == 0:
+        return None
+    top_sum = clean.sort_values(ascending=False).head(top_n).sum()
+    return float((top_sum / total) * 100.0)
+
+
+def _add_to_latest_metrics(
+    basket: pd.DataFrame,
+    symbol_histories: dict[str, pd.DataFrame],
+    benchmark_history: pd.DataFrame,
+    effective_as_of_date: pd.Timestamp,
+) -> pd.DataFrame:
+    if basket.empty:
+        return basket.copy()
+    out = basket.copy()
+    out["exit_date_to_current"] = pd.NaT
+    out["exit_price_to_current"] = pd.NA
+    out["return_to_current"] = pd.NA
+    out["benchmark_return_to_current"] = pd.NA
+    out["alpha_to_current"] = pd.NA
+    out["beat_xu100_to_current"] = pd.NA
+
+    for idx, row in out.iterrows():
+        symbol = str(row.get("symbol") or "")
+        signal_date = pd.to_datetime(row.get("signal_date"), errors="coerce")
+        if pd.isna(signal_date):
+            continue
+        signal_date = pd.Timestamp(signal_date).tz_localize(None)
+        sym_hist = symbol_histories.get(symbol)
+        if sym_hist is None or sym_hist.empty:
+            continue
+        entry_idx = _trading_row_index(sym_hist, signal_date)
+        if entry_idx is None:
+            continue
+        entry_dt, entry_price = _row_close(sym_hist, entry_idx)
+        if entry_dt is None or entry_price is None:
+            continue
+
+        # Entry convention for period backtest: signal-day close
+        out.at[idx, "entry_date"] = entry_dt
+        out.at[idx, "entry_close"] = entry_price
+
+        # 15/30 trading-day exits from signal day
+        exit15_dt, exit15_price = _row_close(sym_hist, entry_idx + 15)
+        exit30_dt, exit30_price = _row_close(sym_hist, entry_idx + 30)
+        out.at[idx, "exit_15d_date"] = exit15_dt
+        out.at[idx, "exit_15d_close"] = exit15_price
+        out.at[idx, "exit_30d_date"] = exit30_dt
+        out.at[idx, "exit_30d_close"] = exit30_price
+        ret15 = _safe_return(entry_price, exit15_price)
+        ret30 = _safe_return(entry_price, exit30_price)
+        out.at[idx, "return_15d"] = ret15
+        out.at[idx, "return_30d"] = ret30
+
+        bench_entry_dt, bench_entry_price = _close_on_or_before(benchmark_history, entry_dt)
+        bench_exit_15_dt, bench_exit_15_price = (None, None)
+        bench_exit_30_dt, bench_exit_30_price = (None, None)
+        if exit15_dt is not None:
+            bench_exit_15_dt, bench_exit_15_price = _close_on_or_before(benchmark_history, exit15_dt)
+        if exit30_dt is not None:
+            bench_exit_30_dt, bench_exit_30_price = _close_on_or_before(benchmark_history, exit30_dt)
+
+        bench_ret15 = _safe_return(bench_entry_price, bench_exit_15_price)
+        bench_ret30 = _safe_return(bench_entry_price, bench_exit_30_price)
+        out.at[idx, "benchmark_return_15d"] = bench_ret15
+        out.at[idx, "benchmark_return_30d"] = bench_ret30
+        alpha15 = None if ret15 is None or bench_ret15 is None else ret15 - bench_ret15
+        alpha30 = None if ret30 is None or bench_ret30 is None else ret30 - bench_ret30
+        out.at[idx, "alpha_15d"] = alpha15
+        out.at[idx, "alpha_30d"] = alpha30
+        out.at[idx, "beat_xu100_15d"] = None if alpha15 is None else alpha15 > 0
+        out.at[idx, "beat_xu100_30d"] = None if alpha30 is None else alpha30 > 0
+
+        exit_current_dt, exit_current_price = _close_on_or_before(sym_hist, effective_as_of_date)
+        if exit_current_dt is None or exit_current_price is None:
+            continue
+        bench_exit_cur_dt, bench_exit_cur_price = _close_on_or_before(benchmark_history, exit_current_dt)
+        ret_cur = _safe_return(entry_price, exit_current_price)
+        bench_ret_cur = _safe_return(bench_entry_price, bench_exit_cur_price)
+        alpha_cur = None if ret_cur is None or bench_ret_cur is None else ret_cur - bench_ret_cur
+
+        out.at[idx, "exit_date_to_current"] = exit_current_dt
+        out.at[idx, "exit_price_to_current"] = exit_current_price
+        out.at[idx, "return_to_current"] = ret_cur
+        out.at[idx, "benchmark_return_to_current"] = bench_ret_cur
+        out.at[idx, "alpha_to_current"] = alpha_cur
+        out.at[idx, "beat_xu100_to_current"] = None if alpha_cur is None else alpha_cur > 0
+    return out
+
+
+def _build_period_strategy_summary(
+    period_start: date,
+    period_end: date,
+    effective_as_of_date: pd.Timestamp | None,
+    strategy: str,
+    basket_mode: str,
+    basket: pd.DataFrame,
+) -> dict[str, Any]:
+    signal_count = int(len(basket))
+    unique_symbol_count = int(basket["symbol"].nunique()) if not basket.empty else 0
+    ret15 = basket["return_15d"] if "return_15d" in basket.columns else pd.Series(dtype=float)
+    ret30 = basket["return_30d"] if "return_30d" in basket.columns else pd.Series(dtype=float)
+    b15 = basket["benchmark_return_15d"] if "benchmark_return_15d" in basket.columns else pd.Series(dtype=float)
+    b30 = basket["benchmark_return_30d"] if "benchmark_return_30d" in basket.columns else pd.Series(dtype=float)
+    a15 = basket["alpha_15d"] if "alpha_15d" in basket.columns else pd.Series(dtype=float)
+    a30 = basket["alpha_30d"] if "alpha_30d" in basket.columns else pd.Series(dtype=float)
+    ret_current = basket["return_to_current"] if "return_to_current" in basket.columns else pd.Series(dtype=float)
+    b_current = basket["benchmark_return_to_current"] if "benchmark_return_to_current" in basket.columns else pd.Series(dtype=float)
+    a_current = basket["alpha_to_current"] if "alpha_to_current" in basket.columns else pd.Series(dtype=float)
+
+    basket_return_15d = _safe_mean(ret15)
+    basket_return_30d = _safe_mean(ret30)
+    benchmark_return_15d = _safe_mean(b15)
+    benchmark_return_30d = _safe_mean(b30)
+    basket_alpha_15d = None if basket_return_15d is None or benchmark_return_15d is None else basket_return_15d - benchmark_return_15d
+    basket_alpha_30d = None if basket_return_30d is None or benchmark_return_30d is None else basket_return_30d - benchmark_return_30d
+    basket_return_to_current = _safe_mean(ret_current)
+    benchmark_return_to_current = _safe_mean(b_current)
+    basket_alpha_to_current = None if basket_return_to_current is None or benchmark_return_to_current is None else basket_return_to_current - benchmark_return_to_current
+
+    valid30 = ret30.dropna()
+    best_symbol_30d = None
+    best_return_30d = None
+    worst_symbol_30d = None
+    worst_return_30d = None
+    if not valid30.empty:
+        best_idx = valid30.idxmax()
+        worst_idx = valid30.idxmin()
+        best_symbol_30d = basket.loc[best_idx, "symbol"]
+        best_return_30d = float(valid30.loc[best_idx])
+        worst_symbol_30d = basket.loc[worst_idx, "symbol"]
+        worst_return_30d = float(valid30.loc[worst_idx])
+
+    valid15 = ret15.dropna()
+    best_symbol_15d = None
+    best_return_15d = None
+    worst_symbol_15d = None
+    worst_return_15d = None
+    if not valid15.empty:
+        best_idx = valid15.idxmax()
+        worst_idx = valid15.idxmin()
+        best_symbol_15d = basket.loc[best_idx, "symbol"]
+        best_return_15d = float(valid15.loc[best_idx])
+        worst_symbol_15d = basket.loc[worst_idx, "symbol"]
+        worst_return_15d = float(valid15.loc[worst_idx])
+
+    top1 = _contribution_pct(valid30, 1)
+    top3 = _contribution_pct(valid30, 3)
+    top1_current = _contribution_pct(ret_current.dropna(), 1)
+    top3_current = _contribution_pct(ret_current.dropna(), 3)
+    mean30 = _safe_mean(ret30)
+    median30 = _safe_median(ret30)
+    outlier_warning = False
+    if top1_current is not None and top1_current >= 50:
+        outlier_warning = True
+    if top3_current is not None and top3_current >= 80:
+        outlier_warning = True
+    if mean30 is not None and median30 is not None and (mean30 - median30) >= 10:
+        outlier_warning = True
+    low_sample_warning = signal_count < 10
+
+    best_symbol_current = None
+    best_return_current = None
+    worst_symbol_current = None
+    worst_return_current = None
+    valid_current = ret_current.dropna()
+    if not valid_current.empty:
+        best_idx = valid_current.idxmax()
+        worst_idx = valid_current.idxmin()
+        best_symbol_current = basket.loc[best_idx, "symbol"]
+        best_return_current = float(valid_current.loc[best_idx])
+        worst_symbol_current = basket.loc[worst_idx, "symbol"]
+        worst_return_current = float(valid_current.loc[worst_idx])
+
+    return {
+        "period_start": period_start.isoformat(),
+        "period_end": period_end.isoformat(),
+        "effective_as_of_date": None if effective_as_of_date is None else effective_as_of_date.date().isoformat(),
+        "strategy": strategy,
+        "basket_mode": basket_mode,
+        "signal_count": signal_count,
+        "unique_symbol_count": unique_symbol_count,
+        "basket_return_15d": basket_return_15d,
+        "basket_return_30d": basket_return_30d,
+        "benchmark_return_15d": benchmark_return_15d,
+        "benchmark_return_30d": benchmark_return_30d,
+        "basket_alpha_15d": basket_alpha_15d,
+        "basket_alpha_30d": basket_alpha_30d,
+        "basket_return_to_current": basket_return_to_current,
+        "benchmark_return_to_current": benchmark_return_to_current,
+        "basket_alpha_to_current": basket_alpha_to_current,
+        "avg_return_15d": _safe_mean(ret15),
+        "avg_return_30d": _safe_mean(ret30),
+        "avg_return_to_current": _safe_mean(ret_current),
+        "median_return_15d": _safe_median(ret15),
+        "median_return_30d": _safe_median(ret30),
+        "median_return_to_current": _safe_median(ret_current),
+        "trimmed_mean_return_15d": _trimmed_mean(ret15),
+        "trimmed_mean_return_30d": _trimmed_mean(ret30),
+        "trimmed_mean_return_to_current": _trimmed_mean(ret_current),
+        "avg_alpha_15d": _safe_mean(a15),
+        "avg_alpha_30d": _safe_mean(a30),
+        "avg_alpha_to_current": _safe_mean(a_current),
+        "median_alpha_15d": _safe_median(a15),
+        "median_alpha_30d": _safe_median(a30),
+        "median_alpha_to_current": _safe_median(a_current),
+        "trimmed_mean_alpha_15d": _trimmed_mean(a15),
+        "trimmed_mean_alpha_30d": _trimmed_mean(a30),
+        "trimmed_mean_alpha_to_current": _trimmed_mean(a_current),
+        "positive_rate_15d": _safe_rate_positive(ret15),
+        "positive_rate_30d": _safe_rate_positive(ret30),
+        "positive_rate_to_current": _safe_rate_positive(ret_current),
+        "beat_rate_15d": _safe_bool_rate(basket["beat_xu100_15d"] if "beat_xu100_15d" in basket.columns else pd.Series(dtype=float)),
+        "beat_rate_30d": _safe_bool_rate(basket["beat_xu100_30d"] if "beat_xu100_30d" in basket.columns else pd.Series(dtype=float)),
+        "beat_rate_to_current": _safe_bool_rate(basket["beat_xu100_to_current"] if "beat_xu100_to_current" in basket.columns else pd.Series(dtype=float)),
+        "valid_return_15d_count": int(ret15.dropna().shape[0]),
+        "valid_return_30d_count": int(ret30.dropna().shape[0]),
+        "valid_return_to_current_count": int(ret_current.dropna().shape[0]),
+        "best_symbol_15d": best_symbol_15d,
+        "best_return_15d": best_return_15d,
+        "worst_symbol_15d": worst_symbol_15d,
+        "worst_return_15d": worst_return_15d,
+        "best_symbol_30d": best_symbol_30d,
+        "best_return_30d": best_return_30d,
+        "worst_symbol_30d": worst_symbol_30d,
+        "worst_return_30d": worst_return_30d,
+        "best_symbol_to_current": best_symbol_current,
+        "best_return_to_current": best_return_current,
+        "worst_symbol_to_current": worst_symbol_current,
+        "worst_return_to_current": worst_return_current,
+        "top_1_contribution_30d_pct": top1,
+        "top_3_contribution_30d_pct": top3,
+        "top_1_contribution_to_current_pct": top1_current,
+        "top_3_contribution_to_current_pct": top3_current,
+        "outlier_warning": outlier_warning,
+        "low_sample_warning": low_sample_warning,
+    }
+
+
+def _build_stability_summary(period_summary: pd.DataFrame) -> pd.DataFrame:
+    if period_summary.empty:
+        return pd.DataFrame(
+            columns=[
+                "strategy",
+                "period_count",
+                "active_period_count",
+                "empty_period_count",
+                "total_signal_count",
+                "total_unique_symbol_count",
+                "avg_basket_return_15d",
+                "avg_basket_return_30d",
+                "avg_basket_return_to_current",
+                "median_basket_return_15d",
+                "median_basket_return_30d",
+                "median_basket_return_to_current",
+                "avg_basket_alpha_15d",
+                "avg_basket_alpha_30d",
+                "avg_basket_alpha_to_current",
+                "median_basket_alpha_15d",
+                "median_basket_alpha_30d",
+                "median_basket_alpha_to_current",
+                "positive_period_rate_15d",
+                "positive_period_rate_30d",
+                "positive_period_rate_to_current",
+                "beat_period_rate_15d",
+                "beat_period_rate_30d",
+                "beat_period_rate_to_current",
+                "best_period_to_current",
+                "worst_period_to_current",
+                "consistency_score",
+                "outlier_period_count",
+                "low_sample_period_count",
+            ]
+        )
+    out_rows: list[dict[str, Any]] = []
+    for strategy, frame in period_summary.groupby("strategy"):
+        active_frame = frame.loc[frame["signal_count"] > 0].copy()
+        ret15 = active_frame["basket_return_15d"] if not active_frame.empty else pd.Series(dtype=float)
+        ret30 = active_frame["basket_return_30d"] if not active_frame.empty else pd.Series(dtype=float)
+        ret_current = active_frame["basket_return_to_current"] if not active_frame.empty else pd.Series(dtype=float)
+        a15 = active_frame["basket_alpha_15d"] if not active_frame.empty else pd.Series(dtype=float)
+        a30 = active_frame["basket_alpha_30d"] if not active_frame.empty else pd.Series(dtype=float)
+        a_current = active_frame["basket_alpha_to_current"] if not active_frame.empty else pd.Series(dtype=float)
+        best_period_current = None
+        worst_period_current = None
+        if not ret_current.dropna().empty:
+            best_idx = ret_current.idxmax()
+            worst_idx = ret_current.idxmin()
+            best_period_current = active_frame.loc[best_idx, "period_start"]
+            worst_period_current = active_frame.loc[worst_idx, "period_start"]
+        period_count = int(frame["period_start"].nunique())
+        active_period_count = int((frame["signal_count"] > 0).sum())
+        empty_period_count = period_count - active_period_count
+        positive_period_rate_15d = _safe_rate_positive(ret15)
+        positive_period_rate_30d = _safe_rate_positive(ret30)
+        positive_period_rate_current = _safe_rate_positive(ret_current)
+        beat_period_rate_15d = _safe_rate_positive(a15)
+        beat_period_rate_30d = _safe_rate_positive(a30)
+        beat_period_rate_current = _safe_rate_positive(a_current)
+        consistency_score = 0.0
+        for value in [positive_period_rate_15d, positive_period_rate_30d, positive_period_rate_current, beat_period_rate_15d, beat_period_rate_30d, beat_period_rate_current]:
+            if value is not None:
+                consistency_score += value * (100.0 / 6.0)
+        out_rows.append(
+            {
+                "strategy": strategy,
+                "period_count": period_count,
+                "active_period_count": active_period_count,
+                "empty_period_count": empty_period_count,
+                "total_signal_count": int(frame["signal_count"].sum()),
+                "total_unique_symbol_count": int(active_frame["unique_symbol_count"].sum()) if not active_frame.empty else 0,
+                "avg_basket_return_15d": _safe_mean(ret15),
+                "avg_basket_return_30d": _safe_mean(ret30),
+                "avg_basket_return_to_current": _safe_mean(ret_current),
+                "median_basket_return_15d": _safe_median(ret15),
+                "median_basket_return_30d": _safe_median(ret30),
+                "median_basket_return_to_current": _safe_median(ret_current),
+                "avg_basket_alpha_15d": _safe_mean(a15),
+                "avg_basket_alpha_30d": _safe_mean(a30),
+                "avg_basket_alpha_to_current": _safe_mean(a_current),
+                "median_basket_alpha_15d": _safe_median(a15),
+                "median_basket_alpha_30d": _safe_median(a30),
+                "median_basket_alpha_to_current": _safe_median(a_current),
+                "positive_period_rate_15d": positive_period_rate_15d,
+                "positive_period_rate_30d": positive_period_rate_30d,
+                "positive_period_rate_to_current": positive_period_rate_current,
+                "beat_period_rate_15d": beat_period_rate_15d,
+                "beat_period_rate_30d": beat_period_rate_30d,
+                "beat_period_rate_to_current": beat_period_rate_current,
+                "best_period_to_current": best_period_current,
+                "worst_period_to_current": worst_period_current,
+                "consistency_score": consistency_score,
+                "outlier_period_count": int(frame["outlier_warning"].fillna(False).astype(bool).sum()),
+                "low_sample_period_count": int(frame["low_sample_warning"].fillna(False).astype(bool).sum()),
+            }
+        )
+    return pd.DataFrame(out_rows).sort_values("strategy")
+
+
+def run_period_backtest(config: PeriodBacktestConfig) -> PeriodBacktestResult:
+    windows = build_period_windows(config.period_starts or [], config.period_ends)
+    raw = run_backtest(
+        BacktestConfig(
+            index_symbol=config.index_symbol,
+            lookback_days=config.lookback_days,
+            strategies=config.strategies,
+            max_workers=config.max_workers,
+            db_path=config.db_path,
+            force_refresh=config.force_refresh,
+            cooldown_days=config.cooldown_days,
+        )
+    )
+    signals = _prepare_signals_frame(raw.signals)
+    if signals.empty:
+        empty = pd.DataFrame()
+        return PeriodBacktestResult(
+            holdings=empty,
+            period_strategy_summary=empty,
+            strategy_stability_summary=empty,
+            run_summary={
+                "period_count": len(windows),
+                "basket_mode": config.basket_mode,
+                "scan_summary": raw.scan_summary,
+                "failed_symbols": raw.failed_symbols,
+            },
+        )
+
+    strategies = sorted(set(signals["strategy"].dropna().astype(str).tolist()))
+    radar_client = BorsapyMarketDataClient()
+    symbol_histories: dict[str, pd.DataFrame] = {}
+    for symbol in sorted(set(signals["symbol"].dropna().astype(str).tolist())):
+        history = radar_client.load_history(
+            symbol,
+            lookback_days=config.lookback_days,
+            db_path=config.db_path,
+            force=config.force_refresh,
+        )
+        symbol_histories[symbol] = _normalize_history(history)
+    benchmark_history = _normalize_history(
+        radar_client.load_history(
+            normalize_bist_symbol(config.index_symbol) or "XU100",
+            lookback_days=config.lookback_days,
+            db_path=config.db_path,
+            force=config.force_refresh,
+        )
+    )
+    if config.as_of_date:
+        effective_as_of = pd.Timestamp(_parse_date(config.as_of_date))
+    else:
+        latest_candidates = [_history_latest_date(benchmark_history)]
+        latest_candidates.extend(_history_latest_date(hist) for hist in symbol_histories.values())
+        latest_candidates = [x for x in latest_candidates if x is not None]
+        effective_as_of = min(latest_candidates) if latest_candidates else None
+
+    holdings_rows: list[dict[str, Any]] = []
+    period_rows: list[dict[str, Any]] = []
+    for idx, window in enumerate(windows):
+        period_end_filter = window.period_end
+        period_end_display = window.period_end
+        if (
+            idx == len(windows) - 1
+            and not config.period_ends
+            and effective_as_of is not None
+            and period_end_filter <= effective_as_of.date()
+        ):
+            period_end_filter = (effective_as_of + pd.Timedelta(days=1)).date()
+            period_end_display = effective_as_of.date()
+
+        mask = (signals["signal_date"] >= pd.Timestamp(window.period_start)) & (
+            signals["signal_date"] < pd.Timestamp(period_end_filter)
+        )
+        scoped = signals.loc[mask].copy()
+        for strategy in strategies:
+            strat = scoped.loc[scoped["strategy"] == strategy].copy()
+            basket = _pick_basket(strat, config.basket_mode)
+            if effective_as_of is not None:
+                basket = _add_to_latest_metrics(
+                    basket=basket,
+                    symbol_histories=symbol_histories,
+                    benchmark_history=benchmark_history,
+                    effective_as_of_date=effective_as_of,
+                )
+            if basket.empty:
+                period_rows.append(
+                    _build_period_strategy_summary(
+                        window.period_start,
+                        period_end_display,
+                        effective_as_of,
+                        strategy,
+                        config.basket_mode,
+                        basket,
+                    )
+                )
+                continue
+
+            export = basket.copy()
+            export["period_start"] = window.period_start.isoformat()
+            export["period_end"] = period_end_display.isoformat()
+            export["effective_as_of_date"] = None if effective_as_of is None else effective_as_of.date().isoformat()
+            export = export.rename(columns={"volume_ratio_20d": "rvol_20d"})
+            holdings_rows.extend(export.to_dict("records"))
+
+            period_rows.append(
+                _build_period_strategy_summary(
+                    window.period_start,
+                    period_end_display,
+                    effective_as_of,
+                    strategy,
+                    config.basket_mode,
+                    basket,
+                )
+            )
+
+    holdings = pd.DataFrame(holdings_rows)
+    period_summary = pd.DataFrame(period_rows)
+    stability = _build_stability_summary(period_summary)
+    return PeriodBacktestResult(
+        holdings=holdings,
+        period_strategy_summary=period_summary.sort_values(["period_start", "strategy"]) if not period_summary.empty else period_summary,
+        strategy_stability_summary=stability,
+        run_summary={
+            "period_count": len(windows),
+            "basket_mode": config.basket_mode,
+            "effective_as_of_date": None if effective_as_of is None else effective_as_of.date().isoformat(),
+            "entry_convention": "entry_price is signal-day close; 15d/30d exits are trading-day offsets from signal date",
+            "period_windows": [asdict(item) for item in windows],
+            "scan_summary": raw.scan_summary,
+            "failed_symbols": raw.failed_symbols,
+            "generated_at": datetime.now(UTC).isoformat(),
+        },
+    )
+
+
+def write_period_outputs(result: PeriodBacktestResult, config: PeriodBacktestConfig) -> dict[str, str]:
+    out_dir = Path(config.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    holdings_path = out_dir / "period_basket_holdings.csv"
+    period_summary_path = out_dir / "period_strategy_summary.csv"
+    stability_path = out_dir / "strategy_stability_summary.csv"
+    config_path = out_dir / "backtest_period_config.json"
+
+    holdings_columns = [
+        "period_start",
+        "period_end",
+        "effective_as_of_date",
+        "strategy",
+        "symbol",
+        "signal_date",
+        "entry_price",
+        "exit_date_15d",
+        "exit_15d_close",
+        "return_15d",
+        "benchmark_return_15d",
+        "alpha_15d",
+        "beat_xu100_15d",
+        "exit_date_30d",
+        "exit_30d_close",
+        "return_30d",
+        "benchmark_return_30d",
+        "alpha_30d",
+        "beat_xu100_30d",
+        "exit_date_to_current",
+        "exit_price_to_current",
+        "return_to_current",
+        "benchmark_return_to_current",
+        "alpha_to_current",
+        "beat_xu100_to_current",
+        "interest_score",
+        "rvol_20d",
+        "turnover_ratio_20d",
+        "close_position",
+        "daily_return_pct",
+        "near_20d_high_pct",
+        "above_ma20",
+        "above_ma50",
+    ]
+
+    period_summary_columns = [
+        "period_start",
+        "period_end",
+        "effective_as_of_date",
+        "strategy",
+        "basket_mode",
+        "signal_count",
+        "unique_symbol_count",
+        "basket_return_15d",
+        "basket_return_30d",
+        "benchmark_return_15d",
+        "benchmark_return_30d",
+        "basket_alpha_15d",
+        "basket_alpha_30d",
+        "basket_return_to_current",
+        "benchmark_return_to_current",
+        "basket_alpha_to_current",
+        "avg_return_15d",
+        "avg_return_30d",
+        "avg_return_to_current",
+        "median_return_15d",
+        "median_return_30d",
+        "median_return_to_current",
+        "trimmed_mean_return_15d",
+        "trimmed_mean_return_30d",
+        "trimmed_mean_return_to_current",
+        "avg_alpha_15d",
+        "avg_alpha_30d",
+        "avg_alpha_to_current",
+        "median_alpha_15d",
+        "median_alpha_30d",
+        "median_alpha_to_current",
+        "trimmed_mean_alpha_15d",
+        "trimmed_mean_alpha_30d",
+        "trimmed_mean_alpha_to_current",
+        "positive_rate_15d",
+        "positive_rate_30d",
+        "positive_rate_to_current",
+        "beat_rate_15d",
+        "beat_rate_30d",
+        "beat_rate_to_current",
+        "valid_return_15d_count",
+        "valid_return_30d_count",
+        "valid_return_to_current_count",
+        "best_symbol_15d",
+        "best_return_15d",
+        "worst_symbol_15d",
+        "worst_return_15d",
+        "best_symbol_30d",
+        "best_return_30d",
+        "worst_symbol_30d",
+        "worst_return_30d",
+        "best_symbol_to_current",
+        "best_return_to_current",
+        "worst_symbol_to_current",
+        "worst_return_to_current",
+        "top_1_contribution_30d_pct",
+        "top_3_contribution_30d_pct",
+        "top_1_contribution_to_current_pct",
+        "top_3_contribution_to_current_pct",
+        "outlier_warning",
+        "low_sample_warning",
+    ]
+
+    stability_columns = [
+        "strategy",
+        "period_count",
+        "active_period_count",
+        "empty_period_count",
+        "total_signal_count",
+        "total_unique_symbol_count",
+        "avg_basket_return_15d",
+        "avg_basket_return_30d",
+        "avg_basket_return_to_current",
+        "median_basket_return_15d",
+        "median_basket_return_30d",
+        "median_basket_return_to_current",
+        "avg_basket_alpha_15d",
+        "avg_basket_alpha_30d",
+        "avg_basket_alpha_to_current",
+        "median_basket_alpha_15d",
+        "median_basket_alpha_30d",
+        "median_basket_alpha_to_current",
+        "positive_period_rate_15d",
+        "positive_period_rate_30d",
+        "positive_period_rate_to_current",
+        "beat_period_rate_15d",
+        "beat_period_rate_30d",
+        "beat_period_rate_to_current",
+        "best_period_to_current",
+        "worst_period_to_current",
+        "consistency_score",
+        "outlier_period_count",
+        "low_sample_period_count",
+    ]
+
+    holdings_df = result.holdings.copy()
+    holdings_df = holdings_df.rename(
+        columns={
+            "entry_close": "entry_price",
+            "exit_15d_date": "exit_date_15d",
+            "exit_30d_date": "exit_date_30d",
+        }
+    )
+    for col in holdings_columns:
+        if col not in holdings_df.columns:
+            holdings_df[col] = pd.NA
+    holdings_df = holdings_df[holdings_columns]
+    holdings_df.to_csv(holdings_path, index=False)
+
+    period_df = result.period_strategy_summary.copy()
+    for col in period_summary_columns:
+        if col not in period_df.columns:
+            period_df[col] = pd.NA
+    period_df = period_df[period_summary_columns]
+    period_df.to_csv(period_summary_path, index=False)
+
+    stability_df = result.strategy_stability_summary.copy()
+    for col in stability_columns:
+        if col not in stability_df.columns:
+            stability_df[col] = pd.NA
+    stability_df = stability_df[stability_columns]
+    stability_df.to_csv(stability_path, index=False)
+
+    config_path.write_text(
+        json.dumps(
+            {
+                "config": asdict(config),
+                "run_summary": result.run_summary,
+            },
+            ensure_ascii=False,
+            indent=2,
+            default=str,
+        ),
+        encoding="utf-8",
+    )
+    return {
+        "period_strategy_summary.csv": str(period_summary_path),
+        "period_basket_holdings.csv": str(holdings_path),
+        "strategy_stability_summary.csv": str(stability_path),
+        "backtest_period_config.json": str(config_path),
+    }
