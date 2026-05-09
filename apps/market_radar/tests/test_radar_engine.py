@@ -7,14 +7,19 @@ import pandas as pd
 
 from market_radar.data_access import (
     BorsapyMarketDataClient,
+    get_cached_history,
+    get_cached_scan_result,
+    get_default_ohlcv_cache_ttl_minutes,
     get_cached_universe,
     init_db,
     is_stale,
     load_bist_universe,
+    save_radar_results_bulk,
+    upsert_cached_scan_result,
     upsert_cached_universe,
 )
 import market_radar.data_access as data_access
-from market_radar.radar_engine import RadarConfig, ScanResult, calculate_interest_score, evaluate_filters, evaluate_symbol, scan_symbols
+from market_radar.radar_engine import RadarConfig, ScanResult, build_scan_cache_key, calculate_interest_score, evaluate_filters, evaluate_symbol, scan_symbols
 from market_radar.symbols import normalize_bist_symbol
 
 
@@ -233,7 +238,15 @@ def test_scan_continues_on_symbol_error(tmp_path: Path) -> None:
     call_count = {"count": 0}
 
     class FakeClient:
-        def load_history(self, symbol: str, lookback_days: int = 260, *, db_path: str = "", force: bool = False) -> pd.DataFrame:
+        def load_history(
+            self,
+            symbol: str,
+            lookback_days: int = 260,
+            *,
+            db_path: str = "",
+            force: bool = False,
+            cache_ttl_minutes: int | None = None,
+        ) -> pd.DataFrame:
             call_count["count"] += 1
             if symbol == "FAIL":
                 raise RuntimeError("data unavailable")
@@ -264,7 +277,15 @@ def test_scan_empty_failed_symbols_on_success(tmp_path: Path) -> None:
     init_db(db)
 
     class FakeClient:
-        def load_history(self, symbol: str, lookback_days: int = 260, *, db_path: str = "", force: bool = False) -> pd.DataFrame:
+        def load_history(
+            self,
+            symbol: str,
+            lookback_days: int = 260,
+            *,
+            db_path: str = "",
+            force: bool = False,
+            cache_ttl_minutes: int | None = None,
+        ) -> pd.DataFrame:
             return _history_frame()
 
     config = RadarConfig(include_negative_moves=True, min_interest_score_active=False, db_path=db)
@@ -273,3 +294,117 @@ def test_scan_empty_failed_symbols_on_success(tmp_path: Path) -> None:
     assert scan.failed_symbols == []
     assert scan.scan_summary["failed_symbols"] == 0
     assert scan.scan_summary["successful_symbols"] == 2
+
+
+def test_save_radar_results_bulk_writes_multiple_rows(tmp_path: Path) -> None:
+    db = str(tmp_path / "radar.sqlite")
+    init_db(db)
+    rows = [
+        {
+            "symbol": "THYAO",
+            "source": "borsapy",
+            "interest_score": 65.0,
+            "metrics": {"a": 1},
+            "signals": ["volume_spike"],
+            "passed_filters": ["min_interest_score"],
+            "failed_filters": [],
+        },
+        {
+            "symbol": "ASELS",
+            "source": "borsapy",
+            "interest_score": 71.0,
+            "metrics": {"a": 2},
+            "signals": ["breakout_20d"],
+            "passed_filters": ["min_interest_score"],
+            "failed_filters": [],
+        },
+    ]
+    save_radar_results_bulk(db, rows)
+
+    import sqlite3
+
+    with sqlite3.connect(db) as conn:
+        count = conn.execute("SELECT COUNT(*) FROM radar_results").fetchone()[0]
+    assert count == 2
+
+
+def test_adaptive_ttl_rules() -> None:
+    weekend = datetime(2026, 5, 9, 12, 0, tzinfo=timezone.utc)  # Saturday
+    assert get_default_ohlcv_cache_ttl_minutes(weekend) == 1440
+
+    market_open = datetime(2026, 5, 8, 9, 0, tzinfo=timezone.utc)  # 12:00 Istanbul
+    assert get_default_ohlcv_cache_ttl_minutes(market_open) == 15
+
+    market_closed = datetime(2026, 5, 8, 2, 0, tzinfo=timezone.utc)  # 05:00 Istanbul
+    assert get_default_ohlcv_cache_ttl_minutes(market_closed) == 360
+
+
+def test_scan_cache_key_changes_with_config() -> None:
+    symbols = ["THYAO", "ASELS"]
+    c1 = RadarConfig(index_symbol="XU100", min_interest_score=50)
+    c2 = RadarConfig(index_symbol="XU100", min_interest_score=60)
+    assert build_scan_cache_key(symbols, c1) != build_scan_cache_key(symbols, c2)
+
+
+def test_scan_cache_roundtrip_and_expiry(tmp_path: Path) -> None:
+    db = str(tmp_path / "radar.sqlite")
+    init_db(db)
+    cache_key = "k1"
+    payload = {
+        "symbol": "THYAO",
+        "date": "2026-05-05",
+        "open": 1.0,
+        "high": 1.1,
+        "low": 0.9,
+        "close": 1.0,
+        "prev_close": 0.95,
+        "volume": 1000.0,
+        "last_close": 1.0,
+        "daily_return_pct": 1.0,
+        "day_range_pct": 2.0,
+        "close_position": 0.8,
+        "avg_volume_20d": 800.0,
+        "volume_ratio_20d": 1.25,
+        "turnover_try": 1000.0,
+        "avg_turnover_20d": 900.0,
+        "turnover_ratio_20d": 1.1,
+        "ma20": 0.8,
+        "ma50": 0.7,
+        "above_ma20": True,
+        "above_ma50": True,
+        "high_20d": 1.0,
+        "breakout_20d": True,
+        "high_52w": 1.2,
+        "near_52w_high": False,
+        "xu100_daily_return_pct": 0.5,
+        "xu100_relative_return_pct": 0.5,
+        "sector_relative_return_pct": None,
+        "interest_score": 60.0,
+        "signals": ["volume_spike"],
+        "passed_filters": ["min_interest_score"],
+        "failed_filters": [],
+        "raw_metrics": {"x": 1},
+    }
+    upsert_cached_scan_result(
+        db,
+        cache_key,
+        universe_source="borsapy",
+        universe_symbol_count=2,
+        results=[payload],
+        raw_results=[payload],
+        failed_symbols=[],
+        scan_summary={"result_count": 1},
+    )
+    hit = get_cached_scan_result(db, cache_key, max_age_minutes=30)
+    assert hit is not None
+    assert hit["scan_summary"]["result_count"] == 1
+
+    import sqlite3
+
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "UPDATE radar_scan_cache SET scanned_at = ? WHERE cache_key = ?",
+            ((datetime.now(UTC) - timedelta(hours=2)).isoformat(), cache_key),
+        )
+    miss = get_cached_scan_result(db, cache_key, max_age_minutes=30)
+    assert miss is None

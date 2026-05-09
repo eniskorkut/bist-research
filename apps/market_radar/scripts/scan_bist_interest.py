@@ -20,6 +20,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--require-xu100-relative", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--include-negative-moves", action="store_true")
     parser.add_argument("--force", action="store_true")
+    parser.add_argument("--max-workers", type=int, default=8)
+    parser.add_argument("--ohlcv-cache-ttl-minutes", type=int)
+    parser.add_argument("--use-scan-cache", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--scan-cache-ttl-minutes", type=int, default=15)
     parser.add_argument("--db-path", default=DB_PATH)
     return parser.parse_args()
 
@@ -62,18 +66,27 @@ def main() -> None:
         include_negative_moves=args.include_negative_moves,
         force_refresh=args.force,
         db_path=args.db_path,
+        max_workers=args.max_workers,
+        ohlcv_cache_ttl_minutes=args.ohlcv_cache_ttl_minutes,
+        use_scan_cache=args.use_scan_cache,
+        scan_cache_ttl_minutes=args.scan_cache_ttl_minutes,
+        index_symbol=args.index,
     )
 
-    scan = scan_symbols(normalized, config=config)
+    scan = scan_symbols(normalized, config=config, universe_source=cache_source)
 
     # Print summary
     summary = scan.scan_summary
-    print(f"universe_symbol_count={summary['universe_symbol_count']}")
-    print(f"scanned_symbols={summary['scanned_symbols']}")
-    print(f"successful_symbols={summary['successful_symbols']}")
-    print(f"failed_symbols={summary['failed_symbols']}")
-    print(f"result_count={summary['result_count']}")
-    print(f"cache_source={cache_source}")
+    print(f"index={summary.get('index')}")
+    print(f"universe_symbol_count={summary.get('universe_symbol_count')}")
+    print(f"scanned_symbols={summary.get('scanned_symbols')}")
+    print(f"successful_symbols={summary.get('successful_symbols')}")
+    print(f"failed_symbols={summary.get('failed_symbols')}")
+    print(f"result_count={summary.get('result_count')}")
+    print(f"universe_cache_source={summary.get('universe_cache_source', cache_source)}")
+    print(f"scan_cache_source={summary.get('scan_cache_source', 'live_scan')}")
+    print(f"max_workers={summary.get('max_workers', args.max_workers)}")
+    print(f"elapsed_seconds={summary.get('elapsed_seconds')}")
 
     if scan.failed_symbols:
         for fail in scan.failed_symbols:

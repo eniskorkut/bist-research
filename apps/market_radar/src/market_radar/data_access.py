@@ -6,6 +6,7 @@ import math
 import sqlite3
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import borsapy as bp
 import pandas as pd
@@ -14,6 +15,7 @@ from market_radar.symbols import normalize_bist_symbol
 
 DB_PATH = "/data/market_radar_cache.sqlite"
 DEFAULT_BIST_UNIVERSE_INDEX = "XUTUM"
+ISTANBUL_TZ = ZoneInfo("Europe/Istanbul")
 
 
 def _to_float(value: Any) -> float | None:
@@ -108,6 +110,33 @@ def init_db(db_path: str) -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS radar_scan_cache (
+                cache_key TEXT PRIMARY KEY,
+                scanned_at TEXT NOT NULL,
+                universe_source TEXT,
+                universe_symbol_count INTEGER,
+                results_json TEXT NOT NULL,
+                raw_results_json TEXT NOT NULL,
+                failed_symbols_json TEXT NOT NULL,
+                scan_summary_json TEXT NOT NULL
+            )
+            """
+        )
+
+
+def get_default_ohlcv_cache_ttl_minutes(now: datetime | None = None) -> int:
+    current = now.astimezone(ISTANBUL_TZ) if now is not None else datetime.now(ISTANBUL_TZ)
+    weekday = current.weekday()
+    if weekday >= 5:
+        return 24 * 60
+    hhmm = current.hour * 60 + current.minute
+    market_open = 10 * 60
+    market_close = 18 * 60 + 30
+    if market_open <= hhmm <= market_close:
+        return 15
+    return 360
 
 
 def is_stale(fetched_at: str | None, max_age_minutes: int = 15) -> bool:
@@ -174,6 +203,105 @@ def save_radar_result(db_path: str, result: dict[str, Any]) -> None:
                 json.dumps(result.get("signals", [])),
                 json.dumps(result.get("passed_filters", [])),
                 json.dumps(result.get("failed_filters", [])),
+            ),
+        )
+
+
+def save_radar_results_bulk(db_path: str, rows: list[dict[str, Any]]) -> None:
+    if not rows:
+        return
+    init_db(db_path)
+    payload_rows = [
+        (
+            row.get("symbol"),
+            row.get("scanned_at") or datetime.now(UTC).isoformat(),
+            row.get("source") or "borsapy",
+            row.get("interest_score"),
+            json.dumps(row.get("metrics", {})),
+            json.dumps(row.get("signals", [])),
+            json.dumps(row.get("passed_filters", [])),
+            json.dumps(row.get("failed_filters", [])),
+        )
+        for row in rows
+    ]
+    with sqlite3.connect(db_path) as conn:
+        conn.executemany(
+            """
+            INSERT INTO radar_results (
+                symbol, scanned_at, source, interest_score,
+                metrics_json, signals_json, passed_filters_json, failed_filters_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            payload_rows,
+        )
+
+
+def get_cached_scan_result(db_path: str, cache_key: str, max_age_minutes: int) -> dict[str, Any] | None:
+    init_db(db_path)
+    with sqlite3.connect(db_path) as conn:
+        row = conn.execute(
+            """
+            SELECT scanned_at, universe_source, universe_symbol_count,
+                   results_json, raw_results_json, failed_symbols_json, scan_summary_json
+            FROM radar_scan_cache
+            WHERE cache_key = ?
+            """,
+            (cache_key,),
+        ).fetchone()
+    if row is None:
+        return None
+    scanned_at = row[0]
+    if is_stale(scanned_at, max_age_minutes=max_age_minutes):
+        return None
+    return {
+        "scanned_at": scanned_at,
+        "universe_source": row[1],
+        "universe_symbol_count": row[2],
+        "results": json.loads(row[3]),
+        "raw_results": json.loads(row[4]),
+        "failed_symbols": json.loads(row[5]),
+        "scan_summary": json.loads(row[6]),
+    }
+
+
+def upsert_cached_scan_result(
+    db_path: str,
+    cache_key: str,
+    *,
+    universe_source: str,
+    universe_symbol_count: int,
+    results: list[dict[str, Any]],
+    raw_results: list[dict[str, Any]],
+    failed_symbols: list[dict[str, Any]],
+    scan_summary: dict[str, Any],
+) -> None:
+    init_db(db_path)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO radar_scan_cache (
+                cache_key, scanned_at, universe_source, universe_symbol_count,
+                results_json, raw_results_json, failed_symbols_json, scan_summary_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(cache_key) DO UPDATE SET
+                scanned_at=excluded.scanned_at,
+                universe_source=excluded.universe_source,
+                universe_symbol_count=excluded.universe_symbol_count,
+                results_json=excluded.results_json,
+                raw_results_json=excluded.raw_results_json,
+                failed_symbols_json=excluded.failed_symbols_json,
+                scan_summary_json=excluded.scan_summary_json
+            """,
+            (
+                cache_key,
+                datetime.now(UTC).isoformat(),
+                universe_source,
+                universe_symbol_count,
+                json.dumps(results),
+                json.dumps(raw_results),
+                json.dumps(failed_symbols),
+                json.dumps(scan_summary),
             ),
         )
 
@@ -268,10 +396,12 @@ class BorsapyMarketDataClient:
         *,
         db_path: str = DB_PATH,
         force: bool = False,
+        cache_ttl_minutes: int | None = None,
     ) -> pd.DataFrame:
         normalized = normalize_bist_symbol(symbol)
         cached_frame, meta = get_cached_history(db_path, normalized)
-        if not force and meta is not None and not is_stale(meta.get("fetched_at"), max_age_minutes=15):
+        ttl_minutes = cache_ttl_minutes if cache_ttl_minutes is not None else get_default_ohlcv_cache_ttl_minutes()
+        if not force and meta is not None and not is_stale(meta.get("fetched_at"), max_age_minutes=ttl_minutes):
             return cached_frame
         try:
             frame = self._fetch_history(normalized, lookback_days)

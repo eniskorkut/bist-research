@@ -6,7 +6,7 @@ from typing import Any
 import pandas as pd
 import streamlit as st
 
-from market_radar.data_access import DB_PATH, DEFAULT_BIST_UNIVERSE_INDEX, init_db, load_bist_universe
+from market_radar.data_access import DB_PATH, DEFAULT_BIST_UNIVERSE_INDEX, get_default_ohlcv_cache_ttl_minutes, init_db, load_bist_universe
 from market_radar.radar_engine import RadarConfig, RadarResult, ScanResult, scan_symbols
 
 
@@ -37,7 +37,17 @@ def _render_scan_info(scan: ScanResult, cache_source: str) -> None:
     c2.metric("Başarılı", summary.get("successful_symbols", 0))
     c3.metric("Hatalı", summary.get("failed_symbols", 0))
     c4.metric("Sonuç üreten", summary.get("result_count", 0))
-    st.caption(f"Evren kaynağı: `{cache_source}` | Evren sembol sayısı: `{summary.get('universe_symbol_count', 0)}`")
+    p1, p2, p3, p4 = st.columns(4)
+    p1.metric("Evren", summary.get("index", DEFAULT_BIST_UNIVERSE_INDEX))
+    p2.metric("Paralel işçi", summary.get("max_workers", "N/A"))
+    p3.metric("OHLCV TTL (dk)", summary.get("ohlcv_cache_ttl_minutes", "N/A"))
+    p4.metric("Süre (sn)", summary.get("elapsed_seconds", "N/A"))
+    st.caption(
+        "Evren kaynağı: "
+        f"`{summary.get('universe_cache_source', cache_source)}` | "
+        f"Scan cache kaynağı: `{summary.get('scan_cache_source', 'live_scan')}` | "
+        f"Evren sembol sayısı: `{summary.get('universe_symbol_count', 0)}`"
+    )
 
 
 def _render_failed_symbols(scan: ScanResult) -> None:
@@ -142,10 +152,21 @@ def render_positive_interest_radar_page(*, embedded: bool = False) -> None:
 
     with st.sidebar:
         st.header("Girdi")
-        universe_index = DEFAULT_BIST_UNIVERSE_INDEX
-        st.caption(f"Tarama evreni: Tüm Borsa İstanbul ({universe_index})")
+        universe_index = st.selectbox("Tarama evreni", ["XU030", "XU100", "XUTUM"], index=2)
         st.caption("Manuel sembol girişi yok; semboller borsapy endeks bileşenlerinden otomatik alınır.")
         lookback_days = st.number_input("Lookback days", min_value=60, value=260, step=10)
+        max_workers = int(st.selectbox("Paralel işçi sayısı", [4, 8, 12, 16], index=1))
+        ttl_label = st.selectbox("OHLCV Cache TTL", ["Otomatik", "15 dakika", "60 dakika", "6 saat", "24 saat"], index=0)
+        ttl_map = {
+            "Otomatik": None,
+            "15 dakika": 15,
+            "60 dakika": 60,
+            "6 saat": 360,
+            "24 saat": 1440,
+        }
+        ohlcv_cache_ttl_minutes = ttl_map[ttl_label]
+        use_scan_cache = st.checkbox("Scan result cache kullan", value=True)
+        scan_cache_ttl_minutes = int(st.selectbox("Scan cache TTL", [5, 15, 30, 60], index=1))
         force_refresh = st.checkbox("Cache'i yenile", value=False)
         st.markdown("#### Filtreler")
         min_avg_turnover_try_active = st.checkbox("Minimum Ortalama TL Hacim", value=True)
@@ -190,6 +211,11 @@ def render_positive_interest_radar_page(*, embedded: bool = False) -> None:
                 include_negative_moves=include_negative_moves,
                 force_refresh=force_refresh,
                 db_path=DB_PATH,
+                max_workers=max_workers,
+                ohlcv_cache_ttl_minutes=ohlcv_cache_ttl_minutes,
+                use_scan_cache=use_scan_cache,
+                scan_cache_ttl_minutes=scan_cache_ttl_minutes,
+                index_symbol=universe_index,
             )
         )
 
@@ -227,6 +253,11 @@ def render_positive_interest_radar_page(*, embedded: bool = False) -> None:
         include_negative_moves=include_negative_moves,
         force_refresh=force_refresh,
         db_path=DB_PATH,
+        max_workers=max_workers,
+        ohlcv_cache_ttl_minutes=ohlcv_cache_ttl_minutes,
+        use_scan_cache=use_scan_cache,
+        scan_cache_ttl_minutes=scan_cache_ttl_minutes,
+        index_symbol=universe_index,
     )
 
     if start_scan:
@@ -239,11 +270,21 @@ def render_positive_interest_radar_page(*, embedded: bool = False) -> None:
             status_text.caption(f"Son taranan: `{symbol}`")
 
         try:
-            scan = scan_symbols(raw_symbols, config=config, progress_callback=_progress_callback)
+            scan = scan_symbols(
+                raw_symbols,
+                config=config,
+                progress_callback=_progress_callback,
+                universe_source=cache_source,
+            )
             st.session_state["radar_scan"] = scan
             st.session_state["radar_cache_source"] = cache_source
-            progress_bar.progress(1.0, text="Tarama tamamlandı.")
-            status_text.empty()
+            if scan.scan_summary.get("scan_cache_source") == "scan_cache":
+                progress_bar.empty()
+                status_text.empty()
+                st.info("Sonuç cache'ten getirildi.")
+            else:
+                progress_bar.progress(1.0, text="Tarama tamamlandı.")
+                status_text.empty()
         except Exception as exc:
             st.session_state["radar_scan"] = None
             st.session_state["radar_cache_source"] = None
@@ -258,6 +299,10 @@ def render_positive_interest_radar_page(*, embedded: bool = False) -> None:
     stored_cache_source = st.session_state.get("radar_cache_source") or cache_source
 
     if scan is not None:
+        if scan.scan_summary.get("scan_cache_source") == "scan_cache":
+            st.caption("Tarama bu koşullar için cache'ten hızlı getirildi.")
+        if config.ohlcv_cache_ttl_minutes is None:
+            st.caption(f"OHLCV TTL (otomatik): {get_default_ohlcv_cache_ttl_minutes()} dakika")
         _render_scan_info(scan, stored_cache_source)
         _render_summary_cards(scan, len(raw_symbols))
         _render_failed_symbols(scan)

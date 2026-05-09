@@ -1,12 +1,22 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
-from statistics import mean
+from datetime import UTC, datetime
+import hashlib
+import json
+import time
 from typing import Any
 
 import pandas as pd
 
-from market_radar.data_access import BorsapyMarketDataClient, save_radar_result
+from market_radar.data_access import (
+    BorsapyMarketDataClient,
+    get_cached_scan_result,
+    get_default_ohlcv_cache_ttl_minutes,
+    save_radar_results_bulk,
+    upsert_cached_scan_result,
+)
 from market_radar.symbols import normalize_bist_symbol
 
 
@@ -43,6 +53,11 @@ class RadarConfig:
     include_negative_moves: bool = False
     force_refresh: bool = False
     db_path: str = "/data/market_radar_cache.sqlite"
+    max_workers: int = 8
+    ohlcv_cache_ttl_minutes: int | None = None
+    use_scan_cache: bool = True
+    scan_cache_ttl_minutes: int = 15
+    index_symbol: str = "XUTUM"
 
 
 @dataclass
@@ -105,20 +120,6 @@ def _tail_average(df: pd.DataFrame, column: str, window: int, *, exclude_latest:
     if series.empty:
         return None
     return _safe_float(series.mean())
-
-
-def _latest_common_row(stock: pd.DataFrame, benchmark: pd.DataFrame | None) -> tuple[pd.Series | None, pd.Series | None]:
-    if stock is None or stock.empty:
-        return None, None
-    stock = stock.sort_index()
-    if benchmark is None or benchmark.empty:
-        return stock.iloc[-1], None
-    benchmark = benchmark.sort_index()
-    common = stock.index.intersection(benchmark.index)
-    if common.empty:
-        return stock.iloc[-1], benchmark.iloc[-1]
-    idx = common[-1]
-    return stock.loc[idx], benchmark.loc[idx]
 
 
 def _daily_return_from_frame(df: pd.DataFrame | None) -> float | None:
@@ -233,10 +234,6 @@ def build_signals(metrics: dict[str, Any]) -> list[str]:
     return signals
 
 
-def _filter_reason(name: str, passing: bool) -> tuple[str, bool]:
-    return name, passing
-
-
 def evaluate_filters(metrics: dict[str, Any], config: RadarConfig) -> tuple[list[str], list[str]]:
     passed: list[str] = []
     failed: list[str] = []
@@ -282,9 +279,7 @@ def evaluate_filters(metrics: dict[str, Any], config: RadarConfig) -> tuple[list
         else:
             failed.append("breakout_20d")
     elif config.breakout_mode == "near_20d_high_2pct":
-        value = metrics.get("near_52w_high")
-        # named requirement: near the 20d high, approximated from the 20d breakout window
-        if bool(value) or bool(metrics.get("close")) and bool(metrics.get("high_20d")) and float(metrics["close"]) >= float(metrics["high_20d"]) * 0.98:
+        if bool(metrics.get("close")) and bool(metrics.get("high_20d")) and float(metrics["close"]) >= float(metrics["high_20d"]) * 0.98:
             passed.append("near_20d_high_2pct")
         else:
             failed.append("near_20d_high_2pct")
@@ -417,7 +412,7 @@ def evaluate_symbol(
     signals = build_signals(metrics)
     passed_filters, failed_filters = evaluate_filters(metrics, config)
 
-    result = RadarResult(
+    return RadarResult(
         symbol=normalize_bist_symbol(symbol),
         date=metrics["date"],
         open=open_,
@@ -452,16 +447,68 @@ def evaluate_symbol(
         failed_filters=failed_filters,
         raw_metrics=metrics,
     )
-    return result
 
 
 @dataclass
 class ScanResult:
-    """Aggregated result of scanning multiple symbols."""
     results: list[RadarResult]
     raw_results: list[RadarResult]
     failed_symbols: list[dict[str, str]]
     scan_summary: dict[str, Any]
+
+
+def _result_to_cache_row(result: RadarResult) -> dict[str, Any]:
+    return asdict(result)
+
+
+def _result_from_cache_row(row: dict[str, Any]) -> RadarResult:
+    return RadarResult(**row)
+
+
+def _build_scan_cache_payload(scan: ScanResult) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
+    return (
+        [_result_to_cache_row(item) for item in scan.results],
+        [_result_to_cache_row(item) for item in scan.raw_results],
+        scan.failed_symbols,
+        scan.scan_summary,
+    )
+
+
+def build_scan_cache_key(symbols: list[str], config: RadarConfig) -> str:
+    normalized_sorted = sorted(normalize_bist_symbol(item) for item in symbols if normalize_bist_symbol(item))
+    key_payload = {
+        "index_symbol": normalize_bist_symbol(config.index_symbol),
+        "symbols_hash": hashlib.sha256(",".join(normalized_sorted).encode("utf-8")).hexdigest(),
+        "lookback_days": config.lookback_days,
+        "filters": {
+            "min_avg_turnover_try_active": config.min_avg_turnover_try_active,
+            "min_avg_turnover_try": config.min_avg_turnover_try,
+            "min_volume_ratio_active": config.min_volume_ratio_active,
+            "min_volume_ratio": config.min_volume_ratio,
+            "min_turnover_ratio_active": config.min_turnover_ratio_active,
+            "min_turnover_ratio": config.min_turnover_ratio,
+            "min_daily_return_active": config.min_daily_return_active,
+            "min_daily_return": config.min_daily_return,
+            "min_close_position_active": config.min_close_position_active,
+            "min_close_position": config.min_close_position,
+            "breakout_mode": config.breakout_mode,
+            "require_ma20_active": config.require_ma20_active,
+            "require_ma50_active": config.require_ma50_active,
+            "min_xu100_relative_active": config.min_xu100_relative_active,
+            "min_xu100_relative": config.min_xu100_relative,
+            "min_interest_score_active": config.min_interest_score_active,
+            "min_interest_score": config.min_interest_score,
+            "include_negative_moves": config.include_negative_moves,
+            "ohlcv_cache_ttl_minutes": config.ohlcv_cache_ttl_minutes,
+            "max_workers": config.max_workers,
+        },
+    }
+    payload_text = json.dumps(key_payload, sort_keys=True)
+    return hashlib.sha256(payload_text.encode("utf-8")).hexdigest()
+
+
+def _passes_result(result: RadarResult) -> bool:
+    return len(result.failed_filters) == 0
 
 
 def scan_symbols(
@@ -470,75 +517,127 @@ def scan_symbols(
     config: RadarConfig | None = None,
     client: BorsapyMarketDataClient | None = None,
     progress_callback: Any | None = None,
+    universe_source: str = "borsapy",
 ) -> ScanResult:
     config = config or RadarConfig()
     client = client or BorsapyMarketDataClient()
-    benchmark = client.load_history("XU100", lookback_days=config.lookback_days, db_path=config.db_path, force=config.force_refresh)
-    passed: list[RadarResult] = []
+    normalized_symbols = [normalize_bist_symbol(item) for item in symbols if normalize_bist_symbol(item)]
+    total = len(normalized_symbols)
+    started_at = time.perf_counter()
+    ohlcv_ttl = config.ohlcv_cache_ttl_minutes if config.ohlcv_cache_ttl_minutes is not None else get_default_ohlcv_cache_ttl_minutes()
+    scan_cache_source = "live_scan"
+
+    if config.use_scan_cache and not config.force_refresh:
+        cache_key = build_scan_cache_key(normalized_symbols, config)
+        cached = get_cached_scan_result(config.db_path, cache_key, max_age_minutes=config.scan_cache_ttl_minutes)
+        if cached is not None:
+            results = [_result_from_cache_row(row) for row in cached["results"]]
+            raw_results = [_result_from_cache_row(row) for row in cached["raw_results"]]
+            summary = dict(cached["scan_summary"])
+            summary["scan_cache_source"] = "scan_cache"
+            summary["elapsed_seconds"] = round(time.perf_counter() - started_at, 3)
+            return ScanResult(
+                results=results,
+                raw_results=raw_results,
+                failed_symbols=list(cached["failed_symbols"]),
+                scan_summary=summary,
+            )
+
+    benchmark = client.load_history(
+        "XU100",
+        lookback_days=config.lookback_days,
+        db_path=config.db_path,
+        force=config.force_refresh,
+        cache_ttl_minutes=ohlcv_ttl,
+    )
     all_results: list[RadarResult] = []
     failed_symbols: list[dict[str, str]] = []
-    total = len(symbols)
+    saved_rows: list[dict[str, Any]] = []
 
-    for idx, raw_symbol in enumerate(symbols):
-        symbol = normalize_bist_symbol(raw_symbol)
-        if not symbol:
-            continue
+    def _worker(symbol: str) -> tuple[str, RadarResult | None, str | None]:
         try:
             history = client.load_history(
                 symbol,
                 lookback_days=config.lookback_days,
                 db_path=config.db_path,
                 force=config.force_refresh,
+                cache_ttl_minutes=ohlcv_ttl,
             )
             if history.empty:
-                continue
+                return symbol, None, "empty_history"
             result = evaluate_symbol(symbol, history, benchmark, config=config)
-            all_results.append(result)
-            save_radar_result(
-                config.db_path,
-                {
-                    "symbol": result.symbol,
-                    "scanned_at": result.raw_metrics.get("date"),
-                    "source": "borsapy",
-                    "interest_score": result.interest_score,
-                    "metrics": asdict(result),
-                    "signals": result.signals,
-                    "passed_filters": result.passed_filters,
-                    "failed_filters": result.failed_filters,
-                },
-            )
-            if not config.include_negative_moves and (result.daily_return_pct or 0) < 0:
-                pass  # don't add to passed
-            elif config.min_interest_score_active and result.interest_score < config.min_interest_score:
-                pass  # don't add to passed
-            elif all(name not in result.failed_filters for name in ["min_avg_turnover_try", "min_volume_ratio", "min_turnover_ratio", "min_daily_return", "min_close_position", "above_ma20", "above_ma50", "xu100_relative", "min_interest_score", "negative_price_move"]):
-                passed.append(result)
-            elif not result.failed_filters:
-                passed.append(result)
+            return symbol, result, None
         except Exception as exc:  # noqa: BLE001
-            failed_symbols.append({"symbol": symbol, "error": str(exc)})
+            return symbol, None, str(exc)
 
-        if progress_callback is not None:
-            try:
-                progress_callback(idx + 1, total, symbol)
-            except Exception:  # noqa: BLE001
-                pass
+    completed = 0
+    with ThreadPoolExecutor(max_workers=max(1, int(config.max_workers))) as executor:
+        future_map = {executor.submit(_worker, symbol): symbol for symbol in normalized_symbols}
+        for future in as_completed(future_map):
+            symbol, result, error = future.result()
+            completed += 1
 
-    passed = sorted(passed, key=lambda item: item.interest_score, reverse=True)
+            if error is not None:
+                failed_symbols.append({"symbol": symbol, "error": error})
+            elif result is not None:
+                all_results.append(result)
+                saved_rows.append(
+                    {
+                        "symbol": result.symbol,
+                        "scanned_at": datetime.now(UTC).isoformat(),
+                        "source": "borsapy",
+                        "interest_score": result.interest_score,
+                        "metrics": asdict(result),
+                        "signals": result.signals,
+                        "passed_filters": result.passed_filters,
+                        "failed_filters": result.failed_filters,
+                    }
+                )
+
+            if progress_callback is not None:
+                try:
+                    progress_callback(completed, total, symbol)
+                except Exception:  # noqa: BLE001
+                    pass
+
+    save_radar_results_bulk(config.db_path, saved_rows)
+    passed = sorted((item for item in all_results if _passes_result(item)), key=lambda item: item.interest_score, reverse=True)
     all_results = sorted(all_results, key=lambda item: item.interest_score, reverse=True)
+    elapsed_seconds = round(time.perf_counter() - started_at, 3)
 
     scan_summary = {
+        "index": normalize_bist_symbol(config.index_symbol),
         "universe_symbol_count": total,
         "scanned_symbols": len(all_results) + len(failed_symbols),
         "successful_symbols": len(all_results),
         "failed_symbols": len(failed_symbols),
         "result_count": len(passed),
+        "universe_cache_source": universe_source,
+        "scan_cache_source": scan_cache_source,
+        "max_workers": int(config.max_workers),
+        "ohlcv_cache_ttl_minutes": int(ohlcv_ttl),
+        "elapsed_seconds": elapsed_seconds,
     }
 
-    return ScanResult(
+    scan = ScanResult(
         results=passed,
         raw_results=all_results,
         failed_symbols=failed_symbols,
         scan_summary=scan_summary,
     )
 
+    if config.use_scan_cache:
+        cache_key = build_scan_cache_key(normalized_symbols, config)
+        results_payload, raw_payload, failed_payload, summary_payload = _build_scan_cache_payload(scan)
+        upsert_cached_scan_result(
+            config.db_path,
+            cache_key,
+            universe_source=universe_source,
+            universe_symbol_count=total,
+            results=results_payload,
+            raw_results=raw_payload,
+            failed_symbols=failed_payload,
+            scan_summary=summary_payload,
+        )
+
+    return scan
