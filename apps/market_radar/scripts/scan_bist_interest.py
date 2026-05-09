@@ -92,6 +92,11 @@ def main() -> None:
     print(f"scan_cache_source={summary.get('scan_cache_source', 'live_scan')}")
     print(f"max_workers={summary.get('max_workers', args.max_workers)}")
     print(f"elapsed_seconds={summary.get('elapsed_seconds')}")
+    print(f"newest_data_date={summary.get('newest_data_date')}")
+    print(f"oldest_data_date={summary.get('oldest_data_date')}")
+    print(f"max_data_lag_days={summary.get('max_data_lag_days')}")
+    print(f"stale_data_count={summary.get('stale_data_count')}")
+    print(f"fresh_data_count={summary.get('fresh_data_count')}")
 
     if scan.failed_symbols:
         for fail in scan.failed_symbols:
@@ -104,7 +109,8 @@ def main() -> None:
         import pandas as pd
 
         df = pd.DataFrame([result.to_row() for result in scan.results]).sort_values("Interest Score", ascending=False)
-        print(df.to_string(index=False))
+        with pd.option_context("display.max_columns", None, "display.width", 240):
+            print(df.to_string(index=False))
     except Exception:
         for result in scan.results:
             print(result.to_row())

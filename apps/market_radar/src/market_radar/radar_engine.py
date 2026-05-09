@@ -12,6 +12,7 @@ import pandas as pd
 
 from market_radar.data_access import (
     BorsapyMarketDataClient,
+    HistoryLoadResult,
     get_cached_scan_result,
     get_default_ohlcv_cache_ttl_minutes,
     save_radar_results_bulk,
@@ -95,6 +96,13 @@ class RadarResult:
     passed_filters: list[str] = field(default_factory=list)
     failed_filters: list[str] = field(default_factory=list)
     raw_metrics: dict[str, Any] = field(default_factory=dict)
+    data_latest_date: str | None = None
+    data_lag_days: int | None = None
+    history_rows: int = 0
+    ohlcv_cache_fetched_at: str | None = None
+    ohlcv_cache_age_minutes: float | None = None
+    ohlcv_cache_status: str = "missing"
+    freshness_warning: bool = False
 
     def to_row(self) -> dict[str, Any]:
         return {
@@ -108,6 +116,11 @@ class RadarResult:
             "Close Position": self.close_position,
             "Breakout 20D": self.breakout_20d,
             "Above MA20": self.above_ma20,
+            "Data Date": self.data_latest_date,
+            "Data Lag Days": self.data_lag_days,
+            "OHLCV Cache Status": self.ohlcv_cache_status,
+            "OHLCV Fetched At": self.ohlcv_cache_fetched_at,
+            "Freshness Warning": self.freshness_warning,
             "Signals": ", ".join(self.signals),
         }
 
@@ -322,6 +335,7 @@ def evaluate_symbol(
     history: pd.DataFrame,
     benchmark: pd.DataFrame | None = None,
     config: RadarConfig | None = None,
+    history_meta: HistoryLoadResult | None = None,
 ) -> RadarResult:
     config = config or RadarConfig()
     df = history.copy()
@@ -406,6 +420,13 @@ def evaluate_symbol(
         "xu100_daily_return_pct": xu100_daily_return_pct,
         "xu100_relative_return_pct": xu100_relative_return_pct,
         "sector_relative_return_pct": sector_relative_return_pct,
+        "data_latest_date": history_meta.data_latest_date if history_meta else None,
+        "data_lag_days": history_meta.data_lag_days if history_meta else None,
+        "history_rows": history_meta.history_rows if history_meta else len(df),
+        "ohlcv_cache_fetched_at": history_meta.ohlcv_cache_fetched_at if history_meta else None,
+        "ohlcv_cache_age_minutes": history_meta.ohlcv_cache_age_minutes if history_meta else None,
+        "ohlcv_cache_status": history_meta.ohlcv_cache_status if history_meta else "missing",
+        "freshness_warning": bool((history_meta.data_lag_days if history_meta else None) is not None and (history_meta.data_lag_days if history_meta else 0) > 3),
     }
     interest_score = calculate_interest_score(metrics)
     metrics["interest_score"] = interest_score
@@ -446,6 +467,13 @@ def evaluate_symbol(
         passed_filters=passed_filters,
         failed_filters=failed_filters,
         raw_metrics=metrics,
+        data_latest_date=metrics["data_latest_date"],
+        data_lag_days=metrics["data_lag_days"],
+        history_rows=metrics["history_rows"],
+        ohlcv_cache_fetched_at=metrics["ohlcv_cache_fetched_at"],
+        ohlcv_cache_age_minutes=metrics["ohlcv_cache_age_minutes"],
+        ohlcv_cache_status=metrics["ohlcv_cache_status"],
+        freshness_warning=metrics["freshness_warning"],
     )
 
 
@@ -477,6 +505,7 @@ def _build_scan_cache_payload(scan: ScanResult) -> tuple[list[dict[str, Any]], l
 def build_scan_cache_key(symbols: list[str], config: RadarConfig) -> str:
     normalized_sorted = sorted(normalize_bist_symbol(item) for item in symbols if normalize_bist_symbol(item))
     key_payload = {
+        "cache_schema_version": 2,
         "index_symbol": normalize_bist_symbol(config.index_symbol),
         "symbols_hash": hashlib.sha256(",".join(normalized_sorted).encode("utf-8")).hexdigest(),
         "lookback_days": config.lookback_days,
@@ -555,16 +584,44 @@ def scan_symbols(
 
     def _worker(symbol: str) -> tuple[str, RadarResult | None, str | None]:
         try:
-            history = client.load_history(
-                symbol,
-                lookback_days=config.lookback_days,
-                db_path=config.db_path,
-                force=config.force_refresh,
-                cache_ttl_minutes=ohlcv_ttl,
-            )
+            if hasattr(client, "load_history_with_meta"):
+                history_meta = client.load_history_with_meta(
+                    symbol,
+                    lookback_days=config.lookback_days,
+                    db_path=config.db_path,
+                    force=config.force_refresh,
+                    cache_ttl_minutes=ohlcv_ttl,
+                )
+                history = history_meta.frame
+            else:
+                history = client.load_history(
+                    symbol,
+                    lookback_days=config.lookback_days,
+                    db_path=config.db_path,
+                    force=config.force_refresh,
+                    cache_ttl_minutes=ohlcv_ttl,
+                )
+                fallback_latest_date = None
+                fallback_lag_days = None
+                if history is not None and not history.empty:
+                    idx = history.index.max()
+                    if pd.notna(idx):
+                        fallback_latest_date = pd.Timestamp(idx).date().isoformat()
+                        fallback_lag_days = (datetime.now().date() - pd.Timestamp(idx).date()).days
+                history_meta = HistoryLoadResult(
+                    frame=history,
+                    symbol=normalize_bist_symbol(symbol),
+                    data_latest_date=fallback_latest_date,
+                    data_lag_days=fallback_lag_days,
+                    history_rows=len(history.index) if history is not None else 0,
+                    ohlcv_cache_fetched_at=None,
+                    ohlcv_cache_age_minutes=None,
+                    ohlcv_cache_status="missing",
+                    source="legacy_client",
+                )
             if history.empty:
                 return symbol, None, "empty_history"
-            result = evaluate_symbol(symbol, history, benchmark, config=config)
+            result = evaluate_symbol(symbol, history, benchmark, config=config, history_meta=history_meta)
             return symbol, result, None
         except Exception as exc:  # noqa: BLE001
             return symbol, None, str(exc)
@@ -616,7 +673,24 @@ def scan_symbols(
         "max_workers": int(config.max_workers),
         "ohlcv_cache_ttl_minutes": int(ohlcv_ttl),
         "elapsed_seconds": elapsed_seconds,
+        "newest_data_date": None,
+        "oldest_data_date": None,
+        "max_data_lag_days": None,
+        "stale_data_count": 0,
+        "fresh_data_count": 0,
     }
+
+    dates = [item.data_latest_date for item in all_results if item.data_latest_date]
+    lags = [item.data_lag_days for item in all_results if item.data_lag_days is not None]
+    stale_count = sum(1 for item in all_results if item.freshness_warning)
+    fresh_count = sum(1 for item in all_results if not item.freshness_warning)
+    if dates:
+        scan_summary["newest_data_date"] = max(dates)
+        scan_summary["oldest_data_date"] = min(dates)
+    if lags:
+        scan_summary["max_data_lag_days"] = max(lags)
+    scan_summary["stale_data_count"] = stale_count
+    scan_summary["fresh_data_count"] = fresh_count
 
     scan = ScanResult(
         results=passed,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 import json
 import math
@@ -17,6 +18,19 @@ from market_radar.symbols import normalize_bist_symbol
 DB_PATH = "/data/market_radar_cache.sqlite"
 DEFAULT_BIST_UNIVERSE_INDEX = "XUTUM"
 ISTANBUL_TZ = ZoneInfo("Europe/Istanbul")
+
+
+@dataclass
+class HistoryLoadResult:
+    frame: pd.DataFrame
+    symbol: str
+    data_latest_date: str | None
+    data_lag_days: int | None
+    history_rows: int
+    ohlcv_cache_fetched_at: str | None
+    ohlcv_cache_age_minutes: float | None
+    ohlcv_cache_status: str
+    source: str
 
 
 def _to_float(value: Any) -> float | None:
@@ -392,6 +406,75 @@ class BorsapyMarketDataClient:
         frame = ticker.history(start=start, interval="1d")
         return _normalize_history_frame(frame)
 
+    def load_history_with_meta(
+        self,
+        symbol: str,
+        lookback_days: int = 260,
+        *,
+        db_path: str = DB_PATH,
+        force: bool = False,
+        cache_ttl_minutes: int | None = None,
+    ) -> HistoryLoadResult:
+        normalized = normalize_bist_symbol(symbol)
+        cached_frame, meta = get_cached_history(db_path, normalized)
+        ttl_minutes = cache_ttl_minutes if cache_ttl_minutes is not None else get_default_ohlcv_cache_ttl_minutes()
+        now_utc = datetime.now(UTC)
+
+        def _build_result(frame: pd.DataFrame, status: str, source: str, fetched_at: str | None) -> HistoryLoadResult:
+            latest_date = None
+            lag_days = None
+            rows = len(frame.index) if frame is not None else 0
+            if frame is not None and not frame.empty:
+                idx = frame.index.max()
+                if pd.notna(idx):
+                    latest_date = pd.Timestamp(idx).date().isoformat()
+                    lag_days = (datetime.now(ISTANBUL_TZ).date() - pd.Timestamp(idx).date()).days
+            cache_age = None
+            if fetched_at:
+                try:
+                    cache_age = (now_utc - datetime.fromisoformat(fetched_at).astimezone(UTC)).total_seconds() / 60.0
+                except Exception:  # noqa: BLE001
+                    cache_age = None
+            return HistoryLoadResult(
+                frame=frame,
+                symbol=normalized,
+                data_latest_date=latest_date,
+                data_lag_days=lag_days,
+                history_rows=rows,
+                ohlcv_cache_fetched_at=fetched_at,
+                ohlcv_cache_age_minutes=cache_age,
+                ohlcv_cache_status=status,
+                source=source,
+            )
+
+        if not force and meta is not None and not is_stale(meta.get("fetched_at"), max_age_minutes=ttl_minutes):
+            return _build_result(cached_frame, "fresh_cache", str(meta.get("source") or "cache"), meta.get("fetched_at"))
+        retries = [2, 5]
+        for attempt in range(len(retries) + 1):
+            try:
+                frame = self._fetch_history(normalized, lookback_days)
+                if not frame.empty:
+                    upsert_cached_history(db_path, normalized, frame)
+                    refreshed_meta = get_cached_history(db_path, normalized)[1]
+                    fetched_at = refreshed_meta.get("fetched_at") if refreshed_meta else None
+                    return _build_result(frame, "live_fetch", "borsapy", fetched_at)
+                break
+            except Exception as exc:
+                message = str(exc)
+                is_rate_limited = ("429" in message) or ("Too Many Requests" in message)
+                if is_rate_limited and attempt < len(retries):
+                    time.sleep(retries[attempt])
+                    continue
+                if not cached_frame.empty:
+                    fetched_at = meta.get("fetched_at") if meta else None
+                    return _build_result(cached_frame, "fallback_cache", str((meta or {}).get("source") or "cache"), fetched_at)
+                raise
+        if not cached_frame.empty:
+            fetched_at = meta.get("fetched_at") if meta else None
+            status = "stale_cache" if meta is not None else "missing"
+            return _build_result(cached_frame, status, str((meta or {}).get("source") or "cache"), fetched_at)
+        return _build_result(pd.DataFrame(), "missing", "missing", None)
+
     def load_history(
         self,
         symbol: str,
@@ -401,26 +484,10 @@ class BorsapyMarketDataClient:
         force: bool = False,
         cache_ttl_minutes: int | None = None,
     ) -> pd.DataFrame:
-        normalized = normalize_bist_symbol(symbol)
-        cached_frame, meta = get_cached_history(db_path, normalized)
-        ttl_minutes = cache_ttl_minutes if cache_ttl_minutes is not None else get_default_ohlcv_cache_ttl_minutes()
-        if not force and meta is not None and not is_stale(meta.get("fetched_at"), max_age_minutes=ttl_minutes):
-            return cached_frame
-        retries = [2, 5]
-        for attempt in range(len(retries) + 1):
-            try:
-                frame = self._fetch_history(normalized, lookback_days)
-                if not frame.empty:
-                    upsert_cached_history(db_path, normalized, frame)
-                    return frame
-                break
-            except Exception as exc:
-                message = str(exc)
-                is_rate_limited = ("429" in message) or ("Too Many Requests" in message)
-                if is_rate_limited and attempt < len(retries):
-                    time.sleep(retries[attempt])
-                    continue
-                if not cached_frame.empty:
-                    return cached_frame
-                raise
-        return cached_frame
+        return self.load_history_with_meta(
+            symbol,
+            lookback_days=lookback_days,
+            db_path=db_path,
+            force=force,
+            cache_ttl_minutes=cache_ttl_minutes,
+        ).frame

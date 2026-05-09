@@ -42,6 +42,11 @@ def _render_scan_info(scan: ScanResult, cache_source: str) -> None:
     p2.metric("Paralel işçi", summary.get("max_workers", "N/A"))
     p3.metric("OHLCV TTL (dk)", summary.get("ohlcv_cache_ttl_minutes", "N/A"))
     p4.metric("Süre (sn)", summary.get("elapsed_seconds", "N/A"))
+    f1, f2, f3, f4 = st.columns(4)
+    f1.metric("En Yeni Veri", summary.get("newest_data_date", "N/A"))
+    f2.metric("En Eski Veri", summary.get("oldest_data_date", "N/A"))
+    f3.metric("Maks Lag (gün)", summary.get("max_data_lag_days", "N/A"))
+    f4.metric("Stale Sembol", summary.get("stale_data_count", 0))
     st.caption(
         "Evren kaynağı: "
         f"`{summary.get('universe_cache_source', cache_source)}` | "
@@ -307,6 +312,8 @@ def render_positive_interest_radar_page(*, embedded: bool = False) -> None:
         if config.ohlcv_cache_ttl_minutes is None:
             st.caption(f"OHLCV TTL (otomatik): {get_default_ohlcv_cache_ttl_minutes()} dakika")
         _render_scan_info(scan, stored_cache_source)
+        if (scan.scan_summary.get("stale_data_count") or 0) > 0:
+            st.warning("Bazı sembollerin OHLCV verisi 3 günden eski görünüyor. Kaynak veri gecikmiş veya cache fallback kullanılmış olabilir.")
         _render_summary_cards(scan, len(raw_symbols))
         _render_failed_symbols(scan)
 

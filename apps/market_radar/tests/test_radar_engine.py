@@ -7,6 +7,7 @@ import pandas as pd
 
 from market_radar.data_access import (
     BorsapyMarketDataClient,
+    HistoryLoadResult,
     get_cached_history,
     get_cached_scan_result,
     get_default_ohlcv_cache_ttl_minutes,
@@ -143,6 +144,23 @@ def test_borsapy_fetch_uses_naive_start_datetime(monkeypatch) -> None:
     assert captured["symbol"] == "THYAO"
     assert captured["interval"] == "1d"
     assert captured["start"].tzinfo is None
+
+
+def test_load_history_with_meta_has_latest_date(monkeypatch, tmp_path: Path) -> None:
+    db = str(tmp_path / "radar.sqlite")
+    init_db(db)
+    client = BorsapyMarketDataClient()
+
+    frame = pd.DataFrame(
+        {"open": [1], "high": [2], "low": [1], "close": [2], "volume": [100]},
+        index=pd.DatetimeIndex(["2026-05-09"]),
+    )
+    monkeypatch.setattr(client, "_fetch_history", lambda symbol, lookback_days: frame)
+
+    result = client.load_history_with_meta("THYAO", db_path=db, force=True)
+    assert result.data_latest_date == "2026-05-09"
+    assert result.data_lag_days is not None
+    assert result.ohlcv_cache_status == "live_fetch"
 
 
 def test_load_bist_universe_uses_xutum_components(monkeypatch, tmp_path: Path) -> None:
@@ -294,6 +312,10 @@ def test_scan_empty_failed_symbols_on_success(tmp_path: Path) -> None:
     assert scan.failed_symbols == []
     assert scan.scan_summary["failed_symbols"] == 0
     assert scan.scan_summary["successful_symbols"] == 2
+    assert "newest_data_date" in scan.scan_summary
+    assert "oldest_data_date" in scan.scan_summary
+    assert "max_data_lag_days" in scan.scan_summary
+    assert "stale_data_count" in scan.scan_summary
 
 
 def test_save_radar_results_bulk_writes_multiple_rows(tmp_path: Path) -> None:
@@ -447,3 +469,23 @@ def test_load_history_retries_on_429_then_succeeds(monkeypatch, tmp_path: Path) 
     frame = client.load_history("THYAO", db_path=db, force=True)
     assert not frame.empty
     assert calls["count"] == 3
+
+
+def test_radar_result_to_row_includes_freshness_columns() -> None:
+    meta = HistoryLoadResult(
+        frame=_history_frame(),
+        symbol="THYAO",
+        data_latest_date="2026-05-09",
+        data_lag_days=1,
+        history_rows=40,
+        ohlcv_cache_fetched_at="2026-05-09T10:00:00+00:00",
+        ohlcv_cache_age_minutes=30.0,
+        ohlcv_cache_status="fresh_cache",
+        source="borsapy",
+    )
+    result = evaluate_symbol("THYAO", _history_frame(), _history_frame(), config=RadarConfig(include_negative_moves=True), history_meta=meta)
+    row = result.to_row()
+    assert "Data Date" in row
+    assert "Data Lag Days" in row
+    assert "OHLCV Cache Status" in row
+    assert row["Data Date"] == "2026-05-09"
