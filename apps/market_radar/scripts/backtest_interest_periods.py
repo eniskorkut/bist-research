@@ -236,6 +236,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--benchmark", default="XU100")
     parser.add_argument("--period-starts", nargs="+")
     parser.add_argument("--period-start")
+    parser.add_argument("--periods")
     parser.add_argument("--period-end")
     parser.add_argument("--period-ends", nargs="*", default=None)
     parser.add_argument("--monthly", action="store_true")
@@ -264,7 +265,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-return-10d-pct", type=float, default=60.0)
     parser.add_argument("--require-strong-close", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--min-close-position", type=float, default=0.60)
+    parser.add_argument("--min-above-ma20-ratio", type=float, default=1.0)
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--baseline-comparison", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--checkpoint-each-period", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--skip-existing-periods", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--symbol-checkpoint-every", type=int, default=25)
@@ -287,6 +290,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         args.strategies = args.strategy
     if not args.strategies:
         args.strategies = ["all"]
+    if args.periods:
+        args.period_starts = [item.strip() for item in str(args.periods).split(",") if item.strip()]
+        args.period_ends = None
+        args.monthly = False
 
     if args.monthly:
         if not args.period_start or not args.period_end:
@@ -322,6 +329,7 @@ def _build_config(args: argparse.Namespace, period_start: str, period_end: str |
         max_return_10d_pct=args.max_return_10d_pct,
         require_strong_close=args.require_strong_close,
         min_close_position=args.min_close_position,
+        min_above_ma20_ratio=args.min_above_ma20_ratio,
         cache_only=bool(args.cache_only),
         max_symbols=args.max_symbols,
         only_symbols=only_symbols or None,
@@ -391,6 +399,7 @@ def main() -> None:
     reason_rows_all: list[dict[str, Any]] = []
     coverage_rows_all: list[dict[str, Any]] = []
     baseline_period_rows_all: list[dict[str, Any]] = []
+    comparison_rows_all: list[dict[str, Any]] = []
 
     completed = 0
     active = 0
@@ -412,12 +421,14 @@ def main() -> None:
             reason_rows = checkpoint.get("reason_rows", [])
             coverage_rows = checkpoint.get("coverage_rows", [])
             baseline_rows = checkpoint.get("baseline_period_rows", [])
+            comparison_rows = checkpoint.get("comparison_rows", [])
             period_rows_all.extend(period_rows)
             holding_rows_all.extend(holding_rows)
             diag_rows_all.extend(diag_rows)
             reason_rows_all.extend(reason_rows)
             coverage_rows_all.extend(coverage_rows)
             baseline_period_rows_all.extend(baseline_rows)
+            comparison_rows_all.extend(comparison_rows)
             completed += 1
             sig = int(pd.DataFrame(period_rows).get("signal_count", pd.Series([0])).fillna(0).sum()) if period_rows else 0
             if sig > 0:
@@ -558,10 +569,11 @@ def main() -> None:
             diag_rows = _to_records(result.period_diagnostics_summary)
             reason_rows = _to_records(result.quality_filter_reason_summary)
             coverage_rows = _to_records(result.data_coverage_summary)
+            comparison_rows = _to_records(result.regime_config_comparison)
             data_load_seconds = round(time.time() - started_at, 3)
 
             baseline_period_rows: list[dict[str, Any]] = []
-            if args.active_volume_spike_quality and ("volume_spike_strict" in args.strategies or args.strategies == ["all"]):
+            if args.baseline_comparison and args.active_volume_spike_quality and ("volume_spike_strict" in args.strategies or args.strategies == ["all"]):
                 baseline_cfg = _build_config(args, period_start, period_end)
                 baseline_cfg.active_volume_spike_quality = False
                 baseline_cfg.only_symbols = remaining_symbols if remaining_symbols else []
@@ -682,6 +694,7 @@ def main() -> None:
             reason_rows_all.extend(reason_rows)
             coverage_rows_all.extend(coverage_rows)
             baseline_period_rows_all.extend(baseline_period_rows)
+            comparison_rows_all.extend(comparison_rows)
 
             elapsed = round(time.time() - started_at, 2)
             quality_filter_seconds = round(max(0.0, signal_eval_seconds * 0.35), 3)
@@ -711,6 +724,7 @@ def main() -> None:
                 "reason_rows": reason_rows,
                 "coverage_rows": coverage_rows,
                 "baseline_period_rows": baseline_period_rows,
+                "comparison_rows": comparison_rows,
             }
             if args.checkpoint_each_period and period_complete:
                 _write_json(cp_path, checkpoint_payload)
@@ -831,6 +845,7 @@ def main() -> None:
             "checkpoint_each_period": bool(args.checkpoint_each_period),
             "generated_at": datetime.utcnow().isoformat() + "Z",
         },
+        regime_config_comparison=pd.DataFrame(comparison_rows_all),
     )
     files = write_period_outputs(final_result, config_for_write)
     quality_vs_baseline_path = _merge_quality_vs_baseline(period_rows_all, baseline_period_rows_all, args.output_dir)

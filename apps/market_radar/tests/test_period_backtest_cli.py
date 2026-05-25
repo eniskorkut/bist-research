@@ -101,6 +101,9 @@ def test_parse_quality_filter_args() -> None:
             "--require-strong-close",
             "--min-close-position",
             "0.60",
+            "--min-above-ma20-ratio",
+            "0.98",
+            "--no-baseline-comparison",
         ]
     )
     assert args.active_volume_spike_quality is True
@@ -111,6 +114,26 @@ def test_parse_quality_filter_args() -> None:
     assert args.max_return_10d_pct == 60.0
     assert args.require_strong_close is True
     assert args.min_close_position == 0.60
+    assert args.min_above_ma20_ratio == 0.98
+    assert args.baseline_comparison is False
+
+
+def test_parse_periods_csv() -> None:
+    parse_args = _load_parse_args()
+    args = parse_args(
+        [
+            "--periods",
+            "2024-02-01,2024-04-01,2025-03-01",
+            "--frequency",
+            "monthly",
+            "--start-date",
+            "2024-01-01",
+            "--end-date",
+            "2024-12-31",
+        ]
+    )
+    assert args.period_starts == ["2024-02-01", "2024-04-01", "2025-03-01"]
+    assert args.period_ends is None
 
 
 def test_parse_legacy_monthly_aliases() -> None:

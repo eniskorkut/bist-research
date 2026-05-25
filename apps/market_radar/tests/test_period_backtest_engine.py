@@ -192,14 +192,46 @@ def test_write_period_outputs(tmp_path: Path, monkeypatch) -> None:
     for path in files.values():
         assert Path(path).exists()
     period = pd.read_csv(files["period_strategy_summary.csv"])
-    assert "outlier_warning" in period.columns
-    assert "low_sample_warning" in period.columns
-    assert "trimmed_mean_alpha_to_current" in period.columns
-    assert "effective_as_of_date" in period.columns
-    assert "basket_return_to_current" in period.columns
-    assert "universe" in period.columns
-    assert "benchmark" in period.columns
-    assert "benchmark_symbol" in period.columns
+    expected_cols = [
+        "period",
+        "regime_label",
+        "xu100_return_20d_pct",
+        "xu100_close",
+        "xu100_ma50",
+        "xu100_ma200",
+        "selected_config",
+        "signal_count",
+        "basket_return_15d",
+        "basket_return_30d",
+        "basket_alpha_30d",
+        "net_basket_alpha_30d",
+    ]
+    assert list(period.columns) == expected_cols
+    
+    comparison = pd.read_csv(files["regime_config_comparison.csv"])
+    expected_comp_cols = [
+        "period",
+        "regime_label",
+        "xu100_return_20d_pct",
+        "selected_config",
+        "current_signal_count",
+        "relaxed_signal_count",
+        "regime_signal_count",
+        "current_alpha_30d",
+        "relaxed_alpha_30d",
+        "regime_alpha_30d",
+        "current_net_alpha_30d",
+        "relaxed_net_alpha_30d",
+        "regime_net_alpha_30d",
+        "winner_config",
+        "regime_minus_current",
+        "regime_minus_relaxed",
+        "same_alpha_allclose",
+        "same_signal_set",
+        "same_alpha_diagnosis",
+    ]
+    assert list(comparison.columns) == expected_comp_cols
+    
     stability = pd.read_csv(files["strategy_stability_summary.csv"])
     assert "consistency_score" in stability.columns
     assert "beat_period_rate_to_current" in stability.columns

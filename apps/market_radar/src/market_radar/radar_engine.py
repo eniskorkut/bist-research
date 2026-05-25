@@ -19,6 +19,7 @@ from market_radar.data_access import (
     upsert_cached_scan_result,
 )
 from market_radar.symbols import normalize_bist_symbol
+from market_radar.regime import MarketRegimeDetector
 
 
 def _safe_float(value: Any) -> float | None:
@@ -86,6 +87,7 @@ class RadarConfig:
     max_return_10d_active: bool = True
     max_return_10d_pct: float = 60.0
     require_strong_close: bool = True
+    min_above_ma20_ratio: float = 1.0
 
 
 @dataclass
@@ -146,6 +148,7 @@ class RadarResult:
     ohlcv_cache_fetched_at: str | None = None
     ohlcv_cache_age_minutes: float | None = None
     ohlcv_cache_status: str = "missing"
+    selected_config: str | None = None
     freshness_warning: bool = False
 
     def to_row(self) -> dict[str, Any]:
@@ -715,7 +718,16 @@ def apply_active_volume_spike_quality_filters(
         else:
             failed.append("min_avg_turnover_20d_try")
 
-    if metrics.get("above_ma20"):
+    close_value = metrics.get("close")
+    ma20_value = metrics.get("ma20")
+    ma20_passed = bool(metrics.get("above_ma20"))
+    if not ma20_passed and float(config.min_above_ma20_ratio) < 1.0:
+        ma20_passed = (
+            isinstance(close_value, (int, float))
+            and isinstance(ma20_value, (int, float))
+            and close_value >= ma20_value * float(config.min_above_ma20_ratio)
+        )
+    if ma20_passed:
         passed.append("above_ma20")
     else:
         failed.append("above_ma20")
@@ -981,6 +993,7 @@ def _result_from_cache_row(row: dict[str, Any]) -> RadarResult:
     row.setdefault("filter_passed", False)
     row.setdefault("filter_reasons", [])
     row.setdefault("failed_reasons", [])
+    row.setdefault("selected_config", None)
     return RadarResult(**row)
 
 
@@ -1047,6 +1060,7 @@ def build_scan_cache_key(symbols: list[str], config: RadarConfig) -> str:
             "max_return_10d_active": config.max_return_10d_active,
             "max_return_10d_pct": config.max_return_10d_pct,
             "require_strong_close": config.require_strong_close,
+            "min_above_ma20_ratio": config.min_above_ma20_ratio,
         },
     }
     payload_text = json.dumps(key_payload, sort_keys=True)
@@ -1096,6 +1110,22 @@ def scan_symbols(
         force=config.force_refresh,
         cache_ttl_minutes=ohlcv_ttl,
     )
+
+    # Regime-aware config selection
+    regime_detector = MarketRegimeDetector(db_path=config.db_path)
+    regime_detector._xu100_df = regime_detector.load_xu100_data(client=client)
+    latest_date_str = str(benchmark.index.max())[:10] if not benchmark.empty else datetime.now().date().isoformat()
+    regime_info = regime_detector.detect_regime(latest_date_str, client=client)
+
+    if regime_info["return_20d_pct"] > 1.5:
+        selected_config_name = "current_config"
+        min_close_pos = 0.60
+    else:
+        selected_config_name = "relaxed_strong_close"
+        min_close_pos = 0.50
+
+    config = replace(config, min_close_position=min_close_pos)
+
     all_results: list[RadarResult] = []
     failed_symbols: list[dict[str, str]] = []
     saved_rows: list[dict[str, Any]] = []
@@ -1140,6 +1170,8 @@ def scan_symbols(
             if history.empty:
                 return symbol, None, "empty_history"
             result = evaluate_symbol(symbol, history, benchmark, config=config, history_meta=history_meta)
+            if result is not None:
+                result.selected_config = selected_config_name
             return symbol, result, None
         except Exception as exc:  # noqa: BLE001
             return symbol, None, str(exc)
@@ -1198,6 +1230,12 @@ def scan_symbols(
         "scanned_fresh_data_count": 0,
         "result_stale_data_count": 0,
         "result_fresh_data_count": 0,
+        "regime_label": regime_info["regime_label"],
+        "xu100_return_20d_pct": regime_info["return_20d_pct"],
+        "xu100_close": regime_info["close"],
+        "xu100_ma50": regime_info["ma50"],
+        "xu100_ma200": regime_info["ma200"],
+        "selected_config": selected_config_name,
     }
 
     dates = [item.data_latest_date for item in all_results if item.data_latest_date]

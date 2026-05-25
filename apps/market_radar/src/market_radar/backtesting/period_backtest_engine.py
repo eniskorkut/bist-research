@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, date, datetime, timedelta
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -11,6 +12,7 @@ import pandas as pd
 from market_radar.backtesting.backtest_engine import BacktestConfig, run_backtest
 from market_radar.data_access import BorsapyMarketDataClient
 from market_radar.symbols import normalize_bist_symbol
+from market_radar.regime import MarketRegimeDetector
 
 
 @dataclass(frozen=True)
@@ -42,6 +44,7 @@ class PeriodBacktestConfig:
     max_return_10d_pct: float = 60.0
     require_strong_close: bool = True
     min_close_position: float = 0.60
+    min_above_ma20_ratio: float = 1.0
     cache_only: bool = False
     max_symbols: int | None = None
     only_symbols: list[str] | None = None
@@ -56,6 +59,7 @@ class PeriodBacktestResult:
     quality_filter_reason_summary: pd.DataFrame
     data_coverage_summary: pd.DataFrame
     run_summary: dict[str, Any]
+    regime_config_comparison: pd.DataFrame | None = None
 
 
 def _parse_date(text: str) -> date:
@@ -227,8 +231,20 @@ def _apply_volume_spike_quality_filter(frame: pd.DataFrame, config: PeriodBackte
         if pd.isna(avg_turn) or float(avg_turn) < float(config.min_avg_turnover_20d_try):
             failed.append("min_avg_turnover_20d_try")
 
+        close_value = pd.to_numeric(
+            row.get("entry_price", row.get("entry_close", row.get("close"))),
+            errors="coerce",
+        )
+        ma20_value = pd.to_numeric(row.get("ma20"), errors="coerce")
         above_ma20 = row.get("above_ma20")
-        if above_ma20 is not True:
+        ma20_passed = above_ma20 is True
+        if not ma20_passed and float(config.min_above_ma20_ratio) < 1.0:
+            ma20_passed = (
+                not pd.isna(close_value)
+                and not pd.isna(ma20_value)
+                and float(close_value) >= float(ma20_value) * float(config.min_above_ma20_ratio)
+            )
+        if not ma20_passed:
             failed.append("above_ma20")
 
         rsi = pd.to_numeric(row.get("rsi_14"), errors="coerce")
@@ -444,6 +460,13 @@ def _build_period_strategy_summary(
     quality_config: PeriodBacktestConfig,
     signal_count_before_quality_filter: int,
     signal_count_after_quality_filter: int,
+    regime_label: str = "Neutral",
+    xu100_return_20d_pct: float = 0.0,
+    xu100_close: float | None = None,
+    xu100_ma50: float | None = None,
+    xu100_ma200: float | None = None,
+    selected_config: str = "current_config",
+    is_decimal: bool = False
 ) -> dict[str, Any]:
     signal_count = int(len(basket))
     unique_symbol_count = int(basket["symbol"].nunique()) if not basket.empty else 0
@@ -521,7 +544,26 @@ def _build_period_strategy_summary(
         worst_symbol_current = basket.loc[worst_idx, "symbol"]
         worst_return_current = float(valid_current.loc[worst_idx])
 
+    net_basket_alpha_30d = None
+    if basket_alpha_30d is not None:
+        if is_decimal:
+            net_basket_alpha_30d = basket_alpha_30d - 0.003
+        else:
+            net_basket_alpha_30d = basket_alpha_30d - 0.30
+
     return {
+        "period": period_start.isoformat(),
+        "regime_label": regime_label,
+        "xu100_return_20d_pct": xu100_return_20d_pct,
+        "xu100_close": xu100_close,
+        "xu100_ma50": xu100_ma50,
+        "xu100_ma200": xu100_ma200,
+        "selected_config": selected_config,
+        "signal_count": signal_count,
+        "basket_return_15d": basket_return_15d,
+        "basket_return_30d": basket_return_30d,
+        "basket_alpha_30d": basket_alpha_30d,
+        "net_basket_alpha_30d": net_basket_alpha_30d,
         "period_start": period_start.isoformat(),
         "period_end": period_end.isoformat(),
         "effective_as_of_date": None if effective_as_of_date is None else effective_as_of_date.date().isoformat(),
@@ -539,17 +581,14 @@ def _build_period_strategy_summary(
         "max_return_10d_pct": quality_config.max_return_10d_pct,
         "require_strong_close": quality_config.require_strong_close,
         "min_close_position": quality_config.min_close_position,
+        "min_above_ma20_ratio": quality_config.min_above_ma20_ratio,
         "signal_count_before_quality_filter": signal_count_before_quality_filter,
         "signal_count_after_quality_filter": signal_count_after_quality_filter,
         "filtered_out_count": max(0, signal_count_before_quality_filter - signal_count_after_quality_filter),
-        "signal_count": signal_count,
         "unique_symbol_count": unique_symbol_count,
-        "basket_return_15d": basket_return_15d,
-        "basket_return_30d": basket_return_30d,
         "benchmark_return_15d": benchmark_return_15d,
         "benchmark_return_30d": benchmark_return_30d,
         "basket_alpha_15d": basket_alpha_15d,
-        "basket_alpha_30d": basket_alpha_30d,
         "basket_return_to_current": basket_return_to_current,
         "benchmark_return_to_current": benchmark_return_to_current,
         "basket_alpha_to_current": basket_alpha_to_current,
@@ -701,6 +740,45 @@ def _build_stability_summary(period_summary: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(out_rows).sort_values("strategy")
 
 
+def _compute_config_metrics(
+    scoped_signals: pd.DataFrame,
+    strategy: str,
+    cfg: PeriodBacktestConfig,
+    symbol_histories: dict[str, pd.DataFrame],
+    benchmark_history: pd.DataFrame,
+    effective_as_of: pd.Timestamp | None,
+) -> dict[str, Any]:
+    strat = scoped_signals.loc[scoped_signals["strategy"] == strategy].copy()
+    if strat.empty:
+        return {"alpha_30d": None, "signal_count": 0, "signature": None}
+    strat = _apply_volume_spike_quality_filter(strat, cfg)
+    if cfg.active_volume_spike_quality and strategy == "volume_spike_strict":
+        strat = strat.loc[strat["filter_passed"] == True].copy()  # noqa: E712
+    basket = _pick_basket(strat, cfg.basket_mode)
+    if basket.empty:
+        return {"alpha_30d": None, "signal_count": 0, "signature": None}
+    if effective_as_of is not None:
+        basket = _add_to_latest_metrics(
+            basket=basket,
+            symbol_histories=symbol_histories,
+            benchmark_history=benchmark_history,
+            effective_as_of_date=effective_as_of,
+        )
+    a30 = basket["alpha_30d"] if "alpha_30d" in basket.columns else pd.Series(dtype=float)
+    fingerprint_series = (
+        basket.sort_values(["symbol", "signal_date"])[["symbol", "signal_date"]]
+        .astype(str)
+        .agg(":".join, axis=1)
+    )
+    fingerprint = "|".join(fingerprint_series.tolist())
+    signature = hashlib.sha1(fingerprint.encode("utf-8")).hexdigest() if fingerprint else None
+    return {
+        "alpha_30d": _safe_mean(a30),
+        "signal_count": int(len(basket)),
+        "signature": signature,
+    }
+
+
 def run_period_backtest(config: PeriodBacktestConfig) -> PeriodBacktestResult:
     windows = build_period_windows(config.period_starts or [], config.period_ends)
     universe_symbol = normalize_bist_symbol(config.universe_symbol) or "XUTUM"
@@ -721,7 +799,19 @@ def run_period_backtest(config: PeriodBacktestConfig) -> PeriodBacktestResult:
         )
     )
     signals = _prepare_signals_frame(raw.signals)
-    signals = _apply_volume_spike_quality_filter(signals, config)
+    
+    is_decimal = False
+    if not signals.empty:
+        max_val = 0.0
+        for col in ["alpha_30d", "return_30d", "return_15d"]:
+            if col in signals.columns:
+                val = float(signals[col].abs().max())
+                if pd.notna(val) and val > max_val:
+                    max_val = val
+        if max_val > 0.0 and max_val <= 1.0:
+            is_decimal = True
+            
+    # Quality filter will be applied dynamically inside the loop per period
     if signals.empty:
         empty = pd.DataFrame()
         return PeriodBacktestResult(
@@ -810,10 +900,15 @@ def run_period_backtest(config: PeriodBacktestConfig) -> PeriodBacktestResult:
         latest_candidates = [x for x in latest_candidates if x is not None]
         effective_as_of = min(latest_candidates) if latest_candidates else None
 
+    # Initialize regime detector
+    regime_detector = MarketRegimeDetector(db_path=config.db_path)
+    regime_detector._xu100_df = regime_detector.load_xu100_data(client=radar_client)
+
     holdings_rows: list[dict[str, Any]] = []
     period_rows: list[dict[str, Any]] = []
     diagnostics_rows: list[dict[str, Any]] = []
     reason_rows: list[dict[str, Any]] = []
+    comparison_rows: list[dict[str, Any]] = []
     for idx, window in enumerate(windows):
         period_end_filter = window.period_end
         period_end_display = window.period_end
@@ -826,10 +921,132 @@ def run_period_backtest(config: PeriodBacktestConfig) -> PeriodBacktestResult:
             period_end_filter = (effective_as_of + pd.Timedelta(days=1)).date()
             period_end_display = effective_as_of.date()
 
+        # Look-ahead-free regime detection
+        regime_info = regime_detector.detect_regime(window.period_start.isoformat(), client=radar_client)
+        if regime_info["return_20d_pct"] > 1.5:
+            selected_config_name = "current_config"
+            min_close_pos = 0.60
+        else:
+            selected_config_name = "relaxed_strong_close"
+            min_close_pos = 0.50
+            
+        period_config = replace(config, min_close_position=min_close_pos)
+
         mask = (signals["signal_date"] >= pd.Timestamp(window.period_start)) & (
             signals["signal_date"] < pd.Timestamp(period_end_filter)
         )
         scoped = signals.loc[mask].copy()
+        
+        current_cfg = replace(config, min_close_position=0.60)
+        relaxed_cfg = replace(config, min_close_position=0.50)
+        
+        current_metrics = _compute_config_metrics(
+            scoped_signals=scoped,
+            strategy="volume_spike_strict",
+            cfg=current_cfg,
+            symbol_histories=symbol_histories,
+            benchmark_history=benchmark_history,
+            effective_as_of=effective_as_of,
+        )
+        current_alpha_30d = current_metrics.get("alpha_30d")
+        
+        relaxed_metrics = _compute_config_metrics(
+            scoped_signals=scoped,
+            strategy="volume_spike_strict",
+            cfg=relaxed_cfg,
+            symbol_histories=symbol_histories,
+            benchmark_history=benchmark_history,
+            effective_as_of=effective_as_of,
+        )
+        relaxed_alpha_30d = relaxed_metrics.get("alpha_30d")
+        
+        regime_alpha_30d = (
+            current_alpha_30d if selected_config_name == "current_config" else relaxed_alpha_30d
+        )
+        regime_signal_count = (
+            int(current_metrics.get("signal_count", 0))
+            if selected_config_name == "current_config"
+            else int(relaxed_metrics.get("signal_count", 0))
+        )
+        current_signal_count = int(current_metrics.get("signal_count", 0))
+        relaxed_signal_count = int(relaxed_metrics.get("signal_count", 0))
+        
+        current_net_alpha_30d = None
+        relaxed_net_alpha_30d = None
+        regime_net_alpha_30d = None
+        cost = 0.003 if is_decimal else 0.30
+        if current_alpha_30d is not None:
+            current_net_alpha_30d = current_alpha_30d - cost
+        if relaxed_alpha_30d is not None:
+            relaxed_net_alpha_30d = relaxed_alpha_30d - cost
+        if regime_alpha_30d is not None:
+            regime_net_alpha_30d = regime_alpha_30d - cost
+
+        if current_alpha_30d is None and relaxed_alpha_30d is None:
+            winner = "None"
+        elif current_alpha_30d is None:
+            winner = "relaxed_strong_close"
+        elif relaxed_alpha_30d is None:
+            winner = "current_config"
+        else:
+            if current_alpha_30d > relaxed_alpha_30d:
+                winner = "current_config"
+            elif relaxed_alpha_30d > current_alpha_30d:
+                winner = "relaxed_strong_close"
+            else:
+                winner = "Same"
+
+        regime_minus_current = (
+            (regime_alpha_30d - current_alpha_30d)
+            if regime_alpha_30d is not None and current_alpha_30d is not None
+            else None
+        )
+        regime_minus_relaxed = (
+            (regime_alpha_30d - relaxed_alpha_30d)
+            if regime_alpha_30d is not None and relaxed_alpha_30d is not None
+            else None
+        )
+        same_alpha_allclose = (
+            current_alpha_30d is not None
+            and relaxed_alpha_30d is not None
+            and abs(float(current_alpha_30d) - float(relaxed_alpha_30d)) < 1e-12
+        )
+        same_signal_set = (
+            current_metrics.get("signature") is not None
+            and current_metrics.get("signature") == relaxed_metrics.get("signature")
+        )
+        same_alpha_diagnosis = (
+            "same_signal_set"
+            if same_alpha_allclose and same_signal_set
+            else ("different_signal_set_or_calc_issue" if same_alpha_allclose else "not_equal_alpha")
+        )
+
+        comparison_rows.append(
+            {
+                "period": window.period_start.isoformat(),
+                "regime_label": regime_info["regime_label"],
+                "xu100_return_20d_pct": regime_info.get("return_20d_pct"),
+                "selected_config": selected_config_name,
+                "current_signal_count": current_signal_count,
+                "relaxed_signal_count": relaxed_signal_count,
+                "regime_signal_count": regime_signal_count,
+                "current_alpha_30d": current_alpha_30d,
+                "relaxed_alpha_30d": relaxed_alpha_30d,
+                "regime_alpha_30d": regime_alpha_30d,
+                "current_net_alpha_30d": current_net_alpha_30d,
+                "relaxed_net_alpha_30d": relaxed_net_alpha_30d,
+                "regime_net_alpha_30d": regime_net_alpha_30d,
+                "winner_config": winner,
+                "regime_minus_current": regime_minus_current,
+                "regime_minus_relaxed": regime_minus_relaxed,
+                "same_alpha_allclose": same_alpha_allclose,
+                "same_signal_set": same_signal_set,
+                "same_alpha_diagnosis": same_alpha_diagnosis,
+            }
+        )
+        
+        # Apply the quality filter dynamically for this period
+        scoped = _apply_volume_spike_quality_filter(scoped, period_config)
         symbols_with_any_price_data = sum(1 for hist in symbol_histories.values() if not hist.empty)
         symbols_with_required_lookback = 0
         symbols_with_valid_volume = 0
@@ -919,6 +1136,13 @@ def run_period_backtest(config: PeriodBacktestConfig) -> PeriodBacktestResult:
                         quality_config=config,
                         signal_count_before_quality_filter=before_quality_count,
                         signal_count_after_quality_filter=after_quality_count,
+                        regime_label=regime_info["regime_label"],
+                        xu100_return_20d_pct=regime_info["return_20d_pct"],
+                        xu100_close=regime_info["close"],
+                        xu100_ma50=regime_info["ma50"],
+                        xu100_ma200=regime_info["ma200"],
+                        selected_config=selected_config_name,
+                        is_decimal=is_decimal,
                     )
                 )
                 continue
@@ -939,6 +1163,7 @@ def run_period_backtest(config: PeriodBacktestConfig) -> PeriodBacktestResult:
             export["max_return_10d_pct"] = float(config.max_return_10d_pct)
             export["require_strong_close"] = bool(config.require_strong_close)
             export["min_close_position"] = float(config.min_close_position)
+            export["min_above_ma20_ratio"] = float(config.min_above_ma20_ratio)
             export["signal_count_before_quality_filter"] = before_quality_count
             export["signal_count_after_quality_filter"] = after_quality_count
             export["filtered_out_count"] = max(0, before_quality_count - after_quality_count)
@@ -948,6 +1173,7 @@ def run_period_backtest(config: PeriodBacktestConfig) -> PeriodBacktestResult:
             export["current_price"] = export.get("exit_price_to_current")
             export["exit_date_15d"] = export.get("exit_15d_date")
             export["exit_date_30d"] = export.get("exit_30d_date")
+            export["selected_config"] = selected_config_name
             export = export.rename(columns={"volume_ratio_20d": "rvol_20d"})
             holdings_rows.extend(export.to_dict("records"))
 
@@ -966,6 +1192,13 @@ def run_period_backtest(config: PeriodBacktestConfig) -> PeriodBacktestResult:
                     quality_config=config,
                     signal_count_before_quality_filter=before_quality_count,
                     signal_count_after_quality_filter=after_quality_count,
+                    regime_label=regime_info["regime_label"],
+                    xu100_return_20d_pct=regime_info["return_20d_pct"],
+                    xu100_close=regime_info["close"],
+                    xu100_ma50=regime_info["ma50"],
+                    xu100_ma200=regime_info["ma200"],
+                    selected_config=selected_config_name,
+                    is_decimal=is_decimal,
                 )
             )
 
@@ -980,6 +1213,7 @@ def run_period_backtest(config: PeriodBacktestConfig) -> PeriodBacktestResult:
         early = diagnostics.loc[diagnostics["period_start"] < "2026-01-01"].copy()
         if not early.empty:
             coverage_warning = bool((early["symbols_with_required_lookback"] < (0.3 * early["universe_symbol_count"])).any())
+    comparison_df = pd.DataFrame(comparison_rows)
     return PeriodBacktestResult(
         holdings=holdings,
         period_strategy_summary=period_summary.sort_values(["period_start", "strategy"]) if not period_summary.empty else period_summary,
@@ -1003,6 +1237,7 @@ def run_period_backtest(config: PeriodBacktestConfig) -> PeriodBacktestResult:
             "failed_symbols": raw.failed_symbols,
             "generated_at": datetime.now(UTC).isoformat(),
         },
+        regime_config_comparison=comparison_df,
     )
 
 
@@ -1017,6 +1252,7 @@ def write_period_outputs(result: PeriodBacktestResult, config: PeriodBacktestCon
     quality_reason_path = out_dir / "quality_filter_reason_summary.csv"
     coverage_path = out_dir / "data_coverage_summary.csv"
     config_path = out_dir / "backtest_period_config.json"
+    comparison_path = out_dir / "regime_config_comparison.csv"
 
     holdings_columns = [
         "period_start",
@@ -1035,6 +1271,7 @@ def write_period_outputs(result: PeriodBacktestResult, config: PeriodBacktestCon
         "max_return_10d_pct",
         "require_strong_close",
         "min_close_position",
+        "min_above_ma20_ratio",
         "signal_count_before_quality_filter",
         "signal_count_after_quality_filter",
         "filtered_out_count",
@@ -1068,6 +1305,7 @@ def write_period_outputs(result: PeriodBacktestResult, config: PeriodBacktestCon
         "filter_passed",
         "filter_reasons",
         "failed_reasons",
+        "selected_config",
         "interest_score",
         "rvol_20d",
         "turnover_ratio_20d",
@@ -1079,82 +1317,18 @@ def write_period_outputs(result: PeriodBacktestResult, config: PeriodBacktestCon
     ]
 
     period_summary_columns = [
-        "period_start",
-        "period_end",
-        "effective_as_of_date",
-        "universe",
-        "benchmark",
-        "universe_symbol_count",
-        "benchmark_symbol",
-        "strategy",
-        "basket_mode",
-        "quality_filter_enabled",
-        "min_last_turnover_try",
-        "min_avg_turnover_20d_try",
-        "max_rsi_14",
-        "max_return_5d_pct",
-        "max_return_10d_pct",
-        "require_strong_close",
-        "min_close_position",
-        "signal_count_before_quality_filter",
-        "signal_count_after_quality_filter",
-        "filtered_out_count",
+        "period",
+        "regime_label",
+        "xu100_return_20d_pct",
+        "xu100_close",
+        "xu100_ma50",
+        "xu100_ma200",
+        "selected_config",
         "signal_count",
-        "unique_symbol_count",
         "basket_return_15d",
         "basket_return_30d",
-        "benchmark_return_15d",
-        "benchmark_return_30d",
-        "basket_alpha_15d",
         "basket_alpha_30d",
-        "basket_return_to_current",
-        "benchmark_return_to_current",
-        "basket_alpha_to_current",
-        "avg_return_15d",
-        "avg_return_30d",
-        "avg_return_to_current",
-        "median_return_15d",
-        "median_return_30d",
-        "median_return_to_current",
-        "trimmed_mean_return_15d",
-        "trimmed_mean_return_30d",
-        "trimmed_mean_return_to_current",
-        "avg_alpha_15d",
-        "avg_alpha_30d",
-        "avg_alpha_to_current",
-        "median_alpha_15d",
-        "median_alpha_30d",
-        "median_alpha_to_current",
-        "trimmed_mean_alpha_15d",
-        "trimmed_mean_alpha_30d",
-        "trimmed_mean_alpha_to_current",
-        "positive_rate_15d",
-        "positive_rate_30d",
-        "positive_rate_to_current",
-        "beat_rate_15d",
-        "beat_rate_30d",
-        "beat_rate_to_current",
-        "valid_return_15d_count",
-        "valid_return_30d_count",
-        "valid_return_to_current_count",
-        "best_symbol_15d",
-        "best_return_15d",
-        "worst_symbol_15d",
-        "worst_return_15d",
-        "best_symbol_30d",
-        "best_return_30d",
-        "worst_symbol_30d",
-        "worst_return_30d",
-        "best_symbol_to_current",
-        "best_return_to_current",
-        "worst_symbol_to_current",
-        "worst_return_to_current",
-        "top_1_contribution_30d_pct",
-        "top_3_contribution_30d_pct",
-        "top_1_contribution_to_current_pct",
-        "top_3_contribution_to_current_pct",
-        "outlier_warning",
-        "low_sample_warning",
+        "net_basket_alpha_30d",
     ]
 
     stability_columns = [
@@ -1219,6 +1393,8 @@ def write_period_outputs(result: PeriodBacktestResult, config: PeriodBacktestCon
     result.period_diagnostics_summary.to_csv(diagnostics_path, index=False)
     result.quality_filter_reason_summary.to_csv(quality_reason_path, index=False)
     result.data_coverage_summary.to_csv(coverage_path, index=False)
+    if result.regime_config_comparison is not None:
+        result.regime_config_comparison.to_csv(comparison_path, index=False)
 
     config_path.write_text(
         json.dumps(
@@ -1232,7 +1408,7 @@ def write_period_outputs(result: PeriodBacktestResult, config: PeriodBacktestCon
         ),
         encoding="utf-8",
     )
-    return {
+    outputs = {
         "period_strategy_summary.csv": str(period_summary_path),
         "period_basket_holdings.csv": str(holdings_path),
         "strategy_stability_summary.csv": str(stability_path),
@@ -1241,3 +1417,6 @@ def write_period_outputs(result: PeriodBacktestResult, config: PeriodBacktestCon
         "data_coverage_summary.csv": str(coverage_path),
         "backtest_period_config.json": str(config_path),
     }
+    if result.regime_config_comparison is not None:
+        outputs["regime_config_comparison.csv"] = str(comparison_path)
+    return outputs

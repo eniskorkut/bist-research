@@ -149,6 +149,8 @@ def _run_symbol_backtest(
                     "strategy": strategy_name,
                     "signal_date": t_date.date().isoformat(),
                     "entry_date": entry_date.date().isoformat(),
+                    "close": metrics.get("close"),
+                    "volume": metrics.get("volume"),
                     "entry_close": entry_close,
                     "exit_15d_date": None if exit_15_date is None else exit_15_date.date().isoformat(),
                     "exit_15d_close": exit_15_close,

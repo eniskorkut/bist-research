@@ -247,6 +247,20 @@ def test_active_volume_spike_quality_rejects_below_ma20() -> None:
     assert "above_ma20" in failed
 
 
+def test_active_volume_spike_quality_accepts_near_ma20_ratio() -> None:
+    metrics = _active_quality_metrics()
+    metrics["above_ma20"] = False
+    metrics["close"] = 98.5
+    metrics["ma20"] = 100.0
+    ok, passed, failed = apply_active_volume_spike_quality_filters(
+        metrics,
+        config=RadarConfig(min_above_ma20_ratio=0.98),
+    )
+    assert ok is True
+    assert "above_ma20" in passed
+    assert "above_ma20" not in failed
+
+
 def test_active_volume_spike_quality_rejects_low_turnover() -> None:
     metrics = _active_quality_metrics()
     metrics["turnover_try"] = 2_000_000.0

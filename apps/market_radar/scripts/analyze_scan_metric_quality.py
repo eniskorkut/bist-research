@@ -39,6 +39,7 @@ def _metric_row(frame: pd.DataFrame, metric: str, column: str) -> dict[str, Any]
             "row_type": "metric",
             "metric": metric,
             "n": 0,
+            "valid_period_count": 0,
             "avg": None,
             "median": None,
             "positive_rate": None,
@@ -53,6 +54,7 @@ def _metric_row(frame: pd.DataFrame, metric: str, column: str) -> dict[str, Any]
         "row_type": "metric",
         "metric": metric,
         "n": int(series.shape[0]),
+        "valid_period_count": int(series.shape[0]),
         "avg": float(series.mean()),
         "median": float(series.median()),
         "positive_rate": float((series > 0).mean()),
@@ -160,6 +162,9 @@ def build_recommendation(output_dir: Path) -> tuple[pd.DataFrame, dict[str, Any]
     rows.extend(_filter_summary(reasons, total_before))
 
     recommendation = {
+        "objective_metric": "basket_alpha_30d",
+        "fallback_metric": "basket_return_30d",
+        "tie_breaker_metric": "basket_return_15d",
         "primary_metric": "basket_alpha_30d",
         "primary_fallback_metric": "basket_return_30d",
         "secondary_tie_breaker": "basket_return_15d",
