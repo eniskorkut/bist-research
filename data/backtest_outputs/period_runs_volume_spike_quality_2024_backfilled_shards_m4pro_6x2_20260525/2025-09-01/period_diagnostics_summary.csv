@@ -1,0 +1,2 @@
+period_start,period_end,universe_symbol_count,symbols_with_any_price_data,symbols_with_required_lookback,symbols_with_valid_volume,symbols_with_valid_ohlcv,symbols_with_volume_spike_strict_before_quality,symbols_after_quality_filter,filtered_out_count
+2025-09-01,2026-05-08,567,551,551,551,551,514,324,190

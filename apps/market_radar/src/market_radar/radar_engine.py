@@ -74,6 +74,18 @@ class RadarConfig:
     use_scan_cache: bool = True
     scan_cache_ttl_minutes: int = 15
     index_symbol: str = "XUTUM"
+    active_volume_spike_quality_active: bool = False
+    min_last_turnover_try_active: bool = True
+    min_last_turnover_try: float = 10_000_000.0
+    min_avg_turnover_20d_try_active: bool = True
+    min_avg_turnover_20d_try: float = 10_000_000.0
+    max_rsi_14_active: bool = True
+    max_rsi_14: float = 78.0
+    max_return_5d_active: bool = True
+    max_return_5d_pct: float = 35.0
+    max_return_10d_active: bool = True
+    max_return_10d_pct: float = 60.0
+    require_strong_close: bool = True
 
 
 @dataclass
@@ -121,6 +133,13 @@ class RadarResult:
     passed_filters: list[str] = field(default_factory=list)
     failed_filters: list[str] = field(default_factory=list)
     raw_metrics: dict[str, Any] = field(default_factory=dict)
+    strategy: str = "volume_spike_strict"
+    rsi_14: float | None = None
+    return_5d_pct: float | None = None
+    return_10d_pct: float | None = None
+    filter_passed: bool = False
+    filter_reasons: list[str] = field(default_factory=list)
+    failed_reasons: list[str] = field(default_factory=list)
     data_latest_date: str | None = None
     data_lag_days: int | None = None
     history_rows: int = 0
@@ -132,8 +151,16 @@ class RadarResult:
     def to_row(self) -> dict[str, Any]:
         return {
             "Symbol": self.symbol,
+            "Strategy": self.strategy,
             "Interest Score": self.interest_score,
             "Last Close": self.last_close,
+            "Volume": self.volume,
+            "Turnover": self.turnover_try,
+            "Avg Turnover 20D": self.avg_turnover_20d,
+            "MA20": self.ma20,
+            "RSI 14": self.rsi_14,
+            "Return 5D %": self.return_5d_pct,
+            "Return 10D %": self.return_10d_pct,
             "Daily Return %": self.daily_return_pct,
             "Volume Ratio 20D": self.volume_ratio_20d,
             "Turnover Ratio 20D": self.turnover_ratio_20d,
@@ -155,6 +182,9 @@ class RadarResult:
             "OHLCV Cache Status": self.ohlcv_cache_status,
             "OHLCV Fetched At": self.ohlcv_cache_fetched_at,
             "Freshness Warning": self.freshness_warning,
+            "Filter Passed": self.filter_passed,
+            "Filter Reasons": ", ".join(self.filter_reasons),
+            "Failed Reasons": ", ".join(self.failed_reasons),
             "Signals": ", ".join(self.signals),
         }
 
@@ -183,9 +213,12 @@ def _daily_return_from_frame(df: pd.DataFrame | None) -> float | None:
 
 
 def _money_flow_multiplier(df: pd.DataFrame) -> pd.Series:
-    spread = (df["high"] - df["low"]).replace(0, pd.NA)
-    mfm = (((df["close"] - df["low"]) - (df["high"] - df["close"])) / spread).fillna(0.0)
-    return mfm.astype(float)
+    high = df["high"].astype(float)
+    low = df["low"].astype(float)
+    close = df["close"].astype(float)
+    spread = (high - low).where((high - low) != 0)
+    mfm = (((close - low) - (high - close)) / spread).fillna(0.0)
+    return mfm
 
 
 def _cmf_20(df: pd.DataFrame) -> float | None:
@@ -241,6 +274,41 @@ def _mfi_14(df: pd.DataFrame) -> float | None:
     ratio = pos14 / neg14
     value = 100 - (100 / (1 + ratio))
     return _safe_float(value)
+
+
+def _rsi_14(df: pd.DataFrame) -> float | None:
+    if df is None or df.empty or "close" not in df.columns or len(df) < 15:
+        return None
+    close = df["close"].astype(float)
+    delta = close.diff()
+    gains = delta.clip(lower=0.0)
+    losses = -delta.clip(upper=0.0)
+    avg_gain = gains.tail(14).mean()
+    avg_loss = losses.tail(14).mean()
+    gain_val = _safe_float(avg_gain)
+    loss_val = _safe_float(avg_loss)
+    if gain_val is None or loss_val is None:
+        return None
+    if loss_val == 0:
+        if gain_val > 0:
+            return 100.0
+        return None
+    rs = gain_val / loss_val
+    return _safe_float(100 - (100 / (1 + rs)))
+
+
+def _return_pct_from_close(df: pd.DataFrame, lookback_days: int) -> float | None:
+    if df is None or df.empty or "close" not in df.columns:
+        return None
+    close = df["close"].astype(float).dropna()
+    needed = lookback_days + 1
+    if len(close) < needed:
+        return None
+    latest = _safe_float(close.iloc[-1])
+    base = _safe_float(close.iloc[-needed])
+    if latest is None or base in (None, 0):
+        return None
+    return ((latest / base) - 1) * 100
 
 
 def calculate_accumulation_score(metrics: dict[str, Any]) -> float:
@@ -618,6 +686,71 @@ def evaluate_filters(metrics: dict[str, Any], config: RadarConfig) -> tuple[list
     return passed, failed
 
 
+def apply_active_volume_spike_quality_filters(
+    metrics: dict[str, Any],
+    *,
+    config: RadarConfig,
+) -> tuple[bool, list[str], list[str]]:
+    passed: list[str] = []
+    failed: list[str] = []
+
+    volume_ratio = metrics.get("volume_ratio_20d")
+    turnover_ratio = metrics.get("turnover_ratio_20d")
+    if isinstance(volume_ratio, (int, float)) and volume_ratio >= 1.5 and isinstance(turnover_ratio, (int, float)) and turnover_ratio >= 1.2:
+        passed.append("volume_spike_strict")
+    else:
+        failed.append("volume_spike_strict")
+
+    if config.min_last_turnover_try_active:
+        value = metrics.get("turnover_try")
+        if isinstance(value, (int, float)) and value >= config.min_last_turnover_try:
+            passed.append("min_last_turnover_try")
+        else:
+            failed.append("min_last_turnover_try")
+
+    if config.min_avg_turnover_20d_try_active:
+        value = metrics.get("avg_turnover_20d")
+        if isinstance(value, (int, float)) and value >= config.min_avg_turnover_20d_try:
+            passed.append("min_avg_turnover_20d_try")
+        else:
+            failed.append("min_avg_turnover_20d_try")
+
+    if metrics.get("above_ma20"):
+        passed.append("above_ma20")
+    else:
+        failed.append("above_ma20")
+
+    if config.max_rsi_14_active:
+        value = metrics.get("rsi_14")
+        if isinstance(value, (int, float)) and value <= config.max_rsi_14 and value <= 80:
+            passed.append("max_rsi_14")
+        else:
+            failed.append("max_rsi_14")
+
+    if config.max_return_5d_active:
+        value = metrics.get("return_5d_pct")
+        if isinstance(value, (int, float)) and value <= config.max_return_5d_pct:
+            passed.append("max_return_5d_pct")
+        else:
+            failed.append("max_return_5d_pct")
+
+    if config.max_return_10d_active:
+        value = metrics.get("return_10d_pct")
+        if isinstance(value, (int, float)) and value <= config.max_return_10d_pct:
+            passed.append("max_return_10d_pct")
+        else:
+            failed.append("max_return_10d_pct")
+
+    if config.require_strong_close:
+        value = metrics.get("close_position")
+        if isinstance(value, (int, float)) and value >= config.min_close_position:
+            passed.append("strong_close")
+        else:
+            failed.append("strong_close")
+
+    return len(failed) == 0, passed, failed
+
+
 def evaluate_symbol(
     symbol: str,
     history: pd.DataFrame,
@@ -679,6 +812,9 @@ def evaluate_symbol(
     obv_slope_5d = _series_slope(obv, 5)
     obv_slope_20d = _series_slope(obv, 20)
     mfi14 = _mfi_14(df)
+    rsi14 = _rsi_14(df)
+    return_5d_pct = _return_pct_from_close(df, 5)
+    return_10d_pct = _return_pct_from_close(df, 10)
     volume_price_confirmation = bool(
         isinstance(volume_ratio_20d, (int, float))
         and volume_ratio_20d >= 1.5
@@ -720,6 +856,9 @@ def evaluate_symbol(
         "obv_slope_5d": obv_slope_5d,
         "obv_slope_20d": obv_slope_20d,
         "mfi_14": mfi14,
+        "rsi_14": rsi14,
+        "return_5d_pct": return_5d_pct,
+        "return_10d_pct": return_10d_pct,
         "price_range_pct": price_range_pct,
         "volume_price_confirmation": volume_price_confirmation,
         "ma20": ma20,
@@ -748,6 +887,9 @@ def evaluate_symbol(
     signals = build_signals(metrics)
     accumulation_signals = build_accumulation_signals(metrics)
     passed_filters, failed_filters = evaluate_filters(metrics, config)
+    filter_passed, filter_reasons, failed_reasons = apply_active_volume_spike_quality_filters(metrics, config=config)
+    if config.active_volume_spike_quality_active and not filter_passed:
+        failed_filters = sorted(set(failed_filters + ["active_volume_spike_quality"]))
 
     return RadarResult(
         symbol=normalize_bist_symbol(symbol),
@@ -773,6 +915,9 @@ def evaluate_symbol(
         obv_slope_5d=obv_slope_5d,
         obv_slope_20d=obv_slope_20d,
         mfi_14=mfi14,
+        rsi_14=rsi14,
+        return_5d_pct=return_5d_pct,
+        return_10d_pct=return_10d_pct,
         price_range_pct=price_range_pct,
         volume_price_confirmation=volume_price_confirmation,
         accumulation_score=accumulation_score,
@@ -793,6 +938,9 @@ def evaluate_symbol(
         passed_filters=passed_filters,
         failed_filters=failed_filters,
         raw_metrics=metrics,
+        filter_passed=filter_passed,
+        filter_reasons=filter_reasons,
+        failed_reasons=failed_reasons,
         data_latest_date=metrics["data_latest_date"],
         data_lag_days=metrics["data_lag_days"],
         history_rows=metrics["history_rows"],
@@ -826,6 +974,13 @@ def _result_from_cache_row(row: dict[str, Any]) -> RadarResult:
     row.setdefault("volume_price_confirmation", False)
     row.setdefault("accumulation_score", 0.0)
     row.setdefault("accumulation_signals", [])
+    row.setdefault("strategy", "volume_spike_strict")
+    row.setdefault("rsi_14", None)
+    row.setdefault("return_5d_pct", None)
+    row.setdefault("return_10d_pct", None)
+    row.setdefault("filter_passed", False)
+    row.setdefault("filter_reasons", [])
+    row.setdefault("failed_reasons", [])
     return RadarResult(**row)
 
 
@@ -880,6 +1035,18 @@ def build_scan_cache_key(symbols: list[str], config: RadarConfig) -> str:
             "min_accumulation_score": config.min_accumulation_score,
             "include_negative_moves": config.include_negative_moves,
             "ohlcv_cache_ttl_minutes": config.ohlcv_cache_ttl_minutes,
+            "active_volume_spike_quality_active": config.active_volume_spike_quality_active,
+            "min_last_turnover_try_active": config.min_last_turnover_try_active,
+            "min_last_turnover_try": config.min_last_turnover_try,
+            "min_avg_turnover_20d_try_active": config.min_avg_turnover_20d_try_active,
+            "min_avg_turnover_20d_try": config.min_avg_turnover_20d_try,
+            "max_rsi_14_active": config.max_rsi_14_active,
+            "max_rsi_14": config.max_rsi_14,
+            "max_return_5d_active": config.max_return_5d_active,
+            "max_return_5d_pct": config.max_return_5d_pct,
+            "max_return_10d_active": config.max_return_10d_active,
+            "max_return_10d_pct": config.max_return_10d_pct,
+            "require_strong_close": config.require_strong_close,
         },
     }
     payload_text = json.dumps(key_payload, sort_keys=True)

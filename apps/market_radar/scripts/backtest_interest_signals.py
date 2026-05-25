@@ -14,7 +14,8 @@ from market_radar.backtesting.backtest_engine import (
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--index", default="XU100")
+    parser.add_argument("--universe", default="XUTUM")
+    parser.add_argument("--benchmark", default="XU100")
     parser.add_argument("--lookback-days", type=int, default=520)
     parser.add_argument("--strategies", nargs="+", default=["all"])
     parser.add_argument("--max-workers", type=int, default=8)
@@ -30,7 +31,8 @@ def main() -> None:
     args = parse_args()
     cooldown_days = 0 if args.no_cooldown else max(0, int(args.cooldown_days))
     cfg = BacktestConfig(
-        index_symbol=args.index,
+        universe_symbol=args.universe,
+        benchmark_symbol=args.benchmark,
         lookback_days=args.lookback_days,
         strategies=args.strategies,
         max_workers=args.max_workers,

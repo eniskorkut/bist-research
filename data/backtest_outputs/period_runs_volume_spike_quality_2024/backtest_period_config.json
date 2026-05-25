@@ -1,0 +1,202 @@
+{
+  "config": {
+    "universe_symbol": "XUTUM",
+    "benchmark_symbol": "XU100",
+    "lookback_days": 1100,
+    "strategies": [
+      "volume_spike_strict"
+    ],
+    "max_workers": 8,
+    "cooldown_days": 15,
+    "force_refresh": false,
+    "db_path": "/data/market_radar_cache.sqlite",
+    "output_dir": "/data/backtest_outputs/period_runs_volume_spike_quality_2024",
+    "period_starts": [
+      "2024-01-01",
+      "2024-02-01",
+      "2024-03-01",
+      "2024-04-01",
+      "2024-05-01",
+      "2024-06-01",
+      "2024-07-01",
+      "2024-08-01",
+      "2024-09-01",
+      "2024-10-01",
+      "2024-11-01",
+      "2024-12-01",
+      "2025-01-01",
+      "2025-02-01",
+      "2025-03-01",
+      "2025-04-01",
+      "2025-05-01",
+      "2025-06-01",
+      "2025-07-01",
+      "2025-08-01",
+      "2025-09-01",
+      "2025-10-01",
+      "2025-11-01",
+      "2025-12-01",
+      "2026-01-01",
+      "2026-02-01",
+      "2026-03-01",
+      "2026-04-01",
+      "2026-05-01"
+    ],
+    "period_ends": null,
+    "basket_mode": "first_signal_per_symbol",
+    "as_of_date": null,
+    "active_volume_spike_quality": true,
+    "min_last_turnover_try": 10000000.0,
+    "min_avg_turnover_20d_try": 10000000.0,
+    "max_rsi_14": 78.0,
+    "max_return_5d_pct": 35.0,
+    "max_return_10d_pct": 60.0,
+    "require_strong_close": true,
+    "min_close_position": 0.6
+  },
+  "run_summary": {
+    "period_count": 29,
+    "basket_mode": "first_signal_per_symbol",
+    "universe": "XUTUM",
+    "benchmark": "XU100",
+    "universe_symbol_count": 567,
+    "benchmark_symbol": "XU100",
+    "effective_as_of_date": "2026-05-08",
+    "entry_convention": "entry_price is signal-day close; 15d/30d exits are trading-day offsets from signal date",
+    "quality_filter_enabled": true,
+    "coverage_warning_2024_2025": true,
+    "period_windows": [
+      {
+        "period_start": "2024-01-01",
+        "period_end": "2024-02-01"
+      },
+      {
+        "period_start": "2024-02-01",
+        "period_end": "2024-03-01"
+      },
+      {
+        "period_start": "2024-03-01",
+        "period_end": "2024-04-01"
+      },
+      {
+        "period_start": "2024-04-01",
+        "period_end": "2024-05-01"
+      },
+      {
+        "period_start": "2024-05-01",
+        "period_end": "2024-06-01"
+      },
+      {
+        "period_start": "2024-06-01",
+        "period_end": "2024-07-01"
+      },
+      {
+        "period_start": "2024-07-01",
+        "period_end": "2024-08-01"
+      },
+      {
+        "period_start": "2024-08-01",
+        "period_end": "2024-09-01"
+      },
+      {
+        "period_start": "2024-09-01",
+        "period_end": "2024-10-01"
+      },
+      {
+        "period_start": "2024-10-01",
+        "period_end": "2024-11-01"
+      },
+      {
+        "period_start": "2024-11-01",
+        "period_end": "2024-12-01"
+      },
+      {
+        "period_start": "2024-12-01",
+        "period_end": "2025-01-01"
+      },
+      {
+        "period_start": "2025-01-01",
+        "period_end": "2025-02-01"
+      },
+      {
+        "period_start": "2025-02-01",
+        "period_end": "2025-03-01"
+      },
+      {
+        "period_start": "2025-03-01",
+        "period_end": "2025-04-01"
+      },
+      {
+        "period_start": "2025-04-01",
+        "period_end": "2025-05-01"
+      },
+      {
+        "period_start": "2025-05-01",
+        "period_end": "2025-06-01"
+      },
+      {
+        "period_start": "2025-06-01",
+        "period_end": "2025-07-01"
+      },
+      {
+        "period_start": "2025-07-01",
+        "period_end": "2025-08-01"
+      },
+      {
+        "period_start": "2025-08-01",
+        "period_end": "2025-09-01"
+      },
+      {
+        "period_start": "2025-09-01",
+        "period_end": "2025-10-01"
+      },
+      {
+        "period_start": "2025-10-01",
+        "period_end": "2025-11-01"
+      },
+      {
+        "period_start": "2025-11-01",
+        "period_end": "2025-12-01"
+      },
+      {
+        "period_start": "2025-12-01",
+        "period_end": "2026-01-01"
+      },
+      {
+        "period_start": "2026-01-01",
+        "period_end": "2026-02-01"
+      },
+      {
+        "period_start": "2026-02-01",
+        "period_end": "2026-03-01"
+      },
+      {
+        "period_start": "2026-03-01",
+        "period_end": "2026-04-01"
+      },
+      {
+        "period_start": "2026-04-01",
+        "period_end": "2026-05-01"
+      },
+      {
+        "period_start": "2026-05-01",
+        "period_end": "2026-06-01"
+      }
+    ],
+    "scan_summary": {
+      "universe": "XUTUM",
+      "benchmark": "XU100",
+      "strategies": [
+        "volume_spike_strict"
+      ],
+      "universe_symbol_count": 567,
+      "universe_source": "fresh_cache",
+      "benchmark_symbol": "XU100",
+      "signal_count": 720,
+      "failed_symbol_count": 0,
+      "elapsed_seconds": 83.741
+    },
+    "failed_symbols": [],
+    "generated_at": "2026-05-10T09:40:04.844098+00:00"
+  }
+}

@@ -1,0 +1,41 @@
+{
+  "config": {
+    "universe_symbol": "XUTUM",
+    "benchmark_symbol": "XU100",
+    "lookback_days": 700,
+    "strategies": [
+      "volume_spike_strict"
+    ],
+    "max_workers": 2,
+    "cooldown_days": 15,
+    "force_refresh": false,
+    "db_path": "/data/market_radar_cache.sqlite",
+    "output_dir": "/data/backtest_outputs/period_runs_volume_spike_quality_2024_backfilled_shards_m4pro_6x2_20260525/2025-12-01",
+    "period_starts": [
+      "2025-12-01"
+    ],
+    "period_ends": null,
+    "basket_mode": "first_signal_per_symbol",
+    "as_of_date": null,
+    "active_volume_spike_quality": true,
+    "min_last_turnover_try": 10000000.0,
+    "min_avg_turnover_20d_try": 10000000.0,
+    "max_rsi_14": 78.0,
+    "max_return_5d_pct": 35.0,
+    "max_return_10d_pct": 60.0,
+    "require_strong_close": true,
+    "min_close_position": 0.6,
+    "cache_only": true,
+    "max_symbols": null,
+    "only_symbols": null
+  },
+  "run_summary": {
+    "period_count": 1,
+    "active_period_count": 1,
+    "empty_period_count": 0,
+    "fully_completed_periods": 1,
+    "resume": true,
+    "checkpoint_each_period": true,
+    "generated_at": "2026-05-25T15:17:29.249571Z"
+  }
+}

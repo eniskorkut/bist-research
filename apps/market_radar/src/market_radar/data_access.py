@@ -74,6 +74,17 @@ def _frame_to_payload(df: pd.DataFrame) -> dict[str, Any]:
     return {"index_name": "date", "records": records}
 
 
+def _merge_history_frames(existing: pd.DataFrame, incoming: pd.DataFrame) -> pd.DataFrame:
+    if existing is None or existing.empty:
+        return _normalize_history_frame(incoming)
+    if incoming is None or incoming.empty:
+        return _normalize_history_frame(existing)
+    merged = pd.concat([existing, incoming], axis=0)
+    merged = _normalize_history_frame(merged)
+    merged = merged[~merged.index.duplicated(keep="last")]
+    return merged.sort_index()
+
+
 def _payload_to_frame(payload: dict[str, Any] | None) -> pd.DataFrame:
     if not payload:
         return pd.DataFrame()
@@ -367,6 +378,7 @@ def load_bist_universe(
     *,
     db_path: str = DB_PATH,
     force: bool = False,
+    cache_only: bool = False,
 ) -> tuple[list[str], str]:
     """Load BIST universe symbols with 24h cache.
 
@@ -379,6 +391,11 @@ def load_bist_universe(
     # If cache is fresh and not forced, return cached
     if cached is not None and not force and not is_stale(cached["fetched_at"], max_age_minutes=24 * 60):
         return cached["symbols_json"], "fresh_cache"
+
+    if cache_only:
+        if cached is not None and cached["symbols_json"]:
+            return cached["symbols_json"], "stale_cache"
+        raise RuntimeError(f"BIST universe ({index_symbol}) cache not found (cache_only mode).")
 
     # Try to fetch from borsapy
     try:
@@ -414,6 +431,7 @@ class BorsapyMarketDataClient:
         db_path: str = DB_PATH,
         force: bool = False,
         cache_ttl_minutes: int | None = None,
+        cache_only: bool = False,
     ) -> HistoryLoadResult:
         normalized = normalize_bist_symbol(symbol)
         cached_frame, meta = get_cached_history(db_path, normalized)
@@ -449,15 +467,23 @@ class BorsapyMarketDataClient:
 
         if not force and meta is not None and not is_stale(meta.get("fetched_at"), max_age_minutes=ttl_minutes):
             return _build_result(cached_frame, "fresh_cache", str(meta.get("source") or "cache"), meta.get("fetched_at"))
+
+        if cache_only:
+            if not cached_frame.empty:
+                fetched_at = meta.get("fetched_at") if meta else None
+                status = "stale_cache" if meta is not None else "missing"
+                return _build_result(cached_frame, status, str((meta or {}).get("source") or "cache"), fetched_at)
+            return _build_result(pd.DataFrame(), "missing", "missing", None)
         retries = [2, 5]
         for attempt in range(len(retries) + 1):
             try:
                 frame = self._fetch_history(normalized, lookback_days)
                 if not frame.empty:
-                    upsert_cached_history(db_path, normalized, frame)
+                    merged = _merge_history_frames(cached_frame, frame)
+                    upsert_cached_history(db_path, normalized, merged)
                     refreshed_meta = get_cached_history(db_path, normalized)[1]
                     fetched_at = refreshed_meta.get("fetched_at") if refreshed_meta else None
-                    return _build_result(frame, "live_fetch", "borsapy", fetched_at)
+                    return _build_result(merged, "live_fetch", "borsapy", fetched_at)
                 break
             except Exception as exc:
                 message = str(exc)
@@ -483,6 +509,7 @@ class BorsapyMarketDataClient:
         db_path: str = DB_PATH,
         force: bool = False,
         cache_ttl_minutes: int | None = None,
+        cache_only: bool = False,
     ) -> pd.DataFrame:
         return self.load_history_with_meta(
             symbol,
@@ -490,4 +517,5 @@ class BorsapyMarketDataClient:
             db_path=db_path,
             force=force,
             cache_ttl_minutes=cache_ttl_minutes,
+            cache_only=cache_only,
         ).frame

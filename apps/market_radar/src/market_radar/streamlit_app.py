@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+from pathlib import Path
 from typing import Any
 
 import pandas as pd
@@ -154,6 +155,43 @@ def _render_details(results: list[RadarResult]) -> None:
             st.json(asdict(result))
 
 
+def _render_monthly_backtest_table() -> None:
+    st.markdown("#### Aylık Cohort Backtest Tablosu")
+    st.caption("Kaynak: volume_spike_strict kalite filtreli monthly cohort çıktısı")
+    csv_path = Path("/data/backtest_outputs/period_runs_volume_spike_quality_2024/period_strategy_summary.csv")
+    if not csv_path.exists():
+        st.info("Aylık backtest dosyası bulunamadı. Önce period backtest komutunu çalıştır.")
+        return
+    try:
+        df = pd.read_csv(csv_path)
+    except Exception as exc:  # noqa: BLE001
+        st.error("Aylık backtest dosyası okunamadı.")
+        st.caption(str(exc))
+        return
+    if df.empty:
+        st.info("Aylık backtest tablosu boş.")
+        return
+    keep_cols = [
+        "period_start",
+        "period_end",
+        "signal_count_before_quality_filter",
+        "signal_count_after_quality_filter",
+        "filtered_out_count",
+        "basket_return_15d",
+        "basket_return_30d",
+        "basket_return_to_current",
+        "benchmark_return_to_current",
+        "basket_alpha_to_current",
+        "beat_rate_to_current",
+        "best_symbol_to_current",
+        "worst_symbol_to_current",
+        "outlier_warning",
+        "low_sample_warning",
+    ]
+    present_cols = [col for col in keep_cols if col in df.columns]
+    st.dataframe(df[present_cols], use_container_width=True, hide_index=True)
+
+
 def render_positive_interest_radar_page(*, embedded: bool = False) -> None:
     if not embedded:
         st.set_page_config(page_title="BIST Pozitif İlgi Radarı", layout="wide")
@@ -228,6 +266,14 @@ def render_positive_interest_radar_page(*, embedded: bool = False) -> None:
         max_price_range_pct = st.number_input("Maks fiyat aralığı %", value=5.0, step=0.5)
         min_accumulation_score_active = st.checkbox("Minimum accumulation score aktif", value=scan_mode in {"positive_money_flow", "silent_accumulation", "strong_momentum"})
         min_accumulation_score = st.number_input("Minimum Accumulation Score", value=50.0, step=5.0)
+        st.markdown("#### Aktif Radar Kalite Filtresi (volume_spike_strict)")
+        active_volume_spike_quality_active = st.checkbox("Aktif kalite filtresini uygula", value=False)
+        min_last_turnover_try = st.number_input("Min son gün turnover (TL)", value=10_000_000.0, step=1_000_000.0)
+        min_avg_turnover_20d_try = st.number_input("Min ort. 20G turnover (TL)", value=10_000_000.0, step=1_000_000.0)
+        max_rsi_14 = st.number_input("Maks RSI 14", value=78.0, step=1.0)
+        max_return_5d_pct = st.number_input("Maks 5G getiri %", value=35.0, step=1.0)
+        max_return_10d_pct = st.number_input("Maks 10G getiri %", value=60.0, step=1.0)
+        require_strong_close = st.checkbox("Güçlü kapanış zorunlu", value=True)
         include_negative_moves = st.checkbox("Negatif fiyat hareketlerini dahil et", value=False)
         start_scan = st.button("Taramayı Başlat")
         _render_filters_panel(
@@ -273,6 +319,13 @@ def render_positive_interest_radar_page(*, embedded: bool = False) -> None:
                 use_scan_cache=use_scan_cache,
                 scan_cache_ttl_minutes=scan_cache_ttl_minutes,
                 index_symbol=universe_index,
+                active_volume_spike_quality_active=active_volume_spike_quality_active,
+                min_last_turnover_try=min_last_turnover_try,
+                min_avg_turnover_20d_try=min_avg_turnover_20d_try,
+                max_rsi_14=max_rsi_14,
+                max_return_5d_pct=max_return_5d_pct,
+                max_return_10d_pct=max_return_10d_pct,
+                require_strong_close=require_strong_close,
             )
         )
 
@@ -330,6 +383,13 @@ def render_positive_interest_radar_page(*, embedded: bool = False) -> None:
         use_scan_cache=use_scan_cache,
         scan_cache_ttl_minutes=scan_cache_ttl_minutes,
         index_symbol=universe_index,
+        active_volume_spike_quality_active=active_volume_spike_quality_active,
+        min_last_turnover_try=min_last_turnover_try,
+        min_avg_turnover_20d_try=min_avg_turnover_20d_try,
+        max_rsi_14=max_rsi_14,
+        max_return_5d_pct=max_return_5d_pct,
+        max_return_10d_pct=max_return_10d_pct,
+        require_strong_close=require_strong_close,
     )
 
     if universe_index == "XUTUM" and force_refresh and max_workers > 8:
@@ -391,9 +451,10 @@ def render_positive_interest_radar_page(*, embedded: bool = False) -> None:
         else:
             st.info("Filtreleri gevşet veya daha geniş bir sembol listesi dene.")
         _render_details(results)
+        _render_monthly_backtest_table()
     else:
         # No scan yet - show empty state
-        pass
+        _render_monthly_backtest_table()
 
 
 def main() -> None:

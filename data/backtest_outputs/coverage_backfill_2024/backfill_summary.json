@@ -1,0 +1,16 @@
+{
+  "generated_at": "2026-05-10T10:15:11.283683+00:00",
+  "universe": "XUTUM",
+  "benchmark": "XU100",
+  "universe_source": "borsapy",
+  "symbol_count": 568,
+  "failed_symbols": 0,
+  "lookback_days": 1084,
+  "fetch_start": "2023-06-01",
+  "required_lookback_date": "2024-01-01",
+  "has_2024_data_count": 533,
+  "has_2025_data_count": 552,
+  "has_2026_data_count": 567,
+  "required_lookback_ready_count": 500,
+  "output_file": "/data/backtest_outputs/coverage_backfill_2024/backfill_coverage_summary.csv"
+}

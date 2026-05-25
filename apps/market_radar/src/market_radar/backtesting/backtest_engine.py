@@ -17,7 +17,8 @@ from market_radar.symbols import normalize_bist_symbol
 
 @dataclass
 class BacktestConfig:
-    index_symbol: str = "XU100"
+    universe_symbol: str = "XUTUM"
+    benchmark_symbol: str = "XU100"
     lookback_days: int = 520
     strategies: list[str] | None = None
     max_workers: int = 8
@@ -25,6 +26,9 @@ class BacktestConfig:
     force_refresh: bool = False
     output_dir: str = "/data/backtest_outputs"
     cooldown_days: int = 15
+    cache_only: bool = False
+    max_symbols: int | None = None
+    only_symbols: list[str] | None = None
 
 
 @dataclass
@@ -84,6 +88,7 @@ def _run_symbol_backtest(
     benchmark: pd.DataFrame,
     strategy_names: list[str],
     *,
+    benchmark_symbol: str = "XU100",
     cooldown_days: int = 15,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
@@ -151,7 +156,7 @@ def _run_symbol_backtest(
                     "exit_30d_close": exit_30_close,
                     "return_15d": return_15d,
                     "return_30d": return_30d,
-                    "benchmark_symbol": "XU100",
+                    "benchmark_symbol": normalize_bist_symbol(benchmark_symbol) or "XU100",
                     "benchmark_entry_date": None if bench_entry_date is None else bench_entry_date.date().isoformat(),
                     "benchmark_exit_15d_date": None if bench_exit_15_date is None else bench_exit_15_date.date().isoformat(),
                     "benchmark_exit_30d_date": None if bench_exit_30_date is None else bench_exit_30_date.date().isoformat(),
@@ -163,9 +168,14 @@ def _run_symbol_backtest(
                     "beat_xu100_30d": None if alpha_30d is None else alpha_30d > 0,
                     "volume_ratio_20d": metrics.get("volume_ratio_20d"),
                     "turnover_ratio_20d": metrics.get("turnover_ratio_20d"),
+                    "turnover": metrics.get("turnover_try"),
                     "avg_turnover_20d": metrics.get("avg_turnover_20d"),
                     "daily_return_pct": metrics.get("daily_return_pct"),
                     "close_position": metrics.get("close_position"),
+                    "ma20": metrics.get("ma20"),
+                    "rsi_14": metrics.get("rsi_14"),
+                    "return_5d_pct": metrics.get("return_5d_pct"),
+                    "return_10d_pct": metrics.get("return_10d_pct"),
                     "cmf_20": metrics.get("cmf_20"),
                     "obv_slope_5d": metrics.get("obv_slope_5d"),
                     "obv_slope_20d": metrics.get("obv_slope_20d"),
@@ -185,18 +195,53 @@ def run_backtest(config: BacktestConfig, client: BorsapyMarketDataClient | None 
     started = datetime.now(UTC)
     radar_client = client or BorsapyMarketDataClient()
     strategies = resolve_strategies(config.strategies)
-    symbols, universe_source = load_bist_universe(config.index_symbol, db_path=config.db_path, force=config.force_refresh)
+    universe_symbol = normalize_bist_symbol(config.universe_symbol) or "XUTUM"
+    benchmark_symbol = normalize_bist_symbol(config.benchmark_symbol) or "XU100"
+    symbols, universe_source = load_bist_universe(
+        universe_symbol,
+        db_path=config.db_path,
+        force=config.force_refresh,
+        cache_only=config.cache_only,
+    )
     symbols = sorted({normalize_bist_symbol(item) for item in symbols if normalize_bist_symbol(item)})
+    if config.only_symbols:
+        wanted = {normalize_bist_symbol(item) for item in config.only_symbols if normalize_bist_symbol(item)}
+        symbols = [item for item in symbols if item in wanted]
+    if config.max_symbols is not None:
+        symbols = symbols[: max(0, int(config.max_symbols))]
 
-    benchmark = radar_client.load_history("XU100", lookback_days=config.lookback_days, db_path=config.db_path, force=config.force_refresh)
+    benchmark = radar_client.load_history(
+        benchmark_symbol,
+        lookback_days=config.lookback_days,
+        db_path=config.db_path,
+        force=config.force_refresh,
+        cache_only=config.cache_only,
+    )
 
     signals: list[dict[str, Any]] = []
     failed: list[dict[str, Any]] = []
 
     def _worker(sym: str) -> tuple[str, list[dict[str, Any]] | None, str | None]:
         try:
-            hist = radar_client.load_history(sym, lookback_days=config.lookback_days, db_path=config.db_path, force=config.force_refresh)
-            rows = _run_symbol_backtest(sym, hist, benchmark, strategies, cooldown_days=max(0, int(config.cooldown_days)))
+            hist = radar_client.load_history(
+                sym,
+                lookback_days=config.lookback_days,
+                db_path=config.db_path,
+                force=config.force_refresh,
+                cache_only=config.cache_only,
+            )
+            if hist is None or hist.empty:
+                if config.cache_only:
+                    return sym, None, "missing cached OHLCV"
+                return sym, None, "empty_history"
+            rows = _run_symbol_backtest(
+                sym,
+                hist,
+                benchmark,
+                strategies,
+                benchmark_symbol=benchmark_symbol,
+                cooldown_days=max(0, int(config.cooldown_days)),
+            )
             return sym, rows, None
         except Exception as exc:  # noqa: BLE001
             return sym, None, str(exc)
@@ -212,10 +257,12 @@ def run_backtest(config: BacktestConfig, client: BorsapyMarketDataClient | None 
 
     elapsed = (datetime.now(UTC) - started).total_seconds()
     summary = {
-        "index_symbol": normalize_bist_symbol(config.index_symbol),
+        "universe": universe_symbol,
+        "benchmark": benchmark_symbol,
         "strategies": strategies,
         "universe_symbol_count": len(symbols),
         "universe_source": universe_source,
+        "benchmark_symbol": benchmark_symbol,
         "signal_count": len(signals),
         "failed_symbol_count": len(failed),
         "elapsed_seconds": round(elapsed, 3),

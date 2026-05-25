@@ -1,0 +1,29 @@
+{
+  "config": {
+    "index_symbol": "XU100",
+    "lookback_days": 520,
+    "strategies": [
+      "all"
+    ],
+    "max_workers": 8,
+    "db_path": "/data/market_radar_cache.sqlite",
+    "force_refresh": false,
+    "output_dir": "/data/backtest_outputs"
+  },
+  "scan_summary": {
+    "index_symbol": "XU100",
+    "strategies": [
+      "positive_interest",
+      "positive_money_flow",
+      "silent_accumulation",
+      "strong_momentum",
+      "volume_spike_strict"
+    ],
+    "universe_symbol_count": 100,
+    "universe_source": "fresh_cache",
+    "signal_count": 749,
+    "failed_symbol_count": 0,
+    "elapsed_seconds": 11.188
+  },
+  "failed_symbols": []
+}

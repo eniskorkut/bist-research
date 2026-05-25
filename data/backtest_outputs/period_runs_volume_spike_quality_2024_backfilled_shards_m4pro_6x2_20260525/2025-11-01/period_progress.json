@@ -1,0 +1,16 @@
+{
+  "total_periods": 1,
+  "fully_completed_periods": 1,
+  "active_period_count": 1,
+  "empty_period_count": 0,
+  "active_period": "2025-11-01",
+  "active_period_processed_symbols": 567,
+  "active_period_total_symbols": 567,
+  "active_period_remaining_symbols": 0,
+  "last_period": "2025-11-01",
+  "last_updated_at": "2026-05-25T15:17:22.470528Z",
+  "data_load_seconds": 1949.502,
+  "signal_eval_seconds": 1568.285,
+  "quality_filter_seconds": 548.9,
+  "return_calc_seconds": 1019.385
+}

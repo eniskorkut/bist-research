@@ -1,0 +1,2 @@
+period_start,period_end,failed_rsi_14,failed_turnover,failed_avg_turnover_20d,failed_above_ma20,failed_return_5d_pct,failed_return_10d_pct,failed_strong_close,failed_missing_metric
+2024-12-01,2026-05-08,293,28,244,622,92,41,1114,337

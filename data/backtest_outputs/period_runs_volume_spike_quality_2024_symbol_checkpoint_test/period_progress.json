@@ -1,0 +1,12 @@
+{
+  "total_periods": 1,
+  "completed_periods": 1,
+  "active_period_count": 1,
+  "empty_period_count": 0,
+  "last_period": "2024-01-01",
+  "updated_at": "2026-05-10T15:53:58.310789Z",
+  "data_load_seconds": 0.0,
+  "signal_eval_seconds": 0.0,
+  "quality_filter_seconds": 0.0,
+  "return_calc_seconds": 0.0
+}

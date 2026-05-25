@@ -21,7 +21,8 @@ class PeriodWindow:
 
 @dataclass
 class PeriodBacktestConfig:
-    index_symbol: str = "XU100"
+    universe_symbol: str = "XUTUM"
+    benchmark_symbol: str = "XU100"
     lookback_days: int = 700
     strategies: list[str] | None = None
     max_workers: int = 8
@@ -33,6 +34,17 @@ class PeriodBacktestConfig:
     period_ends: list[str] | None = None
     basket_mode: str = "first_signal_per_symbol"
     as_of_date: str | None = None
+    active_volume_spike_quality: bool = False
+    min_last_turnover_try: float = 10_000_000.0
+    min_avg_turnover_20d_try: float = 10_000_000.0
+    max_rsi_14: float = 78.0
+    max_return_5d_pct: float = 35.0
+    max_return_10d_pct: float = 60.0
+    require_strong_close: bool = True
+    min_close_position: float = 0.60
+    cache_only: bool = False
+    max_symbols: int | None = None
+    only_symbols: list[str] | None = None
 
 
 @dataclass
@@ -40,6 +52,9 @@ class PeriodBacktestResult:
     holdings: pd.DataFrame
     period_strategy_summary: pd.DataFrame
     strategy_stability_summary: pd.DataFrame
+    period_diagnostics_summary: pd.DataFrame
+    quality_filter_reason_summary: pd.DataFrame
+    data_coverage_summary: pd.DataFrame
     run_summary: dict[str, Any]
 
 
@@ -151,6 +166,12 @@ def _prepare_signals_frame(raw_signals: list[dict[str, Any]]) -> pd.DataFrame:
         "close_position",
         "daily_return_pct",
         "near_20d_high_pct",
+        "turnover",
+        "avg_turnover_20d",
+        "ma20",
+        "rsi_14",
+        "return_5d_pct",
+        "return_10d_pct",
     ]:
         if col in frame.columns:
             frame[col] = pd.to_numeric(frame[col], errors="coerce")
@@ -159,6 +180,92 @@ def _prepare_signals_frame(raw_signals: list[dict[str, Any]]) -> pd.DataFrame:
     if "beat_xu100_30d" in frame.columns:
         frame["beat_xu100_30d"] = frame["beat_xu100_30d"].map(_to_bool)
     return frame
+
+
+def _apply_volume_spike_quality_filter(frame: pd.DataFrame, config: PeriodBacktestConfig) -> pd.DataFrame:
+    if frame.empty:
+        return frame.copy()
+    out = frame.copy()
+    out["quality_filter_enabled"] = bool(config.active_volume_spike_quality)
+    out["filter_reasons"] = ""
+    out["failed_reasons"] = ""
+    out["filter_passed"] = True
+    if not config.active_volume_spike_quality:
+        return out
+
+    filter_reasons = [
+        "volume_spike_strict",
+        "min_last_turnover_try",
+        "min_avg_turnover_20d_try",
+        "above_ma20",
+        "max_rsi_14",
+        "max_return_5d_pct",
+        "max_return_10d_pct",
+    ]
+    if config.require_strong_close:
+        filter_reasons.append("strong_close")
+
+    for idx, row in out.iterrows():
+        failed: list[str] = []
+        strategy = str(row.get("strategy") or "")
+        if strategy != "volume_spike_strict":
+            out.at[idx, "filter_reasons"] = ",".join(filter_reasons)
+            out.at[idx, "failed_reasons"] = ""
+            out.at[idx, "filter_passed"] = True
+            continue
+
+        v_ratio = pd.to_numeric(row.get("volume_ratio_20d"), errors="coerce")
+        t_ratio = pd.to_numeric(row.get("turnover_ratio_20d"), errors="coerce")
+        if pd.isna(v_ratio) or pd.isna(t_ratio) or float(v_ratio) < 1.5 or float(t_ratio) < 1.2:
+            failed.append("volume_spike_strict")
+
+        turnover = pd.to_numeric(row.get("turnover"), errors="coerce")
+        if pd.isna(turnover) or float(turnover) < float(config.min_last_turnover_try):
+            failed.append("min_last_turnover_try")
+
+        avg_turn = pd.to_numeric(row.get("avg_turnover_20d"), errors="coerce")
+        if pd.isna(avg_turn) or float(avg_turn) < float(config.min_avg_turnover_20d_try):
+            failed.append("min_avg_turnover_20d_try")
+
+        above_ma20 = row.get("above_ma20")
+        if above_ma20 is not True:
+            failed.append("above_ma20")
+
+        rsi = pd.to_numeric(row.get("rsi_14"), errors="coerce")
+        if pd.isna(rsi) or float(rsi) > float(config.max_rsi_14) or float(rsi) > 80.0:
+            failed.append("max_rsi_14")
+
+        ret5 = pd.to_numeric(row.get("return_5d_pct"), errors="coerce")
+        if pd.isna(ret5) or float(ret5) > float(config.max_return_5d_pct):
+            failed.append("max_return_5d_pct")
+
+        ret10 = pd.to_numeric(row.get("return_10d_pct"), errors="coerce")
+        if pd.isna(ret10) or float(ret10) > float(config.max_return_10d_pct):
+            failed.append("max_return_10d_pct")
+
+        if config.require_strong_close:
+            close_pos = pd.to_numeric(row.get("close_position"), errors="coerce")
+            if pd.isna(close_pos) or float(close_pos) < float(config.min_close_position):
+                failed.append("strong_close")
+
+        out.at[idx, "filter_reasons"] = ",".join(filter_reasons)
+        out.at[idx, "failed_reasons"] = ",".join(failed)
+        out.at[idx, "filter_passed"] = len(failed) == 0
+    return out
+
+
+def _reason_flags(failed_reasons: str) -> dict[str, int]:
+    parts = {item.strip() for item in str(failed_reasons or "").split(",") if item.strip()}
+    return {
+        "failed_rsi_14": int("max_rsi_14" in parts),
+        "failed_turnover": int("min_last_turnover_try" in parts),
+        "failed_avg_turnover_20d": int("min_avg_turnover_20d_try" in parts),
+        "failed_above_ma20": int("above_ma20" in parts),
+        "failed_return_5d_pct": int("max_return_5d_pct" in parts),
+        "failed_return_10d_pct": int("max_return_10d_pct" in parts),
+        "failed_strong_close": int("strong_close" in parts),
+        "failed_missing_metric": int(any(x in parts for x in {"max_rsi_14", "max_return_5d_pct", "max_return_10d_pct"}) and "volume_spike_strict" not in parts),
+    }
 
 
 def _normalize_history(df: pd.DataFrame) -> pd.DataFrame:
@@ -326,9 +433,17 @@ def _build_period_strategy_summary(
     period_start: date,
     period_end: date,
     effective_as_of_date: pd.Timestamp | None,
+    universe_symbol: str,
+    benchmark_symbol: str,
+    universe_symbol_count: int,
     strategy: str,
     basket_mode: str,
     basket: pd.DataFrame,
+    *,
+    quality_filter_enabled: bool,
+    quality_config: PeriodBacktestConfig,
+    signal_count_before_quality_filter: int,
+    signal_count_after_quality_filter: int,
 ) -> dict[str, Any]:
     signal_count = int(len(basket))
     unique_symbol_count = int(basket["symbol"].nunique()) if not basket.empty else 0
@@ -410,8 +525,23 @@ def _build_period_strategy_summary(
         "period_start": period_start.isoformat(),
         "period_end": period_end.isoformat(),
         "effective_as_of_date": None if effective_as_of_date is None else effective_as_of_date.date().isoformat(),
+        "universe": universe_symbol,
+        "benchmark": benchmark_symbol,
+        "universe_symbol_count": universe_symbol_count,
+        "benchmark_symbol": benchmark_symbol,
         "strategy": strategy,
         "basket_mode": basket_mode,
+        "quality_filter_enabled": quality_filter_enabled,
+        "min_last_turnover_try": quality_config.min_last_turnover_try,
+        "min_avg_turnover_20d_try": quality_config.min_avg_turnover_20d_try,
+        "max_rsi_14": quality_config.max_rsi_14,
+        "max_return_5d_pct": quality_config.max_return_5d_pct,
+        "max_return_10d_pct": quality_config.max_return_10d_pct,
+        "require_strong_close": quality_config.require_strong_close,
+        "min_close_position": quality_config.min_close_position,
+        "signal_count_before_quality_filter": signal_count_before_quality_filter,
+        "signal_count_after_quality_filter": signal_count_after_quality_filter,
+        "filtered_out_count": max(0, signal_count_before_quality_filter - signal_count_after_quality_filter),
         "signal_count": signal_count,
         "unique_symbol_count": unique_symbol_count,
         "basket_return_15d": basket_return_15d,
@@ -573,24 +703,34 @@ def _build_stability_summary(period_summary: pd.DataFrame) -> pd.DataFrame:
 
 def run_period_backtest(config: PeriodBacktestConfig) -> PeriodBacktestResult:
     windows = build_period_windows(config.period_starts or [], config.period_ends)
+    universe_symbol = normalize_bist_symbol(config.universe_symbol) or "XUTUM"
+    benchmark_symbol = normalize_bist_symbol(config.benchmark_symbol) or "XU100"
     raw = run_backtest(
         BacktestConfig(
-            index_symbol=config.index_symbol,
+            universe_symbol=universe_symbol,
+            benchmark_symbol=benchmark_symbol,
             lookback_days=config.lookback_days,
             strategies=config.strategies,
             max_workers=config.max_workers,
             db_path=config.db_path,
             force_refresh=config.force_refresh,
             cooldown_days=config.cooldown_days,
+            cache_only=config.cache_only,
+            max_symbols=config.max_symbols,
+            only_symbols=config.only_symbols,
         )
     )
     signals = _prepare_signals_frame(raw.signals)
+    signals = _apply_volume_spike_quality_filter(signals, config)
     if signals.empty:
         empty = pd.DataFrame()
         return PeriodBacktestResult(
             holdings=empty,
             period_strategy_summary=empty,
             strategy_stability_summary=empty,
+            period_diagnostics_summary=empty,
+            quality_filter_reason_summary=empty,
+            data_coverage_summary=empty,
             run_summary={
                 "period_count": len(windows),
                 "basket_mode": config.basket_mode,
@@ -603,21 +743,65 @@ def run_period_backtest(config: PeriodBacktestConfig) -> PeriodBacktestResult:
     radar_client = BorsapyMarketDataClient()
     symbol_histories: dict[str, pd.DataFrame] = {}
     for symbol in sorted(set(signals["symbol"].dropna().astype(str).tolist())):
-        history = radar_client.load_history(
-            symbol,
-            lookback_days=config.lookback_days,
-            db_path=config.db_path,
-            force=config.force_refresh,
-        )
+        try:
+            history = radar_client.load_history(
+                symbol,
+                lookback_days=config.lookback_days,
+                db_path=config.db_path,
+                force=config.force_refresh,
+                cache_only=config.cache_only,
+            )
+        except TypeError:
+            history = radar_client.load_history(
+                symbol,
+                lookback_days=config.lookback_days,
+                db_path=config.db_path,
+                force=config.force_refresh,
+            )
         symbol_histories[symbol] = _normalize_history(history)
-    benchmark_history = _normalize_history(
-        radar_client.load_history(
-            normalize_bist_symbol(config.index_symbol) or "XU100",
+    coverage_rows: list[dict[str, Any]] = []
+    for symbol, hist in symbol_histories.items():
+        if hist.empty:
+            coverage_rows.append(
+                {
+                    "symbol": symbol,
+                    "first_date": None,
+                    "last_date": None,
+                    "row_count": 0,
+                    "has_2024_data": False,
+                    "has_2025_data": False,
+                    "has_2026_data": False,
+                }
+            )
+            continue
+        years = set(pd.DatetimeIndex(hist.index).year.tolist())
+        coverage_rows.append(
+            {
+                "symbol": symbol,
+                "first_date": pd.Timestamp(hist.index.min()).date().isoformat(),
+                "last_date": pd.Timestamp(hist.index.max()).date().isoformat(),
+                "row_count": int(len(hist)),
+                "has_2024_data": 2024 in years,
+                "has_2025_data": 2025 in years,
+                "has_2026_data": 2026 in years,
+            }
+        )
+    try:
+        benchmark_loaded = radar_client.load_history(
+            benchmark_symbol,
+            lookback_days=config.lookback_days,
+            db_path=config.db_path,
+            force=config.force_refresh,
+            cache_only=config.cache_only,
+        )
+    except TypeError:
+        benchmark_loaded = radar_client.load_history(
+            benchmark_symbol,
             lookback_days=config.lookback_days,
             db_path=config.db_path,
             force=config.force_refresh,
         )
-    )
+    benchmark_history = _normalize_history(benchmark_loaded)
     if config.as_of_date:
         effective_as_of = pd.Timestamp(_parse_date(config.as_of_date))
     else:
@@ -628,6 +812,8 @@ def run_period_backtest(config: PeriodBacktestConfig) -> PeriodBacktestResult:
 
     holdings_rows: list[dict[str, Any]] = []
     period_rows: list[dict[str, Any]] = []
+    diagnostics_rows: list[dict[str, Any]] = []
+    reason_rows: list[dict[str, Any]] = []
     for idx, window in enumerate(windows):
         period_end_filter = window.period_end
         period_end_display = window.period_end
@@ -644,8 +830,71 @@ def run_period_backtest(config: PeriodBacktestConfig) -> PeriodBacktestResult:
             signals["signal_date"] < pd.Timestamp(period_end_filter)
         )
         scoped = signals.loc[mask].copy()
+        symbols_with_any_price_data = sum(1 for hist in symbol_histories.values() if not hist.empty)
+        symbols_with_required_lookback = 0
+        symbols_with_valid_volume = 0
+        symbols_with_valid_ohlcv = 0
+        for hist in symbol_histories.values():
+            if hist.empty:
+                continue
+            hist_scope = hist.loc[hist.index < pd.Timestamp(period_end_filter)]
+            if len(hist_scope) >= 30:
+                symbols_with_required_lookback += 1
+            if "volume" in hist_scope.columns and pd.to_numeric(hist_scope["volume"], errors="coerce").dropna().shape[0] > 0:
+                symbols_with_valid_volume += 1
+            required_cols = {"open", "high", "low", "close", "volume"}
+            if required_cols.issubset(set(hist_scope.columns)) and len(hist_scope) > 0:
+                symbols_with_valid_ohlcv += 1
+
+        before_spike = int(scoped.loc[scoped["strategy"] == "volume_spike_strict", "symbol"].nunique())
+        if config.active_volume_spike_quality:
+            q_scoped = scoped.loc[(scoped["strategy"] == "volume_spike_strict") & (scoped["filter_passed"] == True)]  # noqa: E712
+            after_quality_symbols = int(q_scoped["symbol"].nunique())
+        else:
+            after_quality_symbols = before_spike
+        diagnostics_rows.append(
+            {
+                "period_start": window.period_start.isoformat(),
+                "period_end": period_end_display.isoformat(),
+                "universe_symbol_count": int(raw.scan_summary.get("universe_symbol_count", 0)),
+                "symbols_with_any_price_data": symbols_with_any_price_data,
+                "symbols_with_required_lookback": symbols_with_required_lookback,
+                "symbols_with_valid_volume": symbols_with_valid_volume,
+                "symbols_with_valid_ohlcv": symbols_with_valid_ohlcv,
+                "symbols_with_volume_spike_strict_before_quality": before_spike,
+                "symbols_after_quality_filter": after_quality_symbols,
+                "filtered_out_count": max(0, before_spike - after_quality_symbols),
+            }
+        )
+        if config.active_volume_spike_quality:
+            failed_set = scoped.loc[(scoped["strategy"] == "volume_spike_strict") & (scoped["filter_passed"] == False)]  # noqa: E712
+            totals = {
+                "failed_rsi_14": 0,
+                "failed_turnover": 0,
+                "failed_avg_turnover_20d": 0,
+                "failed_above_ma20": 0,
+                "failed_return_5d_pct": 0,
+                "failed_return_10d_pct": 0,
+                "failed_strong_close": 0,
+                "failed_missing_metric": 0,
+            }
+            for value in failed_set.get("failed_reasons", pd.Series(dtype=str)).tolist():
+                flags = _reason_flags(str(value))
+                for key, num in flags.items():
+                    totals[key] += num
+            reason_rows.append(
+                {
+                    "period_start": window.period_start.isoformat(),
+                    "period_end": period_end_display.isoformat(),
+                    **totals,
+                }
+            )
         for strategy in strategies:
             strat = scoped.loc[scoped["strategy"] == strategy].copy()
+            before_quality_count = int(len(strat))
+            if config.active_volume_spike_quality and strategy == "volume_spike_strict":
+                strat = strat.loc[strat["filter_passed"] == True].copy()  # noqa: E712
+            after_quality_count = int(len(strat))
             basket = _pick_basket(strat, config.basket_mode)
             if effective_as_of is not None:
                 basket = _add_to_latest_metrics(
@@ -660,9 +909,16 @@ def run_period_backtest(config: PeriodBacktestConfig) -> PeriodBacktestResult:
                         window.period_start,
                         period_end_display,
                         effective_as_of,
+                        universe_symbol,
+                        benchmark_symbol,
+                        int(raw.scan_summary.get("universe_symbol_count", 0)),
                         strategy,
                         config.basket_mode,
                         basket,
+                        quality_filter_enabled=bool(config.active_volume_spike_quality and strategy == "volume_spike_strict"),
+                        quality_config=config,
+                        signal_count_before_quality_filter=before_quality_count,
+                        signal_count_after_quality_filter=after_quality_count,
                     )
                 )
                 continue
@@ -671,6 +927,27 @@ def run_period_backtest(config: PeriodBacktestConfig) -> PeriodBacktestResult:
             export["period_start"] = window.period_start.isoformat()
             export["period_end"] = period_end_display.isoformat()
             export["effective_as_of_date"] = None if effective_as_of is None else effective_as_of.date().isoformat()
+            export["universe"] = universe_symbol
+            export["benchmark"] = benchmark_symbol
+            export["universe_symbol_count"] = int(raw.scan_summary.get("universe_symbol_count", 0))
+            export["benchmark_symbol"] = benchmark_symbol
+            export["quality_filter_enabled"] = bool(config.active_volume_spike_quality and strategy == "volume_spike_strict")
+            export["min_last_turnover_try"] = float(config.min_last_turnover_try)
+            export["min_avg_turnover_20d_try"] = float(config.min_avg_turnover_20d_try)
+            export["max_rsi_14"] = float(config.max_rsi_14)
+            export["max_return_5d_pct"] = float(config.max_return_5d_pct)
+            export["max_return_10d_pct"] = float(config.max_return_10d_pct)
+            export["require_strong_close"] = bool(config.require_strong_close)
+            export["min_close_position"] = float(config.min_close_position)
+            export["signal_count_before_quality_filter"] = before_quality_count
+            export["signal_count_after_quality_filter"] = after_quality_count
+            export["filtered_out_count"] = max(0, before_quality_count - after_quality_count)
+            export["entry_price"] = export.get("entry_close")
+            export["exit_price_15d"] = export.get("exit_15d_close")
+            export["exit_price_30d"] = export.get("exit_30d_close")
+            export["current_price"] = export.get("exit_price_to_current")
+            export["exit_date_15d"] = export.get("exit_15d_date")
+            export["exit_date_30d"] = export.get("exit_30d_date")
             export = export.rename(columns={"volume_ratio_20d": "rvol_20d"})
             holdings_rows.extend(export.to_dict("records"))
 
@@ -679,24 +956,48 @@ def run_period_backtest(config: PeriodBacktestConfig) -> PeriodBacktestResult:
                     window.period_start,
                     period_end_display,
                     effective_as_of,
+                    universe_symbol,
+                    benchmark_symbol,
+                    int(raw.scan_summary.get("universe_symbol_count", 0)),
                     strategy,
                     config.basket_mode,
                     basket,
+                    quality_filter_enabled=bool(config.active_volume_spike_quality and strategy == "volume_spike_strict"),
+                    quality_config=config,
+                    signal_count_before_quality_filter=before_quality_count,
+                    signal_count_after_quality_filter=after_quality_count,
                 )
             )
 
     holdings = pd.DataFrame(holdings_rows)
     period_summary = pd.DataFrame(period_rows)
     stability = _build_stability_summary(period_summary)
+    diagnostics = pd.DataFrame(diagnostics_rows)
+    reason_summary = pd.DataFrame(reason_rows)
+    coverage_summary = pd.DataFrame(coverage_rows)
+    coverage_warning = False
+    if not diagnostics.empty:
+        early = diagnostics.loc[diagnostics["period_start"] < "2026-01-01"].copy()
+        if not early.empty:
+            coverage_warning = bool((early["symbols_with_required_lookback"] < (0.3 * early["universe_symbol_count"])).any())
     return PeriodBacktestResult(
         holdings=holdings,
         period_strategy_summary=period_summary.sort_values(["period_start", "strategy"]) if not period_summary.empty else period_summary,
         strategy_stability_summary=stability,
+        period_diagnostics_summary=diagnostics,
+        quality_filter_reason_summary=reason_summary,
+        data_coverage_summary=coverage_summary,
         run_summary={
             "period_count": len(windows),
             "basket_mode": config.basket_mode,
+            "universe": universe_symbol,
+            "benchmark": benchmark_symbol,
+            "universe_symbol_count": int(raw.scan_summary.get("universe_symbol_count", 0)),
+            "benchmark_symbol": benchmark_symbol,
             "effective_as_of_date": None if effective_as_of is None else effective_as_of.date().isoformat(),
             "entry_convention": "entry_price is signal-day close; 15d/30d exits are trading-day offsets from signal date",
+            "quality_filter_enabled": config.active_volume_spike_quality,
+            "coverage_warning_2024_2025": coverage_warning,
             "period_windows": [asdict(item) for item in windows],
             "scan_summary": raw.scan_summary,
             "failed_symbols": raw.failed_symbols,
@@ -712,13 +1013,31 @@ def write_period_outputs(result: PeriodBacktestResult, config: PeriodBacktestCon
     holdings_path = out_dir / "period_basket_holdings.csv"
     period_summary_path = out_dir / "period_strategy_summary.csv"
     stability_path = out_dir / "strategy_stability_summary.csv"
+    diagnostics_path = out_dir / "period_diagnostics_summary.csv"
+    quality_reason_path = out_dir / "quality_filter_reason_summary.csv"
+    coverage_path = out_dir / "data_coverage_summary.csv"
     config_path = out_dir / "backtest_period_config.json"
 
     holdings_columns = [
         "period_start",
         "period_end",
         "effective_as_of_date",
+        "universe",
+        "benchmark",
+        "universe_symbol_count",
+        "benchmark_symbol",
         "strategy",
+        "quality_filter_enabled",
+        "min_last_turnover_try",
+        "min_avg_turnover_20d_try",
+        "max_rsi_14",
+        "max_return_5d_pct",
+        "max_return_10d_pct",
+        "require_strong_close",
+        "min_close_position",
+        "signal_count_before_quality_filter",
+        "signal_count_after_quality_filter",
+        "filtered_out_count",
         "symbol",
         "signal_date",
         "entry_price",
@@ -740,6 +1059,15 @@ def write_period_outputs(result: PeriodBacktestResult, config: PeriodBacktestCon
         "benchmark_return_to_current",
         "alpha_to_current",
         "beat_xu100_to_current",
+        "turnover",
+        "avg_turnover_20d",
+        "ma20",
+        "rsi_14",
+        "return_5d_pct",
+        "return_10d_pct",
+        "filter_passed",
+        "filter_reasons",
+        "failed_reasons",
         "interest_score",
         "rvol_20d",
         "turnover_ratio_20d",
@@ -754,8 +1082,23 @@ def write_period_outputs(result: PeriodBacktestResult, config: PeriodBacktestCon
         "period_start",
         "period_end",
         "effective_as_of_date",
+        "universe",
+        "benchmark",
+        "universe_symbol_count",
+        "benchmark_symbol",
         "strategy",
         "basket_mode",
+        "quality_filter_enabled",
+        "min_last_turnover_try",
+        "min_avg_turnover_20d_try",
+        "max_rsi_14",
+        "max_return_5d_pct",
+        "max_return_10d_pct",
+        "require_strong_close",
+        "min_close_position",
+        "signal_count_before_quality_filter",
+        "signal_count_after_quality_filter",
+        "filtered_out_count",
         "signal_count",
         "unique_symbol_count",
         "basket_return_15d",
@@ -873,6 +1216,9 @@ def write_period_outputs(result: PeriodBacktestResult, config: PeriodBacktestCon
             stability_df[col] = pd.NA
     stability_df = stability_df[stability_columns]
     stability_df.to_csv(stability_path, index=False)
+    result.period_diagnostics_summary.to_csv(diagnostics_path, index=False)
+    result.quality_filter_reason_summary.to_csv(quality_reason_path, index=False)
+    result.data_coverage_summary.to_csv(coverage_path, index=False)
 
     config_path.write_text(
         json.dumps(
@@ -890,5 +1236,8 @@ def write_period_outputs(result: PeriodBacktestResult, config: PeriodBacktestCon
         "period_strategy_summary.csv": str(period_summary_path),
         "period_basket_holdings.csv": str(holdings_path),
         "strategy_stability_summary.csv": str(stability_path),
+        "period_diagnostics_summary.csv": str(diagnostics_path),
+        "quality_filter_reason_summary.csv": str(quality_reason_path),
+        "data_coverage_summary.csv": str(coverage_path),
         "backtest_period_config.json": str(config_path),
     }

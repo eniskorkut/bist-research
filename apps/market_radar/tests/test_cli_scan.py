@@ -99,3 +99,30 @@ def test_cli_parses_scan_mode_and_moneyflow_flags() -> None:
     assert args.require_obv_slope_20d is True
     assert args.min_cmf_20 == 0.02
     assert args.min_accumulation_score == 55.0
+
+
+def test_cli_parses_active_quality_flags() -> None:
+    parse_args = _load_parse_args()
+    args = parse_args(
+        [
+            "--active-volume-spike-quality",
+            "--min-last-turnover-try",
+            "12000000",
+            "--min-avg-turnover-20d-try",
+            "13000000",
+            "--max-rsi-14",
+            "77",
+            "--max-return-5d-pct",
+            "30",
+            "--max-return-10d-pct",
+            "50",
+            "--require-strong-close",
+        ]
+    )
+    assert args.active_volume_spike_quality is True
+    assert args.min_last_turnover_try == 12_000_000.0
+    assert args.min_avg_turnover_20d_try == 13_000_000.0
+    assert args.max_rsi_14 == 77.0
+    assert args.max_return_5d_pct == 30.0
+    assert args.max_return_10d_pct == 50.0
+    assert args.require_strong_close is True

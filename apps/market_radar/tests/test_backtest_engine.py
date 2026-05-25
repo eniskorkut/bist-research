@@ -103,7 +103,7 @@ def test_write_outputs(tmp_path: Path) -> None:
             }
         ],
         failed_symbols=[],
-        scan_summary={"index_symbol": "XU100"},
+        scan_summary={"universe": "XUTUM", "benchmark": "XU100"},
     )
     files = write_backtest_outputs(result, cfg)
     for path in files.values():
@@ -112,12 +112,19 @@ def test_write_outputs(tmp_path: Path) -> None:
 
 def test_run_backtest_with_mock_client(monkeypatch, tmp_path: Path) -> None:
     class FakeClient(BorsapyMarketDataClient):
-        def load_history(self, symbol: str, lookback_days: int = 260, *, db_path: str = "", force: bool = False, cache_ttl_minutes: int | None = None) -> pd.DataFrame:  # type: ignore[override]
+        def load_history(self, symbol: str, lookback_days: int = 260, *, db_path: str = "", force: bool = False, cache_ttl_minutes: int | None = None, cache_only: bool = False) -> pd.DataFrame:  # type: ignore[override]
             return _history()
 
-    monkeypatch.setattr("market_radar.backtesting.backtest_engine.load_bist_universe", lambda index_symbol, db_path, force: (["THYAO"], "test"))
+    captured: dict[str, str] = {}
+
+    def _load_universe(index_symbol, db_path, force, cache_only=False):
+        captured["universe"] = index_symbol
+        return ["THYAO"], "test"
+
+    monkeypatch.setattr("market_radar.backtesting.backtest_engine.load_bist_universe", _load_universe)
     cfg = BacktestConfig(
-        index_symbol="XU100",
+        universe_symbol="XUTUM",
+        benchmark_symbol="XU100",
         lookback_days=80,
         strategies=["positive_interest"],
         db_path=str(tmp_path / "radar.sqlite"),
@@ -125,3 +132,51 @@ def test_run_backtest_with_mock_client(monkeypatch, tmp_path: Path) -> None:
     )
     result = run_backtest(cfg, client=FakeClient())
     assert "signal_count" in result.scan_summary
+    assert result.scan_summary["universe"] == "XUTUM"
+    assert result.scan_summary["benchmark"] == "XU100"
+    assert captured["universe"] == "XUTUM"
+
+
+def test_backtest_uses_xu100_as_benchmark_not_universe(monkeypatch, tmp_path: Path) -> None:
+    class FakeClient(BorsapyMarketDataClient):
+        def load_history(self, symbol: str, lookback_days: int = 260, *, db_path: str = "", force: bool = False, cache_ttl_minutes: int | None = None, cache_only: bool = False) -> pd.DataFrame:  # type: ignore[override]
+            frame = _history()
+            if symbol == "XU100":
+                frame["close"] = frame["close"] * 0.5
+            return frame
+
+    monkeypatch.setattr("market_radar.backtesting.backtest_engine.load_bist_universe", lambda index_symbol, db_path, force, cache_only=False: (["THYAO"], "test"))
+    cfg = BacktestConfig(
+        universe_symbol="XUTUM",
+        benchmark_symbol="XU100",
+        lookback_days=80,
+        strategies=["positive_interest"],
+        db_path=str(tmp_path / "radar.sqlite"),
+        output_dir=str(tmp_path / "out"),
+    )
+    result = run_backtest(cfg, client=FakeClient())
+    if result.signals:
+        row = result.signals[0]
+        assert row["benchmark_symbol"] == "XU100"
+        assert row["alpha_15d"] is None or row["alpha_15d"] != row["return_15d"]
+
+
+def test_cache_only_marks_missing_cached_ohlcv(monkeypatch, tmp_path: Path) -> None:
+    class FakeClient(BorsapyMarketDataClient):
+        def load_history(self, symbol: str, lookback_days: int = 260, *, db_path: str = "", force: bool = False, cache_ttl_minutes: int | None = None, cache_only: bool = False) -> pd.DataFrame:  # type: ignore[override]
+            if symbol == "XU100":
+                return _history()
+            return pd.DataFrame()
+
+    monkeypatch.setattr("market_radar.backtesting.backtest_engine.load_bist_universe", lambda index_symbol, db_path, force, cache_only=False: (["THYAO"], "stale_cache"))
+    cfg = BacktestConfig(
+        universe_symbol="XUTUM",
+        benchmark_symbol="XU100",
+        lookback_days=80,
+        strategies=["positive_interest"],
+        db_path=str(tmp_path / "radar.sqlite"),
+        cache_only=True,
+    )
+    result = run_backtest(cfg, client=FakeClient())
+    assert result.scan_summary["failed_symbol_count"] == 1
+    assert result.failed_symbols[0]["error"] == "missing cached OHLCV"

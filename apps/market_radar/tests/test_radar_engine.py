@@ -23,6 +23,7 @@ import market_radar.data_access as data_access
 from market_radar.radar_engine import (
     RadarConfig,
     ScanResult,
+    apply_active_volume_spike_quality_filters,
     apply_scan_mode_presets,
     build_scan_cache_key,
     calculate_accumulation_score,
@@ -207,6 +208,87 @@ def test_filter_evaluation_min_score() -> None:
     assert "min_interest_score" in passed
     assert "min_avg_turnover_try" in passed
     assert not failed or "above_ma50" in failed
+
+
+def _active_quality_metrics() -> dict[str, float | bool]:
+    return {
+        "volume_ratio_20d": 1.8,
+        "turnover_ratio_20d": 1.4,
+        "turnover_try": 25_000_000.0,
+        "avg_turnover_20d": 16_000_000.0,
+        "above_ma20": True,
+        "rsi_14": 68.0,
+        "return_5d_pct": 12.0,
+        "return_10d_pct": 18.0,
+        "close_position": 0.72,
+    }
+
+
+def test_active_volume_spike_quality_passes() -> None:
+    ok, passed, failed = apply_active_volume_spike_quality_filters(_active_quality_metrics(), config=RadarConfig())
+    assert ok is True
+    assert "volume_spike_strict" in passed
+    assert not failed
+
+
+def test_active_volume_spike_quality_rejects_high_rsi() -> None:
+    metrics = _active_quality_metrics()
+    metrics["rsi_14"] = 80.0
+    ok, _passed, failed = apply_active_volume_spike_quality_filters(metrics, config=RadarConfig())
+    assert ok is False
+    assert "max_rsi_14" in failed
+
+
+def test_active_volume_spike_quality_rejects_below_ma20() -> None:
+    metrics = _active_quality_metrics()
+    metrics["above_ma20"] = False
+    ok, _passed, failed = apply_active_volume_spike_quality_filters(metrics, config=RadarConfig())
+    assert ok is False
+    assert "above_ma20" in failed
+
+
+def test_active_volume_spike_quality_rejects_low_turnover() -> None:
+    metrics = _active_quality_metrics()
+    metrics["turnover_try"] = 2_000_000.0
+    ok, _passed, failed = apply_active_volume_spike_quality_filters(metrics, config=RadarConfig())
+    assert ok is False
+    assert "min_last_turnover_try" in failed
+
+
+def test_active_volume_spike_quality_rejects_5d_overheat() -> None:
+    metrics = _active_quality_metrics()
+    metrics["return_5d_pct"] = 40.0
+    ok, _passed, failed = apply_active_volume_spike_quality_filters(metrics, config=RadarConfig())
+    assert ok is False
+    assert "max_return_5d_pct" in failed
+
+
+def test_active_volume_spike_quality_rejects_10d_overheat() -> None:
+    metrics = _active_quality_metrics()
+    metrics["return_10d_pct"] = 65.0
+    ok, _passed, failed = apply_active_volume_spike_quality_filters(metrics, config=RadarConfig())
+    assert ok is False
+    assert "max_return_10d_pct" in failed
+
+
+def test_active_volume_spike_quality_rejects_weak_close_when_required() -> None:
+    metrics = _active_quality_metrics()
+    metrics["close_position"] = 0.3
+    ok, _passed, failed = apply_active_volume_spike_quality_filters(metrics, config=RadarConfig(require_strong_close=True))
+    assert ok is False
+    assert "strong_close" in failed
+
+
+def test_active_volume_spike_quality_does_not_require_positive_5d_or_10d() -> None:
+    metrics = _active_quality_metrics()
+    metrics["return_5d_pct"] = -4.0
+    metrics["return_10d_pct"] = -6.0
+    ok, passed, failed = apply_active_volume_spike_quality_filters(metrics, config=RadarConfig())
+    assert ok is True
+    assert "max_return_5d_pct" in passed
+    assert "max_return_10d_pct" in passed
+    assert "max_return_5d_pct" not in failed
+    assert "max_return_10d_pct" not in failed
 
 
 # ========= Universe cache tests =========

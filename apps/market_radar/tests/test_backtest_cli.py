@@ -13,8 +13,11 @@ def _load_parse_args():
 
 def test_cli_parses_strategies_and_workers() -> None:
     parse_args = _load_parse_args()
-    args = parse_args(["--index", "XU100", "--strategies", "all", "--max-workers", "8", "--cooldown-days", "0"])
-    assert args.index == "XU100"
+    args = parse_args(
+        ["--universe", "XUTUM", "--benchmark", "XU100", "--strategies", "all", "--max-workers", "8", "--cooldown-days", "0"]
+    )
+    assert args.universe == "XUTUM"
+    assert args.benchmark == "XU100"
     assert args.strategies == ["all"]
     assert args.max_workers == 8
     assert args.cooldown_days == 0

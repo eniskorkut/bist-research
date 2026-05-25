@@ -36,6 +36,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-daily-return-pct", type=float, default=2.0)
     parser.add_argument("--max-price-range-pct", type=float, default=5.0)
     parser.add_argument("--min-accumulation-score", type=float, default=50.0)
+    parser.add_argument("--active-volume-spike-quality", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--min-last-turnover-try", type=float, default=10_000_000.0)
+    parser.add_argument("--min-avg-turnover-20d-try", type=float, default=10_000_000.0)
+    parser.add_argument("--max-rsi-14", type=float, default=78.0)
+    parser.add_argument("--max-return-5d-pct", type=float, default=35.0)
+    parser.add_argument("--max-return-10d-pct", type=float, default=60.0)
+    parser.add_argument("--require-strong-close", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--include-negative-moves", action="store_true")
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--max-workers", type=int, default=8)
@@ -94,6 +101,13 @@ def main() -> None:
         max_price_range_pct=args.max_price_range_pct,
         min_accumulation_score_active=args.scan_mode in {"positive_money_flow", "silent_accumulation", "strong_momentum"},
         min_accumulation_score=args.min_accumulation_score,
+        active_volume_spike_quality_active=args.active_volume_spike_quality,
+        min_last_turnover_try=args.min_last_turnover_try,
+        min_avg_turnover_20d_try=args.min_avg_turnover_20d_try,
+        max_rsi_14=args.max_rsi_14,
+        max_return_5d_pct=args.max_return_5d_pct,
+        max_return_10d_pct=args.max_return_10d_pct,
+        require_strong_close=args.require_strong_close,
         min_interest_score_active=args.require_min_score,
         min_interest_score=args.min_score,
         include_negative_moves=args.include_negative_moves,

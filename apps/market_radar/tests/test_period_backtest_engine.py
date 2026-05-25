@@ -134,6 +134,8 @@ def test_first_signal_per_symbol_and_metrics(monkeypatch) -> None:
         period_starts=["2026-01-01"],
         strategies=["positive_interest"],
         basket_mode="first_signal_per_symbol",
+        universe_symbol="XUTUM",
+        benchmark_symbol="XU100",
     )
     result = run_period_backtest(cfg)
     holdings = result.holdings
@@ -142,6 +144,9 @@ def test_first_signal_per_symbol_and_metrics(monkeypatch) -> None:
     summary = result.period_strategy_summary.iloc[0]
     assert summary["signal_count"] == 2
     assert summary["unique_symbol_count"] == 2
+    assert summary["universe"] == "XUTUM"
+    assert summary["benchmark"] == "XU100"
+    assert summary["benchmark_symbol"] == "XU100"
     assert summary["basket_alpha_15d"] == summary["basket_return_15d"] - summary["benchmark_return_15d"]
     assert 0 <= int(summary["valid_return_30d_count"]) <= int(summary["signal_count"])
     assert "return_to_current" in holdings.columns
@@ -160,6 +165,8 @@ def test_signal_weighted_keeps_repeats(monkeypatch) -> None:
         period_starts=["2026-01-01"],
         strategies=["positive_interest"],
         basket_mode="signal_weighted",
+        universe_symbol="XUTUM",
+        benchmark_symbol="XU100",
     )
     result = run_period_backtest(cfg)
     assert len(result.holdings) == 3
@@ -177,6 +184,8 @@ def test_write_period_outputs(tmp_path: Path, monkeypatch) -> None:
         period_starts=["2026-01-01"],
         strategies=["positive_interest"],
         output_dir=str(tmp_path),
+        universe_symbol="XUTUM",
+        benchmark_symbol="XU100",
     )
     result = run_period_backtest(cfg)
     files = write_period_outputs(result, cfg)
@@ -188,6 +197,9 @@ def test_write_period_outputs(tmp_path: Path, monkeypatch) -> None:
     assert "trimmed_mean_alpha_to_current" in period.columns
     assert "effective_as_of_date" in period.columns
     assert "basket_return_to_current" in period.columns
+    assert "universe" in period.columns
+    assert "benchmark" in period.columns
+    assert "benchmark_symbol" in period.columns
     stability = pd.read_csv(files["strategy_stability_summary.csv"])
     assert "consistency_score" in stability.columns
     assert "beat_period_rate_to_current" in stability.columns
@@ -290,3 +302,132 @@ def test_alpha_to_current_negative_when_benchmark_stronger(monkeypatch) -> None:
     result = run_period_backtest(cfg)
     row = result.period_strategy_summary.iloc[0]
     assert row["avg_alpha_to_current"] < 0
+
+
+def test_period_backtest_uses_universe_and_benchmark_separately(monkeypatch) -> None:
+    fake = BacktestResult(signals=_signals(), failed_symbols=[], scan_summary={"universe_symbol_count": 42})
+    captured: dict[str, object] = {}
+
+    def _fake_run_backtest(cfg):
+        captured["universe_symbol"] = cfg.universe_symbol
+        captured["benchmark_symbol"] = cfg.benchmark_symbol
+        return fake
+
+    monkeypatch.setattr("market_radar.backtesting.period_backtest_engine.run_backtest", _fake_run_backtest)
+
+    def _hist_variant(self, symbol, lookback_days=260, db_path="", force=False):
+        idx = pd.date_range("2025-01-01", periods=900, freq="B")
+        base = pd.Series(range(len(idx)), index=idx).astype(float)
+        if symbol == "XU100":
+            close = 100 + (base * 0.5)
+        else:
+            close = 100 + base
+        return pd.DataFrame({"open": close, "high": close + 1, "low": close - 1, "close": close, "volume": 1000}, index=idx)
+
+    monkeypatch.setattr(
+        "market_radar.backtesting.period_backtest_engine.BorsapyMarketDataClient.load_history",
+        _hist_variant,
+    )
+    cfg = PeriodBacktestConfig(
+        period_starts=["2026-01-01"],
+        strategies=["positive_interest"],
+        universe_symbol="XUTUM",
+        benchmark_symbol="XU100",
+    )
+    result = run_period_backtest(cfg)
+    row = result.period_strategy_summary.iloc[0]
+    assert captured["universe_symbol"] == "XUTUM"
+    assert captured["benchmark_symbol"] == "XU100"
+    assert row["universe"] == "XUTUM"
+    assert row["benchmark"] == "XU100"
+    assert row["benchmark_symbol"] == "XU100"
+    assert row["universe_symbol_count"] == 42
+
+
+def test_quality_filter_reduces_volume_spike_signals(monkeypatch) -> None:
+    signals = [
+        {
+            "symbol": "AAA",
+            "strategy": "volume_spike_strict",
+            "signal_date": "2026-01-05",
+            "entry_date": "2026-01-06",
+            "entry_close": 10.0,
+            "exit_15d_date": "2026-01-26",
+            "exit_15d_close": 10.5,
+            "return_15d": 5.0,
+            "benchmark_return_15d": 2.0,
+            "alpha_15d": 3.0,
+            "beat_xu100_15d": True,
+            "exit_30d_date": "2026-02-16",
+            "exit_30d_close": 11.0,
+            "return_30d": 10.0,
+            "benchmark_return_30d": 3.0,
+            "alpha_30d": 7.0,
+            "beat_xu100_30d": True,
+            "interest_score": 70.0,
+            "volume_ratio_20d": 2.0,
+            "turnover_ratio_20d": 1.5,
+            "turnover": 20_000_000.0,
+            "avg_turnover_20d": 15_000_000.0,
+            "close_position": 0.7,
+            "daily_return_pct": 2.0,
+            "ma20": 9.0,
+            "above_ma20": True,
+            "above_ma50": True,
+            "rsi_14": 65.0,
+            "return_5d_pct": 10.0,
+            "return_10d_pct": 15.0,
+        },
+        {
+            "symbol": "BBB",
+            "strategy": "volume_spike_strict",
+            "signal_date": "2026-01-07",
+            "entry_date": "2026-01-08",
+            "entry_close": 20.0,
+            "exit_15d_date": "2026-01-28",
+            "exit_15d_close": 20.2,
+            "return_15d": 1.0,
+            "benchmark_return_15d": 2.0,
+            "alpha_15d": -1.0,
+            "beat_xu100_15d": False,
+            "exit_30d_date": "2026-02-18",
+            "exit_30d_close": 20.1,
+            "return_30d": 0.5,
+            "benchmark_return_30d": 3.0,
+            "alpha_30d": -2.5,
+            "beat_xu100_30d": False,
+            "interest_score": 60.0,
+            "volume_ratio_20d": 2.2,
+            "turnover_ratio_20d": 1.6,
+            "turnover": 25_000_000.0,
+            "avg_turnover_20d": 16_000_000.0,
+            "close_position": 0.7,
+            "daily_return_pct": 1.5,
+            "ma20": 19.0,
+            "above_ma20": True,
+            "above_ma50": True,
+            "rsi_14": 82.0,
+            "return_5d_pct": 8.0,
+            "return_10d_pct": 12.0,
+        },
+    ]
+    fake = BacktestResult(signals=signals, failed_symbols=[], scan_summary={"universe_symbol_count": 2})
+    monkeypatch.setattr("market_radar.backtesting.period_backtest_engine.run_backtest", lambda cfg: fake)
+    monkeypatch.setattr(
+        "market_radar.backtesting.period_backtest_engine.BorsapyMarketDataClient.load_history",
+        lambda self, symbol, lookback_days=260, db_path="", force=False: _hist(),
+    )
+
+    cfg = PeriodBacktestConfig(
+        period_starts=["2026-01-01"],
+        strategies=["volume_spike_strict"],
+        active_volume_spike_quality=True,
+        universe_symbol="XUTUM",
+        benchmark_symbol="XU100",
+    )
+    result = run_period_backtest(cfg)
+    row = result.period_strategy_summary.iloc[0]
+    assert row["signal_count_before_quality_filter"] == 2
+    assert row["signal_count_after_quality_filter"] == 1
+    assert row["filtered_out_count"] == 1
+    assert bool(row["quality_filter_enabled"]) is True
