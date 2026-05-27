@@ -266,6 +266,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--require-strong-close", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--min-close-position", type=float, default=0.60)
     parser.add_argument("--min-above-ma20-ratio", type=float, default=1.0)
+    parser.add_argument("--transaction-cost-pct", type=float, default=0.0)
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--baseline-comparison", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--checkpoint-each-period", action=argparse.BooleanOptionalAction, default=True)
@@ -330,6 +331,7 @@ def _build_config(args: argparse.Namespace, period_start: str, period_end: str |
         require_strong_close=args.require_strong_close,
         min_close_position=args.min_close_position,
         min_above_ma20_ratio=args.min_above_ma20_ratio,
+        transaction_cost_pct=args.transaction_cost_pct,
         cache_only=bool(args.cache_only),
         max_symbols=args.max_symbols,
         only_symbols=only_symbols or None,

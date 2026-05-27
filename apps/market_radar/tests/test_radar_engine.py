@@ -424,6 +424,50 @@ def test_scan_empty_failed_symbols_on_success(tmp_path: Path) -> None:
     assert "stale_data_count" in scan.scan_summary
 
 
+def test_scan_adds_production_scores_and_rank_fields(tmp_path: Path) -> None:
+    db = str(tmp_path / "radar.sqlite")
+    init_db(db)
+
+    class FakeClient:
+        def load_history(
+            self,
+            symbol: str,
+            lookback_days: int = 260,
+            *,
+            db_path: str = "",
+            force: bool = False,
+            cache_ttl_minutes: int | None = None,
+        ) -> pd.DataFrame:
+            frame = _history_frame().copy()
+            if symbol == "AAA":
+                frame.iloc[-1, frame.columns.get_loc("volume")] = frame.iloc[-1]["volume"] * 4
+            return frame
+
+    cfg = RadarConfig(
+        include_negative_moves=True,
+        min_interest_score_active=False,
+        db_path=db,
+    )
+    scan = scan_symbols(["AAA", "BBB", "CCC"], config=cfg, client=FakeClient())
+    assert "default_filter_config" in scan.scan_summary
+    assert scan.scan_summary["default_filter_config"] == "relaxed_strong_close"
+    assert scan.scan_summary["ranking_score"] == "liquidity_safe_score"
+    assert "regime_label" in scan.scan_summary
+    assert "xu100_return_20d_pct" in scan.scan_summary
+    assert "market_supportive" in scan.scan_summary
+    assert "ranked_result_count" in scan.scan_summary
+    if scan.results:
+        top = scan.results[0]
+        assert top.balanced_score is not None
+        assert top.momentum_quality_score is not None
+        assert top.liquidity_safe_score is not None
+        assert top.production_score == top.liquidity_safe_score
+        assert top.production_rank is not None
+        assert top.score_bucket in {"top20", "top30", "top50", "top75", "watchlist"}
+        assert top.regime_label in {"Bull", "WeakOrNeutral"}
+        assert top.market_supportive in {True, False}
+
+
 def test_save_radar_results_bulk_writes_multiple_rows(tmp_path: Path) -> None:
     db = str(tmp_path / "radar.sqlite")
     init_db(db)

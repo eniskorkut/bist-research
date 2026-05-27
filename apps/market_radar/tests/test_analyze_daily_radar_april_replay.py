@@ -191,6 +191,125 @@ def test_expected_trading_day_stale_reasons_and_fingerprint_vs_prev_trading_day(
     db_path.unlink()
 
 
+def test_signal_date_change_only_keeps_value_fingerprint_same() -> None:
+    m = _load_module()
+    rows = [
+        _make_row(
+            "AAA",
+            "2026-04-22",
+            close=11.0,
+            turnover=55_000_000.0,
+            avg_turnover_20d=70_000_000.0,
+            volume_ratio_20d=2.8,
+            turnover_ratio_20d=2.0,
+            rsi_14=60.0,
+            return_5d_pct=11.0,
+            return_10d_pct=19.0,
+            close_position=0.82,
+        ),
+        _make_row(
+            "AAA",
+            "2026-04-24",
+            close=11.0,
+            turnover=55_000_000.0,
+            avg_turnover_20d=70_000_000.0,
+            volume_ratio_20d=2.8,
+            turnover_ratio_20d=2.0,
+            rsi_14=60.0,
+            return_5d_pct=11.0,
+            return_10d_pct=19.0,
+            close_position=0.82,
+        ),
+    ]
+    features = m._prepare_base_features_from_df(pd.DataFrame(rows))
+    daily_all, summary_df, _lifecycle_df, _perf_df, _audit_df = m.build_april_replay(
+        features,
+        "2026-04-22",
+        "2026-04-24",
+        db_path="missing.sqlite",
+    )
+
+    day22 = daily_all.loc[daily_all["as_of_date"] == "2026-04-22"].iloc[0]
+    day24 = daily_all.loc[daily_all["as_of_date"] == "2026-04-24"].iloc[0]
+    assert day22["data_fingerprint"] != day24["data_fingerprint"]
+    assert day22["value_fingerprint"] == day24["value_fingerprint"]
+
+    sum24 = summary_df.loc[summary_df["as_of_date"] == "2026-04-24"].iloc[0]
+    assert bool(sum24["same_value_fingerprint_as_prev_trading_day"]) is True
+    assert bool(sum24["same_data_fingerprint_as_prev_trading_day"]) is False
+    assert bool(sum24["same_data_but_signal_date_changed_warning"]) is True
+    assert "value_fingerprint_same_but_data_fingerprint_changed" in str(sum24["same_data_but_signal_date_changed_reason"])
+
+
+def test_value_change_updates_value_fingerprint_and_rank_change_does_not() -> None:
+    m = _load_module()
+    rows = [
+        _make_row(
+            "AAA",
+            "2026-04-22",
+            close=11.0,
+            turnover=55_000_000.0,
+            avg_turnover_20d=70_000_000.0,
+            volume_ratio_20d=2.8,
+            turnover_ratio_20d=2.0,
+            rsi_14=60.0,
+            return_5d_pct=11.0,
+            return_10d_pct=19.0,
+            close_position=0.82,
+        ),
+        _make_row(
+            "BBB",
+            "2026-04-22",
+            close=12.0,
+            turnover=58_000_000.0,
+            avg_turnover_20d=75_000_000.0,
+            volume_ratio_20d=2.9,
+            turnover_ratio_20d=2.1,
+            rsi_14=61.0,
+            return_5d_pct=10.0,
+            return_10d_pct=18.0,
+            close_position=0.83,
+        ),
+        _make_row(
+            "AAA",
+            "2026-04-24",
+            close=11.5,
+            turnover=55_000_000.0,
+            avg_turnover_20d=70_000_000.0,
+            volume_ratio_20d=2.8,
+            turnover_ratio_20d=2.0,
+            rsi_14=60.0,
+            return_5d_pct=11.0,
+            return_10d_pct=19.0,
+            close_position=0.82,
+        ),
+        _make_row(
+            "BBB",
+            "2026-04-24",
+            close=12.0,
+            turnover=58_000_000.0,
+            avg_turnover_20d=75_000_000.0,
+            volume_ratio_20d=2.9,
+            turnover_ratio_20d=2.1,
+            rsi_14=61.0,
+            return_5d_pct=10.0,
+            return_10d_pct=18.0,
+            close_position=0.83,
+        ),
+    ]
+    features = m._prepare_base_features_from_df(pd.DataFrame(rows))
+    daily_all, summary_df, _lifecycle_df, _perf_df, _audit_df = m.build_april_replay(
+        features,
+        "2026-04-22",
+        "2026-04-24",
+        db_path="missing.sqlite",
+    )
+    sum24 = summary_df.loc[summary_df["as_of_date"] == "2026-04-24"].iloc[0]
+    assert bool(sum24["same_value_fingerprint_as_prev_trading_day"]) is False
+    assert int(sum24["changed_value_symbol_count_vs_prev_trading_day"]) >= 1
+    assert float(sum24["changed_value_symbol_ratio_vs_prev_trading_day"]) > 0
+
+
 def test_exclude_stale_performance_drops_expected_trading_day_stale_rows(tmp_path: Path) -> None:
     m = _load_module()
     rows = [

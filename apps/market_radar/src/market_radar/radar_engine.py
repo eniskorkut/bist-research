@@ -32,6 +32,80 @@ def _safe_float(value: Any) -> float | None:
     return parsed
 
 
+def _clip_0_100(value: float | None) -> float:
+    if value is None or pd.isna(value):
+        return 0.0
+    return float(max(0.0, min(100.0, value)))
+
+
+def compute_production_scores(metrics: dict[str, Any], regime_context: dict[str, Any] | None = None) -> dict[str, float]:
+    volume_ratio = _safe_float(metrics.get("volume_ratio_20d")) or 0.0
+    turnover_ratio = _safe_float(metrics.get("turnover_ratio_20d")) or 0.0
+    avg_turnover = _safe_float(metrics.get("avg_turnover_20d")) or 0.0
+    turnover_try = _safe_float(metrics.get("turnover_try")) or 0.0
+    close_position = _safe_float(metrics.get("close_position")) or 0.0
+    rsi_14 = _safe_float(metrics.get("rsi_14"))
+    return_5d = _safe_float(metrics.get("return_5d_pct")) or 0.0
+    return_10d = _safe_float(metrics.get("return_10d_pct")) or 0.0
+    close = _safe_float(metrics.get("close"))
+    ma20 = _safe_float(metrics.get("ma20"))
+
+    volume_spike_score = _clip_0_100((volume_ratio / 3.0) * 100.0 * 0.5 + (turnover_ratio / 2.5) * 100.0 * 0.5)
+    liquidity_score = _clip_0_100(
+        min(avg_turnover / 50_000_000.0, 1.0) * 70.0 + min(turnover_try / 50_000_000.0, 1.0) * 30.0
+    )
+    close_position_score = _clip_0_100(close_position * 100.0)
+
+    trend_quality_score = 0.0
+    if close is not None and ma20 not in (None, 0):
+        ratio = close / ma20
+        trend_quality_score = _clip_0_100(((ratio - 0.95) / 0.10) * 100.0)
+
+    rsi_safety_score = 60.0
+    if rsi_14 is not None:
+        rsi_safety_score = _clip_0_100(100.0 - abs(rsi_14 - 62.0) * 3.0)
+
+    overextension_penalty = _clip_0_100(max(0.0, return_5d - 12.0) * 2.0 + max(0.0, return_10d - 20.0) * 1.3)
+
+    regime_bonus = 0.0
+    if regime_context and bool(regime_context.get("market_supportive", False)):
+        regime_bonus = 3.0
+
+    balanced = _clip_0_100(
+        0.24 * volume_spike_score
+        + 0.20 * liquidity_score
+        + 0.18 * close_position_score
+        + 0.20 * trend_quality_score
+        + 0.18 * rsi_safety_score
+        - 0.12 * overextension_penalty
+        + regime_bonus
+    )
+    momentum_quality = _clip_0_100(
+        0.32 * volume_spike_score
+        + 0.12 * liquidity_score
+        + 0.22 * close_position_score
+        + 0.24 * trend_quality_score
+        + 0.10 * rsi_safety_score
+        - 0.18 * overextension_penalty
+        + regime_bonus
+    )
+    liquidity_safe = _clip_0_100(
+        0.12 * volume_spike_score
+        + 0.34 * liquidity_score
+        + 0.12 * close_position_score
+        + 0.12 * trend_quality_score
+        + 0.30 * rsi_safety_score
+        - 0.18 * overextension_penalty
+        + regime_bonus
+    )
+    return {
+        "balanced_score": balanced,
+        "momentum_quality_score": momentum_quality,
+        "liquidity_safe_score": liquidity_safe,
+        "production_score": liquidity_safe,
+    }
+
+
 @dataclass
 class RadarConfig:
     scan_mode: str = "positive_money_flow"
@@ -150,6 +224,15 @@ class RadarResult:
     ohlcv_cache_status: str = "missing"
     selected_config: str | None = None
     freshness_warning: bool = False
+    balanced_score: float | None = None
+    momentum_quality_score: float | None = None
+    liquidity_safe_score: float | None = None
+    production_score: float | None = None
+    production_rank: int | None = None
+    score_bucket: str | None = None
+    regime_label: str | None = None
+    xu100_return_20d_pct: float | None = None
+    market_supportive: bool | None = None
 
     def to_row(self) -> dict[str, Any]:
         return {
@@ -185,6 +268,15 @@ class RadarResult:
             "OHLCV Cache Status": self.ohlcv_cache_status,
             "OHLCV Fetched At": self.ohlcv_cache_fetched_at,
             "Freshness Warning": self.freshness_warning,
+            "Balanced Score": self.balanced_score,
+            "Momentum Quality Score": self.momentum_quality_score,
+            "Liquidity Safe Score": self.liquidity_safe_score,
+            "Production Score": self.production_score,
+            "Production Rank": self.production_rank,
+            "Score Bucket": self.score_bucket,
+            "Regime Label": self.regime_label,
+            "XU100 Return 20D %": self.xu100_return_20d_pct,
+            "Market Supportive": self.market_supportive,
             "Filter Passed": self.filter_passed,
             "Filter Reasons": ", ".join(self.filter_reasons),
             "Failed Reasons": ", ".join(self.failed_reasons),
@@ -994,6 +1086,15 @@ def _result_from_cache_row(row: dict[str, Any]) -> RadarResult:
     row.setdefault("filter_reasons", [])
     row.setdefault("failed_reasons", [])
     row.setdefault("selected_config", None)
+    row.setdefault("balanced_score", None)
+    row.setdefault("momentum_quality_score", None)
+    row.setdefault("liquidity_safe_score", None)
+    row.setdefault("production_score", None)
+    row.setdefault("production_rank", None)
+    row.setdefault("score_bucket", None)
+    row.setdefault("regime_label", None)
+    row.setdefault("xu100_return_20d_pct", None)
+    row.setdefault("market_supportive", None)
     return RadarResult(**row)
 
 
@@ -1111,20 +1212,16 @@ def scan_symbols(
         cache_ttl_minutes=ohlcv_ttl,
     )
 
-    # Regime-aware config selection
+    # Regime diagnostic only. Filter config is fixed to relaxed_strong_close.
     regime_detector = MarketRegimeDetector(db_path=config.db_path)
     regime_detector._xu100_df = regime_detector.load_xu100_data(client=client)
     latest_date_str = str(benchmark.index.max())[:10] if not benchmark.empty else datetime.now().date().isoformat()
     regime_info = regime_detector.detect_regime(latest_date_str, client=client)
-
-    if regime_info["return_20d_pct"] > 1.5:
-        selected_config_name = "current_config"
-        min_close_pos = 0.60
-    else:
-        selected_config_name = "relaxed_strong_close"
-        min_close_pos = 0.50
-
-    config = replace(config, min_close_position=min_close_pos)
+    xu100_20d = _safe_float(regime_info.get("return_20d_pct")) or 0.0
+    market_supportive = xu100_20d > 1.0
+    regime_label = "Bull" if market_supportive else "WeakOrNeutral"
+    selected_config_name = "relaxed_strong_close"
+    config = replace(config, min_close_position=0.50, require_strong_close=True)
 
     all_results: list[RadarResult] = []
     failed_symbols: list[dict[str, str]] = []
@@ -1172,6 +1269,14 @@ def scan_symbols(
             result = evaluate_symbol(symbol, history, benchmark, config=config, history_meta=history_meta)
             if result is not None:
                 result.selected_config = selected_config_name
+                result.regime_label = regime_label
+                result.xu100_return_20d_pct = xu100_20d
+                result.market_supportive = market_supportive
+                scores = compute_production_scores(result.raw_metrics, {"market_supportive": market_supportive})
+                result.balanced_score = scores["balanced_score"]
+                result.momentum_quality_score = scores["momentum_quality_score"]
+                result.liquidity_safe_score = scores["liquidity_safe_score"]
+                result.production_score = scores["production_score"]
             return symbol, result, None
         except Exception as exc:  # noqa: BLE001
             return symbol, None, str(exc)
@@ -1207,8 +1312,28 @@ def scan_symbols(
                     pass
 
     save_radar_results_bulk(config.db_path, saved_rows)
-    passed = sorted((item for item in all_results if _passes_result(item)), key=lambda item: item.interest_score, reverse=True)
-    all_results = sorted(all_results, key=lambda item: item.interest_score, reverse=True)
+    passed = sorted(
+        (item for item in all_results if _passes_result(item)),
+        key=lambda item: (item.liquidity_safe_score if item.liquidity_safe_score is not None else -1e9, item.interest_score),
+        reverse=True,
+    )
+    for idx, item in enumerate(passed, start=1):
+        item.production_rank = idx
+        if idx <= 20:
+            item.score_bucket = "top20"
+        elif idx <= 30:
+            item.score_bucket = "top30"
+        elif idx <= 50:
+            item.score_bucket = "top50"
+        elif idx <= 75:
+            item.score_bucket = "top75"
+        else:
+            item.score_bucket = "watchlist"
+    all_results = sorted(
+        all_results,
+        key=lambda item: (item.liquidity_safe_score if item.liquidity_safe_score is not None else -1e9, item.interest_score),
+        reverse=True,
+    )
     elapsed_seconds = round(time.perf_counter() - started_at, 3)
 
     scan_summary = {
@@ -1230,8 +1355,12 @@ def scan_symbols(
         "scanned_fresh_data_count": 0,
         "result_stale_data_count": 0,
         "result_fresh_data_count": 0,
-        "regime_label": regime_info["regime_label"],
-        "xu100_return_20d_pct": regime_info["return_20d_pct"],
+        "default_filter_config": "relaxed_strong_close",
+        "ranking_score": "liquidity_safe_score",
+        "regime_label": regime_label,
+        "xu100_return_20d_pct": xu100_20d,
+        "market_supportive": market_supportive,
+        "ranked_result_count": len(passed),
         "xu100_close": regime_info["close"],
         "xu100_ma50": regime_info["ma50"],
         "xu100_ma200": regime_info["ma200"],

@@ -2,6 +2,7 @@ from datetime import date
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 from market_radar.backtesting.backtest_engine import BacktestResult
 from market_radar.backtesting.period_backtest_engine import (
@@ -200,6 +201,7 @@ def test_write_period_outputs(tmp_path: Path, monkeypatch) -> None:
         "xu100_ma50",
         "xu100_ma200",
         "selected_config",
+        "transaction_cost_pct",
         "signal_count",
         "basket_return_15d",
         "basket_return_30d",
@@ -223,6 +225,7 @@ def test_write_period_outputs(tmp_path: Path, monkeypatch) -> None:
         "current_net_alpha_30d",
         "relaxed_net_alpha_30d",
         "regime_net_alpha_30d",
+        "transaction_cost_pct",
         "winner_config",
         "regime_minus_current",
         "regime_minus_relaxed",
@@ -238,6 +241,40 @@ def test_write_period_outputs(tmp_path: Path, monkeypatch) -> None:
     assert "low_sample_period_count" in stability.columns
     assert "active_period_count" in stability.columns
     assert "empty_period_count" in stability.columns
+
+
+def test_transaction_cost_pct_030_matches_legacy_net(monkeypatch) -> None:
+    fake = BacktestResult(signals=_signals(), failed_symbols=[], scan_summary={})
+    monkeypatch.setattr("market_radar.backtesting.period_backtest_engine.run_backtest", lambda cfg: fake)
+    monkeypatch.setattr(
+        "market_radar.backtesting.period_backtest_engine.BorsapyMarketDataClient.load_history",
+        lambda self, symbol, lookback_days=260, db_path="", force=False: _hist(),
+    )
+    cfg = PeriodBacktestConfig(
+        period_starts=["2026-01-01"],
+        strategies=["positive_interest"],
+        transaction_cost_pct=0.30,
+    )
+    result = run_period_backtest(cfg)
+    row = result.period_strategy_summary.iloc[0]
+    assert row["net_basket_alpha_30d"] == pytest.approx(row["basket_alpha_30d"] - 0.30, rel=1e-9)
+
+
+def test_transaction_cost_pct_zero_makes_net_equal_gross(monkeypatch) -> None:
+    fake = BacktestResult(signals=_signals(), failed_symbols=[], scan_summary={})
+    monkeypatch.setattr("market_radar.backtesting.period_backtest_engine.run_backtest", lambda cfg: fake)
+    monkeypatch.setattr(
+        "market_radar.backtesting.period_backtest_engine.BorsapyMarketDataClient.load_history",
+        lambda self, symbol, lookback_days=260, db_path="", force=False: _hist(),
+    )
+    cfg = PeriodBacktestConfig(
+        period_starts=["2026-01-01"],
+        strategies=["positive_interest"],
+        transaction_cost_pct=0.0,
+    )
+    result = run_period_backtest(cfg)
+    row = result.period_strategy_summary.iloc[0]
+    assert row["net_basket_alpha_30d"] == pytest.approx(row["basket_alpha_30d"], rel=1e-9)
 
 
 def test_missing_30d_horizon_is_excluded_from_valid_count(monkeypatch) -> None:

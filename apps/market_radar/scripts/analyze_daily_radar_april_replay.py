@@ -29,6 +29,25 @@ FINGERPRINT_FIELDS = [
     "ma20",
     "signal_date",
 ]
+VALUE_FINGERPRINT_FIELDS = [
+    "symbol",
+    "close",
+    "volume",
+    "turnover",
+    "avg_turnover_20d",
+    "volume_ratio_20d",
+    "turnover_ratio_20d",
+    "rsi_14",
+    "return_5d_pct",
+    "return_10d_pct",
+    "close_position",
+    "ma20",
+    "above_ma20",
+    "balanced_score",
+    "momentum_quality_score",
+    "liquidity_safe_score",
+    "special_score",
+]
 PERFORMANCE_WINDOWS = [5, 10, 20]
 
 
@@ -215,6 +234,11 @@ def _row_fingerprint(row: pd.Series) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def _row_value_fingerprint(row: pd.Series) -> str:
+    payload = "|".join(_normalize_fingerprint_value(row.get(field)) for field in VALUE_FINGERPRINT_FIELDS)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def _top_symbols(df: pd.DataFrame, n: int) -> list[str]:
     return df.loc[df["production_rank"] <= n, "symbol"].astype(str).tolist()
 
@@ -223,6 +247,13 @@ def _daily_fingerprint(df: pd.DataFrame) -> str:
     if df.empty:
         return hashlib.sha256(b"").hexdigest()
     payload = "|".join(df.sort_values("symbol")["data_fingerprint"].astype(str).tolist())
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _daily_value_fingerprint(df: pd.DataFrame) -> str:
+    if df.empty:
+        return hashlib.sha256(b"").hexdigest()
+    payload = "|".join(df.sort_values("symbol")["value_fingerprint"].astype(str).tolist())
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
@@ -380,6 +411,7 @@ def build_daily_radar(features: pd.DataFrame, as_of_date: str) -> pd.DataFrame:
 
     details = pd.DataFrame([_special_pass_details(row) for _, row in f.iterrows()], index=f.index)
     f = pd.concat([f, details], axis=1)
+    f["value_fingerprint"] = f.apply(_row_value_fingerprint, axis=1)
     f["as_of_date"] = as_of_date
     f["signal_date"] = f["signal_date"].dt.strftime("%Y-%m-%d")
     return f
@@ -552,6 +584,9 @@ def build_april_replay(
     prev_day_df: pd.DataFrame | None = None
     prev_calendar_fingerprint: str | None = None
     prev_trading_fingerprint: str | None = None
+    prev_calendar_value_fingerprint: str | None = None
+    prev_trading_value_fingerprint: str | None = None
+    prev_trading_value_map: dict[str, str] = {}
     prev_top30: list[str] = []
     prev_loose: list[str] = []
     prev_mid: list[str] = []
@@ -568,6 +603,7 @@ def build_april_replay(
         if not day_df.empty:
             day_df = day_df.copy()
             day_df["daily_data_fingerprint"] = _daily_fingerprint(day_df)
+            day_df["daily_value_fingerprint"] = _daily_value_fingerprint(day_df)
             daily_frames.append(day_df)
 
         top30 = _top_symbols(day_df, 30) if not day_df.empty else []
@@ -593,10 +629,13 @@ def build_april_replay(
                 unique_signal_date_count = int(signal_dates.nunique())
 
         day_fingerprint = _daily_fingerprint(day_df)
+        day_value_fingerprint = _daily_value_fingerprint(day_df)
         same_count = 0
         same_daily_fingerprint = False
         same_prev_calendar = False
         same_prev_trading = False
+        same_value_prev_calendar = False
+        same_value_prev_trading = False
         data_warning = ""
         if prev_day_df is not None and not day_df.empty and not prev_day_df.empty:
             prev_fp = prev_day_df.set_index("symbol")["data_fingerprint"].to_dict()
@@ -606,6 +645,10 @@ def build_april_replay(
             same_prev_calendar = prev_calendar_fingerprint == day_fingerprint
         if prev_trading_fingerprint is not None:
             same_prev_trading = prev_trading_fingerprint == day_fingerprint
+        if prev_calendar_value_fingerprint is not None:
+            same_value_prev_calendar = prev_calendar_value_fingerprint == day_value_fingerprint
+        if prev_trading_value_fingerprint is not None:
+            same_value_prev_trading = prev_trading_value_fingerprint == day_value_fingerprint
         same_daily_fingerprint = same_prev_calendar
 
         special_counts = _summarize_special_counts(day_df) if not day_df.empty else {
@@ -616,11 +659,26 @@ def build_april_replay(
         }
 
         stale_reasons: list[str] = []
+        same_data_but_signal_date_changed_warning = False
+        same_data_but_signal_date_changed_reason = ""
+        same_value_symbol_count = 0
+        changed_value_symbol_count = 0
+        changed_value_symbol_ratio = None
+        if not day_df.empty and prev_trading_value_map:
+            current_value_map = day_df.set_index("symbol")["value_fingerprint"].astype(str).to_dict()
+            common_symbols = sorted(set(current_value_map) & set(prev_trading_value_map))
+            if common_symbols:
+                same_value_symbol_count = sum(1 for s in common_symbols if current_value_map[s] == prev_trading_value_map[s])
+                changed_value_symbol_count = len(common_symbols) - same_value_symbol_count
+                changed_value_symbol_ratio = changed_value_symbol_count / len(common_symbols)
         if is_expected_trading_day:
             if max_signal_date is not None and max_signal_date < as_of_date:
                 stale_reasons.append("max_signal_date_before_as_of")
             if same_prev_trading:
                 stale_reasons.append("same_fingerprint_as_previous_expected_trading_day")
+            if (not same_prev_trading) and same_value_prev_trading:
+                same_data_but_signal_date_changed_warning = True
+                same_data_but_signal_date_changed_reason = "value_fingerprint_same_but_data_fingerprint_changed"
 
         summary_rows.append(
             {
@@ -647,6 +705,14 @@ def build_april_replay(
                 "same_data_fingerprint_as_prev": bool(same_daily_fingerprint),
                 "same_data_fingerprint_as_prev_calendar_day": bool(same_prev_calendar),
                 "same_data_fingerprint_as_prev_trading_day": bool(same_prev_trading),
+                "daily_value_fingerprint": day_value_fingerprint,
+                "same_value_fingerprint_as_prev_calendar_day": bool(same_value_prev_calendar),
+                "same_value_fingerprint_as_prev_trading_day": bool(same_value_prev_trading),
+                "same_data_but_signal_date_changed_warning": bool(same_data_but_signal_date_changed_warning),
+                "same_data_but_signal_date_changed_reason": same_data_but_signal_date_changed_reason,
+                "same_value_symbol_count_vs_prev_trading_day": int(same_value_symbol_count),
+                "changed_value_symbol_count_vs_prev_trading_day": int(changed_value_symbol_count),
+                "changed_value_symbol_ratio_vs_prev_trading_day": changed_value_symbol_ratio,
                 "same_data_symbol_count": int(same_count),
                 "data_warning": data_warning,
                 **special_counts,
@@ -667,8 +733,11 @@ def build_april_replay(
         seen_month_top30.update(top30)
         prev_day_df = day_df
         prev_calendar_fingerprint = day_fingerprint
+        prev_calendar_value_fingerprint = day_value_fingerprint
         if is_expected_trading_day:
             prev_trading_fingerprint = day_fingerprint
+            prev_trading_value_fingerprint = day_value_fingerprint
+            prev_trading_value_map = day_df.set_index("symbol")["value_fingerprint"].astype(str).to_dict() if not day_df.empty else {}
         prev_top30 = top30
         prev_loose = loose_syms
         prev_mid = mid_syms
@@ -712,6 +781,13 @@ def build_april_replay(
                 "stale_data_reason",
                 "same_data_fingerprint_as_prev_trading_day",
                 "same_data_fingerprint_as_prev_calendar_day",
+                "same_value_fingerprint_as_prev_trading_day",
+                "same_value_fingerprint_as_prev_calendar_day",
+                "same_data_but_signal_date_changed_warning",
+                "same_data_but_signal_date_changed_reason",
+                "same_value_symbol_count_vs_prev_trading_day",
+                "changed_value_symbol_count_vs_prev_trading_day",
+                "changed_value_symbol_ratio_vs_prev_trading_day",
                 "max_signal_date",
                 "max_data_latest_date",
             ]
@@ -736,7 +812,14 @@ def build_april_replay(
             "max_data_latest_date",
             "unique_data_latest_date_count",
             "daily_fingerprint",
+            "daily_value_fingerprint",
             "same_data_fingerprint_as_prev_trading_day",
+            "same_value_fingerprint_as_prev_trading_day",
+            "same_data_but_signal_date_changed_warning",
+            "same_data_but_signal_date_changed_reason",
+            "same_value_symbol_count_vs_prev_trading_day",
+            "changed_value_symbol_count_vs_prev_trading_day",
+            "changed_value_symbol_ratio_vs_prev_trading_day",
             "stale_data_warning",
             "stale_data_reason",
         ],
@@ -891,13 +974,22 @@ def main() -> None:
         "special_filter_reasons",
         "special_failed_reasons",
         "data_fingerprint",
+        "value_fingerprint",
         "daily_data_fingerprint",
+        "daily_value_fingerprint",
         "data_latest_date",
         "is_expected_trading_day",
         "stale_data_warning",
         "stale_data_reason",
         "same_data_fingerprint_as_prev_trading_day",
         "same_data_fingerprint_as_prev_calendar_day",
+        "same_value_fingerprint_as_prev_trading_day",
+        "same_value_fingerprint_as_prev_calendar_day",
+        "same_data_but_signal_date_changed_warning",
+        "same_data_but_signal_date_changed_reason",
+        "same_value_symbol_count_vs_prev_trading_day",
+        "changed_value_symbol_count_vs_prev_trading_day",
+        "changed_value_symbol_ratio_vs_prev_trading_day",
         "forward_return_5d_pct",
         "forward_return_10d_pct",
         "forward_return_20d_pct",

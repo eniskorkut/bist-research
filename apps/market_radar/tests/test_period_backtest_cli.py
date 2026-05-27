@@ -115,6 +115,7 @@ def test_parse_quality_filter_args() -> None:
     assert args.require_strong_close is True
     assert args.min_close_position == 0.60
     assert args.min_above_ma20_ratio == 0.98
+    assert args.transaction_cost_pct == 0.0
     assert args.baseline_comparison is False
 
 

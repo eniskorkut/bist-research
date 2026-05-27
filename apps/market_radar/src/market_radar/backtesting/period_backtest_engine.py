@@ -45,6 +45,7 @@ class PeriodBacktestConfig:
     require_strong_close: bool = True
     min_close_position: float = 0.60
     min_above_ma20_ratio: float = 1.0
+    transaction_cost_pct: float = 0.0
     cache_only: bool = False
     max_symbols: int | None = None
     only_symbols: list[str] | None = None
@@ -466,7 +467,7 @@ def _build_period_strategy_summary(
     xu100_ma50: float | None = None,
     xu100_ma200: float | None = None,
     selected_config: str = "current_config",
-    is_decimal: bool = False
+    transaction_cost_pct: float = 0.0,
 ) -> dict[str, Any]:
     signal_count = int(len(basket))
     unique_symbol_count = int(basket["symbol"].nunique()) if not basket.empty else 0
@@ -546,10 +547,7 @@ def _build_period_strategy_summary(
 
     net_basket_alpha_30d = None
     if basket_alpha_30d is not None:
-        if is_decimal:
-            net_basket_alpha_30d = basket_alpha_30d - 0.003
-        else:
-            net_basket_alpha_30d = basket_alpha_30d - 0.30
+        net_basket_alpha_30d = basket_alpha_30d - float(transaction_cost_pct)
 
     return {
         "period": period_start.isoformat(),
@@ -559,6 +557,7 @@ def _build_period_strategy_summary(
         "xu100_ma50": xu100_ma50,
         "xu100_ma200": xu100_ma200,
         "selected_config": selected_config,
+        "transaction_cost_pct": float(transaction_cost_pct),
         "signal_count": signal_count,
         "basket_return_15d": basket_return_15d,
         "basket_return_30d": basket_return_30d,
@@ -800,17 +799,6 @@ def run_period_backtest(config: PeriodBacktestConfig) -> PeriodBacktestResult:
     )
     signals = _prepare_signals_frame(raw.signals)
     
-    is_decimal = False
-    if not signals.empty:
-        max_val = 0.0
-        for col in ["alpha_30d", "return_30d", "return_15d"]:
-            if col in signals.columns:
-                val = float(signals[col].abs().max())
-                if pd.notna(val) and val > max_val:
-                    max_val = val
-        if max_val > 0.0 and max_val <= 1.0:
-            is_decimal = True
-            
     # Quality filter will be applied dynamically inside the loop per period
     if signals.empty:
         empty = pd.DataFrame()
@@ -974,7 +962,7 @@ def run_period_backtest(config: PeriodBacktestConfig) -> PeriodBacktestResult:
         current_net_alpha_30d = None
         relaxed_net_alpha_30d = None
         regime_net_alpha_30d = None
-        cost = 0.003 if is_decimal else 0.30
+        cost = float(config.transaction_cost_pct)
         if current_alpha_30d is not None:
             current_net_alpha_30d = current_alpha_30d - cost
         if relaxed_alpha_30d is not None:
@@ -1036,6 +1024,7 @@ def run_period_backtest(config: PeriodBacktestConfig) -> PeriodBacktestResult:
                 "current_net_alpha_30d": current_net_alpha_30d,
                 "relaxed_net_alpha_30d": relaxed_net_alpha_30d,
                 "regime_net_alpha_30d": regime_net_alpha_30d,
+                "transaction_cost_pct": float(config.transaction_cost_pct),
                 "winner_config": winner,
                 "regime_minus_current": regime_minus_current,
                 "regime_minus_relaxed": regime_minus_relaxed,
@@ -1142,7 +1131,7 @@ def run_period_backtest(config: PeriodBacktestConfig) -> PeriodBacktestResult:
                         xu100_ma50=regime_info["ma50"],
                         xu100_ma200=regime_info["ma200"],
                         selected_config=selected_config_name,
-                        is_decimal=is_decimal,
+                        transaction_cost_pct=float(config.transaction_cost_pct),
                     )
                 )
                 continue
@@ -1198,7 +1187,7 @@ def run_period_backtest(config: PeriodBacktestConfig) -> PeriodBacktestResult:
                     xu100_ma50=regime_info["ma50"],
                     xu100_ma200=regime_info["ma200"],
                     selected_config=selected_config_name,
-                    is_decimal=is_decimal,
+                    transaction_cost_pct=float(config.transaction_cost_pct),
                 )
             )
 
@@ -1324,6 +1313,7 @@ def write_period_outputs(result: PeriodBacktestResult, config: PeriodBacktestCon
         "xu100_ma50",
         "xu100_ma200",
         "selected_config",
+        "transaction_cost_pct",
         "signal_count",
         "basket_return_15d",
         "basket_return_30d",
