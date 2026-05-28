@@ -541,7 +541,7 @@ def attach_forward_metrics(daily_all: pd.DataFrame, db_path: str) -> tuple[pd.Da
 
 def build_performance_summary(daily_all: pd.DataFrame, forward_warning: str, exclude_stale_performance: bool = False) -> pd.DataFrame:
     groups = {
-        "top30": daily_all["is_top30"],
+        "top30": daily_all.get("is_top30", pd.Series(False, index=daily_all.index)),
         "special_loose": daily_all["passes_special_loose"],
         "special_mid": daily_all["passes_special_mid"],
         "special_strict": daily_all["passes_special_strict"],
@@ -607,11 +607,11 @@ def build_april_replay(
             daily_frames.append(day_df)
 
         top30 = _top_symbols(day_df, 30) if not day_df.empty else []
-        top30_scores = pd.to_numeric(day_df.loc[day_df["is_top30"], "liquidity_safe_score"], errors="coerce")
+        top30_scores = pd.to_numeric(day_df.loc[day_df["is_top30"], "liquidity_safe_score"], errors="coerce") if not day_df.empty and "is_top30" in day_df.columns else pd.Series(dtype=float)
         special_any_mask = day_df["special_tier"].astype(str).ne("") if not day_df.empty else pd.Series(dtype=bool)
         special_any_scores = pd.to_numeric(day_df.loc[special_any_mask, "liquidity_safe_score"], errors="coerce") if not day_df.empty else pd.Series(dtype=float)
         special_any_special_scores = pd.to_numeric(day_df.loc[special_any_mask, "special_score"], errors="coerce") if not day_df.empty else pd.Series(dtype=float)
-        top30_special_scores = pd.to_numeric(day_df.loc[day_df["is_top30"], "special_score"], errors="coerce") if not day_df.empty else pd.Series(dtype=float)
+        top30_special_scores = pd.to_numeric(day_df.loc[day_df["is_top30"], "special_score"], errors="coerce") if not day_df.empty and "is_top30" in day_df.columns else pd.Series(dtype=float)
 
         loose_syms = day_df.loc[day_df["passes_special_loose"], "symbol"].astype(str).tolist() if not day_df.empty else []
         mid_syms = day_df.loc[day_df["passes_special_mid"], "symbol"].astype(str).tolist() if not day_df.empty else []

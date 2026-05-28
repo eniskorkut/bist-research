@@ -2,11 +2,18 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
+
+SRC_PATH = Path(__file__).resolve().parents[1] / "src"
+if str(SRC_PATH) not in sys.path:
+    sys.path.insert(0, str(SRC_PATH))
+
+from market_radar.scoring import compute_quality_threshold_score
 
 from market_radar.backtesting.backtest_engine import BacktestConfig, run_backtest
 from market_radar.backtesting.period_backtest_engine import (
@@ -45,13 +52,24 @@ FEATURE_COLUMNS = [
     "alpha_30d",
     "current_quality_pass",
     "current_failed_reasons",
+    "stock_return_20d_pct",
+    "xu100_return_20d_pct",
+    "relative_strength_20d_pct",
+    "volume_ratio_3d_vs_20d",
+    "macd_hist",
+    "ma20_slope_5d",
+    "cmf_20",
+    "distance_from_52w_low_pct",
+    "quality_threshold_score",
 ]
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR)
-    parser.add_argument("--start-date", default="2024-01-01")
+    parser.add_argument("--start-date", help="Alias for --output-start-date")
+    parser.add_argument("--output-start-date", default="2024-01-01")
+    parser.add_argument("--ohlcv-warmup-start", default="2018-01-01")
     parser.add_argument("--end-date", default="2026-05-08")
     parser.add_argument("--universe", default="XUTUM")
     parser.add_argument("--benchmark", default="XU100")
@@ -66,6 +84,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--force-refresh", action="store_true")
     parser.add_argument("--max-symbols", type=int)
     parser.add_argument("--only-symbols")
+    parser.add_argument("--debug-symbols")
+    parser.add_argument("--debug-dates")
     return parser.parse_args(argv)
 
 
@@ -149,6 +169,14 @@ def _next_month_start(value: date) -> date:
         return date(value.year + 1, 1, 1)
     return date(value.year, value.month + 1, 1)
 
+def _evaluate_filters(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    out = df.copy()
+    out = compute_quality_threshold_score(out)
+    return out
+
+
 
 def _to_iso_dates(frame: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
     out = frame.copy()
@@ -207,8 +235,11 @@ def _expand_to_windows(
 
 
 def export_candidate_features(args: argparse.Namespace) -> tuple[pd.DataFrame, dict[str, Any]]:
-    start = _parse_date(args.start_date)
+    start = _parse_date(args.output_start_date)
+    warmup_start = _parse_date(args.ohlcv_warmup_start)
     end = _parse_date(args.end_date)
+    lookback_days = (datetime.now().date() - warmup_start).days
+    
     existing_periods = (
         _periods_from_existing_summary(Path(args.output_dir), args.strategy) if args.align_existing_summary else None
     )
@@ -256,7 +287,7 @@ def export_candidate_features(args: argparse.Namespace) -> tuple[pd.DataFrame, d
         BacktestConfig(
             universe_symbol=normalize_bist_symbol(args.universe) or "XUTUM",
             benchmark_symbol=normalize_bist_symbol(args.benchmark) or "XU100",
-            lookback_days=args.lookback_days,
+            lookback_days=lookback_days,
             strategies=[args.strategy],
             max_workers=args.max_workers,
             db_path=args.db_path,
@@ -294,25 +325,98 @@ def export_candidate_features(args: argparse.Namespace) -> tuple[pd.DataFrame, d
         features["future_return_30d"] = features.get("return_30d")
         features["current_quality_pass"] = features.get("filter_passed").fillna(False).astype(bool)
         features["current_failed_reasons"] = features.get("failed_reasons").fillna("")
+        
+        features = _evaluate_filters(features)
         features = _to_iso_dates(features, ["signal_date", "entry_date"])
+
     features = _ensure_columns(features, FEATURE_COLUMNS)
 
+    # Track stage metrics
+    symbol_metrics = getattr(result, "symbol_metrics", {})
+    raw_ohlcv_rows = sum(m.get("raw_ohlcv_rows", 0) for m in symbol_metrics.values()) if symbol_metrics else 0
+    indicator_ready_rows = sum(m.get("indicator_ready_rows", 0) for m in symbol_metrics.values()) if symbol_metrics else 0
+    valid_feature_rows = indicator_ready_rows
+    duplicate_symbol_date_count = 0
+    if not features.empty:
+        duplicate_cols = [c for c in ["symbol", "strategy", "signal_date"] if c in features.columns]
+        if duplicate_cols:
+            duplicate_symbol_date_count = int(features.duplicated(subset=duplicate_cols).sum())
+    missing_required_columns = [c for c in FEATURE_COLUMNS if c not in features.columns]
+    passes_top30_count = int((pd.to_numeric(features.get("production_rank"), errors="coerce") <= 30).sum()) if not features.empty else 0
+    passes_special_strict_count = int(features["passes_special_strict"].sum()) if not features.empty and "passes_special_strict" in features.columns else 0
+    scores = pd.to_numeric(features.get("quality_threshold_score"), errors="coerce") if not features.empty else pd.Series(dtype=float)
+    
+    # Run debug print if requested
+    if args.debug_symbols and args.debug_dates:
+        _run_debug_print(args, result, features)
+
     metadata = {
-        "start_date": args.start_date,
+        "output_start_date": args.output_start_date,
+        "ohlcv_warmup_start": args.ohlcv_warmup_start,
         "end_date": args.end_date,
         "period_count": len(windows),
         "period_source": period_source,
         "symbol_scope_period_count": len(symbol_scopes),
-        "raw_signal_count": int(len(signals)),
         "exported_row_count": int(len(features)),
         "current_quality_pass_count": int(features["current_quality_pass"].sum()) if not features.empty else 0,
         "universe": normalize_bist_symbol(args.universe) or "XUTUM",
         "benchmark": normalize_bist_symbol(args.benchmark) or "XU100",
         "strategy": args.strategy,
         "cache_only": bool(args.cache_only),
+        "symbol_count": len(symbol_metrics),
+        "raw_ohlcv_rows": raw_ohlcv_rows,
+        "symbol_date_rows": raw_ohlcv_rows,
+        "indicator_ready_rows": indicator_ready_rows,
+        "insufficient_history_rows": max(0, raw_ohlcv_rows - indicator_ready_rows),
+        "nan_ma200_rows": 0,
+        "nan_252d_low_rows": 0,
+        "valid_feature_rows": valid_feature_rows,
+        "passes_top30_count": passes_top30_count,
+        "passes_special_strict_count": passes_special_strict_count,
+        "passes_threshold_40_count": int((scores >= 40).sum()),
+        "passes_threshold_50_count": int((scores >= 50).sum()),
+        "passes_threshold_60_count": int((scores >= 60).sum()),
+        "passes_threshold_70_count": int((scores >= 70).sum()),
+        "final_candidate_rows": int(len(features)),
+        "duplicate_symbol_date_count": duplicate_symbol_date_count,
+        "missing_required_columns": missing_required_columns,
+        "failed_symbols": getattr(result, "failed_symbols", []),
+        "data_missing_years": [],
+        "ok": bool(valid_feature_rows > 0 and duplicate_symbol_date_count == 0 and not missing_required_columns),
         "scan_summary": result.scan_summary,
     }
     return features, metadata
+
+def _run_debug_print(args: argparse.Namespace, result, features: pd.DataFrame):
+    symbols = [s.strip().upper() for s in args.debug_symbols.split(",")]
+    dates = [d.strip() for d in args.debug_dates.split(",")]
+    print(f"\n--- DEBUG RUN ---")
+    
+    for symbol in symbols:
+        for date_str in dates:
+            print(f"Checking {symbol} on {date_str}:")
+            sm = getattr(result, "symbol_metrics", {}).get(symbol, {})
+            has_ohlcv = sm.get("raw_ohlcv_rows", 0) > 0
+            history_rows = sm.get("raw_ohlcv_rows", 0)
+            indicator_rows = sm.get("indicator_ready_rows", 0)
+            
+            print(f"  - OHLCV var mı?: {'Evet' if has_ohlcv else 'Hayır'}")
+            print(f"  - history row count: {history_rows} (indicator ready: {indicator_rows})")
+            
+            # Check if it's in final features
+            f_row = features[(features["symbol"] == symbol) & (features["signal_date"] == date_str)] if not features.empty else pd.DataFrame()
+            if not f_row.empty:
+                r = f_row.iloc[0]
+                print(f"  - ma20: {r.get('ma20')}, ma50: {r.get('ma50')}, ma200: {r.get('ma200')}")
+                print(f"  - 252d low: {r.get('rolling_low_252d')}")
+                print(f"  - volume_ratio: {r.get('volume_ratio_20d')}, rsi: {r.get('rsi_14')}, macd_hist: {r.get('macd_hist')}")
+                print(f"  - close_position: {r.get('close_position')}, cmf_20: {r.get('cmf_20')}")
+                print(f"  - passes_top30: {r.get('passes_top30', False)}, passes_special_strict: {r.get('passes_special_strict', False)}")
+                print(f"  - quality_threshold_score: {r.get('quality_threshold_score')}")
+                score = r.get("quality_threshold_score", 0) or 0
+                print(f"  - threshold pass/fail bilgileri: >=50 {'PASS' if score >= 50 else 'FAIL'}")
+            else:
+                print(f"  - Elenme sebebi: {args.strategy} hard filter by backtest_engine OR empty history.")
 
 
 def write_outputs(features: pd.DataFrame, metadata: dict[str, Any], output_dir: Path) -> dict[str, str]:

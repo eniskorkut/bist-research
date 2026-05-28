@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import argparse
 from pathlib import Path
 
 import pandas as pd
@@ -87,6 +88,7 @@ def _row(
         "ema20_gt_ema50": True,
         "ema8_gte_ema21": True,
         "close_gt_ema60": True,
+        "quality_threshold_score": 55.0,
     }
 
 
@@ -425,3 +427,226 @@ def test_forward20_and_bought_vs_skipped_flags() -> None:
 def test_tv_strategy_name_included() -> None:
     m = _load_module()
     assert "tv_volume_momentum_trend_fresh_only" in m.STRATEGY_NAMES
+    assert "special_strict_quality_v2_score_fresh_only" in m.STRATEGY_NAMES
+    assert "special_strict_score_threshold_fresh_only" in m.STRATEGY_NAMES
+
+
+def test_default_trade_simulation_has_zero_commission() -> None:
+    m = _load_module()
+    dates = ["2026-01-01", "2026-01-02"]
+    summary_df = _summary(dates)
+    daily_all = pd.DataFrame([_row("2026-01-01", "AAA", production_rank=1)])
+    price_cache = {"AAA": _price_frame([("2026-01-01", 10.0, None), ("2026-01-02", 12.0, None)])}
+
+    _daily_df, trades_df, _pending_df, _signals_df = m.simulate_strategy(
+        "top30_fresh_only",
+        daily_all,
+        summary_df,
+        price_cache,
+        initial_capital=1000.0,
+        max_holdings=1,
+        holding_days=2,
+        entry_mode="same_close",
+        exit_mode="hold20_close",
+        exclude_stale_new_entries=True,
+        allow_same_day_reentry=False,
+        min_position_value=1.0,
+    )
+
+    closed = trades_df.loc[trades_df["exit_reason"] == "hold20_close"].iloc[0]
+    assert round(float(closed["entry_value"]), 6) == 1000.0
+    assert round(float(closed["return_pct"]), 6) == 20.0
+
+
+def test_shared_quality_score_does_not_mutate_special_strict_flag() -> None:
+    m = _load_module()
+    df = pd.DataFrame(
+        [
+            {**_row("2026-01-01", "AAA", production_rank=1, passes_strict=True), "relative_strength_20d_pct": 12.0},
+            {**_row("2026-01-01", "BBB", production_rank=2, passes_strict=False), "relative_strength_20d_pct": 12.0},
+        ]
+    )
+    before = df["passes_special_strict"].tolist()
+
+    out = m.compute_quality_threshold_score(df.copy())
+
+    assert out["passes_special_strict"].tolist() == before
+    assert out["quality_threshold_score"].between(0, 100).all()
+
+
+def test_quality_v2_score_sorting_and_nonhard_diagnostics() -> None:
+    m = _load_module()
+    day_df = pd.DataFrame(
+        [
+            _row("2026-01-01", "AAA", production_rank=1, passes_strict=True, special_score=90.0),
+            _row("2026-01-01", "BBB", production_rank=2, passes_strict=True, special_score=85.0),
+        ]
+    )
+    day_df.loc[:, "passes_special_strict_quality_v2"] = True
+    day_df.loc[:, "quality_v2_score"] = [70.0, 90.0]
+    day_df.loc[:, "liquidity_safe_score"] = [95.0, 80.0]
+    day_df.loc[:, "daily_change_gt_2"] = [False, False]
+    day_df.loc[:, "distance_from_52w_low_pct"] = [10.0, 20.0]
+    out_liq = m._select_group(day_df, "special_strict_quality_v2", 10)
+    out_score = m._select_group(day_df, "special_strict_quality_v2_score", 10)
+    assert out_liq["symbol"].tolist()[0] == "AAA"
+    assert out_score["symbol"].tolist()[0] == "BBB"
+
+
+def test_quality_threshold_score_range_and_threshold_selection() -> None:
+    m = _load_module()
+    day_df = pd.DataFrame(
+        [
+            _row("2026-01-01", "AAA", production_rank=1, passes_strict=True),
+            _row("2026-01-01", "BBB", production_rank=2, passes_strict=True),
+            _row("2026-01-01", "CCC", production_rank=3, passes_strict=False),
+        ]
+    )
+    day_df.loc[:, "quality_threshold_score"] = [49.9, 50.0, 90.0]
+    day_df.loc[:, "passes_special_strict"] = [True, True, False]
+    day_df.attrs["quality_score_threshold"] = 50.0
+    out = m._select_group(day_df, "special_strict_score_threshold", 10)
+    assert out["symbol"].tolist() == ["BBB"]
+    assert out["quality_threshold_score"].between(0, 100).all()
+
+
+def test_threshold_filter_not_top10_limited() -> None:
+    m = _load_module()
+    day_df = pd.DataFrame([_row("2026-01-01", f"S{i:02d}", production_rank=i + 1, passes_strict=True) for i in range(15)])
+    day_df.loc[:, "quality_threshold_score"] = [70.0] * 15
+    day_df.loc[:, "passes_special_strict"] = [True] * 15
+    day_df.attrs["quality_score_threshold"] = 50.0
+    out = m._select_group(day_df, "special_strict_score_threshold", 10)
+    assert len(out) == 15
+
+
+def test_parse_thresholds_cli_list() -> None:
+    m = _load_module()
+    args = argparse.Namespace(quality_score_threshold=50.0, quality_score_thresholds="40,50,60,70")
+    assert m._parse_thresholds(args) == [40, 50, 60, 70]
+
+
+def test_market_breadth_computation() -> None:
+    m = _load_module()
+    df = pd.DataFrame(
+        [
+            {"symbol": "A", "close": 11.0, "ma20": 10.0},
+            {"symbol": "B", "close": 9.0, "ma20": 10.0},
+            {"symbol": "C", "close": 12.0, "ma20": 10.0},
+            {"symbol": "D", "close": None, "ma20": 10.0},
+        ]
+    )
+    out = m._compute_market_breadth(df)
+    assert round(float(out), 4) == round((2 / 3) * 100.0, 4)
+
+
+def test_weak_score_computation() -> None:
+    m = _load_module()
+    weak = m._compute_weak_score(
+        xu100_close=90.0,
+        xu100_ma50=100.0,
+        xu100_return_20d_pct=-5.0,
+        xu100_ma50_slope_10d=-1.0,
+        market_breadth_pct_above_ma20=40.0,
+    )
+    assert weak == 4
+
+
+def test_adaptive_threshold_switching_logic() -> None:
+    m = _load_module()
+    day_df = pd.DataFrame(
+        [
+            _row("2026-01-01", "AAA", production_rank=1, passes_strict=True, special_score=90.0),
+            _row("2026-01-01", "BBB", production_rank=2, passes_strict=True, special_score=80.0),
+        ]
+    )
+    day_df.loc[:, "quality_threshold_score"] = [55.0, 65.0]
+
+    day_df.attrs["weak_score"] = 1
+    out_weak1 = m._select_group(day_df, "adaptive_regime_v1", 10)
+    assert set(out_weak1["symbol"].tolist()) == {"AAA", "BBB"}
+    assert out_weak1["adaptive_selected_mode"].iloc[0] == "special_strict"
+
+    day_df.attrs["weak_score"] = 2
+    out_weak2 = m._select_group(day_df, "adaptive_regime_v1", 10)
+    assert set(out_weak2["symbol"].tolist()) == {"AAA", "BBB"}
+    assert out_weak2["adaptive_selected_mode"].iloc[0] == "threshold_50"
+
+    day_df.attrs["weak_score"] = 3
+    out_weak3 = m._select_group(day_df, "adaptive_regime_v1", 10)
+    assert out_weak3["symbol"].tolist() == ["BBB"]
+    assert out_weak3["adaptive_selected_mode"].iloc[0] == "threshold_60"
+
+    day_df.attrs["weak_score"] = 4
+    out_weak4 = m._select_group(day_df, "adaptive_regime_v1", 10)
+    assert out_weak4.empty
+
+
+def test_adaptive_strategy_name_included() -> None:
+    m = _load_module()
+    assert "adaptive_regime_v1_fresh_only" in m.STRATEGY_NAMES
+
+
+def test_prepare_inputs_builds_data_missing_coverage_summary(monkeypatch) -> None:
+    m = _load_module()
+    features = pd.DataFrame(
+        [
+            {"symbol": "AAA", "strategy": "volume_spike_strict", "signal_date": "2024-01-02"},
+            {"symbol": "AAA", "strategy": "volume_spike_strict", "signal_date": "2024-01-03"},
+        ]
+    )
+    daily_all = pd.DataFrame([_row("2024-01-02", "AAA", production_rank=1)])
+    summary_df = pd.DataFrame(
+        [
+            {"as_of_date": "2024-01-02", "is_expected_trading_day": True, "stale_data_warning": False, "stale_data_reason": ""},
+        ]
+    )
+    monkeypatch.setattr(m.APRIL, "_prepare_base_features", lambda _p: features)
+    monkeypatch.setattr(m.APRIL, "build_april_replay", lambda *args, **kwargs: (daily_all, summary_df, pd.DataFrame(), pd.DataFrame(), pd.DataFrame()))
+    monkeypatch.setattr(m, "_load_price_cache_full", lambda *_args, **_kwargs: {"AAA": _price_frame([("2024-01-02", 10.0, None)])})
+    monkeypatch.setattr(m, "_build_indicator_snapshot", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(m, "_enrich_daily_all", lambda frame, *_args, **_kwargs: frame)
+    _da, _su, _pc, _end, cov = m._prepare_inputs(
+        "dummy",
+        None,
+        "dummy.sqlite",
+        "2020-01-01",
+        "2024-01-31",
+        True,
+    )
+    assert cov["available_min_signal_date"] == "2024-01-02"
+    assert cov["actual_start_date"] == "2024-01-02"
+    assert 2020 in cov["missing_years"]
+
+
+def test_candidate_features_path_directory_is_loaded(tmp_path) -> None:
+    m = _load_module()
+    year_dir = tmp_path / "year=2020"
+    year_dir.mkdir(parents=True)
+    pd.DataFrame(
+        [
+            {
+                "period": "2020-01-01",
+                "symbol": "AAA",
+                "strategy": "volume_spike_strict",
+                "signal_date": "2020-01-02",
+                "entry_date": "2020-01-03",
+                "close": 10.0,
+                "volume": 1000,
+                "turnover": 10_000_000.0,
+                "avg_turnover_20d": 10_000_000.0,
+                "volume_ratio_20d": 2.0,
+                "turnover_ratio_20d": 2.0,
+                "ma20": 9.0,
+                "above_ma20": True,
+                "rsi_14": 55.0,
+                "return_5d_pct": 5.0,
+                "return_10d_pct": 8.0,
+                "close_position": 0.7,
+            }
+        ]
+    ).to_csv(year_dir / "candidate_features.csv", index=False)
+    out = m._prepare_features("unused", str(tmp_path))
+    assert len(out) == 1
+    assert out.iloc[0]["symbol"] == "AAA"
+    assert str(out.iloc[0]["signal_date"].date()) == "2020-01-02"

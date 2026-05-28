@@ -4,10 +4,17 @@ import argparse
 import importlib.util
 import json
 import sqlite3
+import sys
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
+
+SRC_PATH = Path(__file__).resolve().parents[1] / "src"
+if str(SRC_PATH) not in sys.path:
+    sys.path.insert(0, str(SRC_PATH))
+
+from market_radar.scoring import compute_quality_threshold_score
 
 
 DEFAULT_OUTPUT_DIR = "data/backtest_outputs/period_runs_volume_spike_quality_2024_backfilled"
@@ -26,12 +33,23 @@ FILTER_NAMES = [
     "special_strict",
     "special_strict_top10",
     "tv_volume_momentum_trend",
+    "special_strict_quality_v2",
+    "adaptive_v1_cash_no_buy",
+    "special_strict_score_threshold_50",
+    "special_strict_score_threshold_60",
 ]
 STRATEGY_NAMES = [
     "top30_fresh_only",
     "special_mid_fresh_only",
     "special_strict_fresh_only",
     "special_strict_top10_fresh_only",
+    "special_strict_score_threshold_fresh_only",
+    "special_strict_score_threshold_50_fresh_only",
+    "special_strict_score_threshold_60_fresh_only",
+    "adaptive_v1_cash_no_buy_fresh_only",
+    "adaptive_regime_v1_fresh_only",
+    "special_strict_quality_v2_fresh_only",
+    "special_strict_quality_v2_score_fresh_only",
     "special_strict_pending_ttl3_raw",
     "special_strict_top10_pending_ttl3_raw",
     "special_strict_pending_ttl3_revalidate",
@@ -58,6 +76,7 @@ APRIL = _load_april_module()
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR)
+    p.add_argument("--candidate-features-path")
     p.add_argument("--out-root", default=DEFAULT_OUT_ROOT)
     p.add_argument("--db-path", default=DEFAULT_DB_PATH)
     p.add_argument("--start-date", default=DEFAULT_START_DATE)
@@ -70,7 +89,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--exclude-stale-new-entries", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--allow-same-day-reentry", action=argparse.BooleanOptionalAction, default=False)
     p.add_argument("--min-position-value", type=float, default=DEFAULT_MIN_POSITION_VALUE)
+    p.add_argument("--quality-score-thresholds", default="40,50,60,70")
     return p.parse_args()
+
+
+def _parse_thresholds(args: argparse.Namespace) -> list[int]:
+    raw = getattr(args, "quality_score_thresholds", None)
+    if raw:
+        return sorted({int(float(x.strip())) for x in str(raw).split(",") if x.strip()})
+    return [int(float(getattr(args, "quality_score_threshold", 50.0)))]
 
 
 def _resolve_end_date(features: pd.DataFrame, end_date: str | None) -> str:
@@ -82,6 +109,47 @@ def _resolve_end_date(features: pd.DataFrame, end_date: str | None) -> str:
     return signal_dates.max().strftime("%Y-%m-%d")
 
 
+def _compute_market_breadth(day_df: pd.DataFrame) -> float | None:
+    if day_df.empty or "close" not in day_df.columns or "ma20" not in day_df.columns:
+        return None
+    close = pd.to_numeric(day_df["close"], errors="coerce")
+    ma20 = pd.to_numeric(day_df["ma20"], errors="coerce")
+    valid = close.notna() & ma20.notna()
+    if not bool(valid.any()):
+        return None
+    return float((close.loc[valid] > ma20.loc[valid]).mean() * 100.0)
+
+
+def _compute_weak_score(
+    *,
+    xu100_close: float | None,
+    xu100_ma50: float | None,
+    xu100_return_20d_pct: float | None,
+    xu100_ma50_slope_10d: float | None,
+    market_breadth_pct_above_ma20: float | None,
+) -> int:
+    score = 0
+    if pd.notna(xu100_close) and pd.notna(xu100_ma50) and float(xu100_close) < float(xu100_ma50):
+        score += 1
+    if pd.notna(xu100_return_20d_pct) and float(xu100_return_20d_pct) < -3.0:
+        score += 1
+    if pd.notna(xu100_ma50_slope_10d) and float(xu100_ma50_slope_10d) < 0.0:
+        score += 1
+    if pd.notna(market_breadth_pct_above_ma20) and float(market_breadth_pct_above_ma20) < 45.0:
+        score += 1
+    return int(score)
+
+
+def _adaptive_mode_for_weak_score(weak_score: int) -> str:
+    if weak_score <= 1:
+        return "special_strict"
+    if weak_score == 2:
+        return "threshold_50"
+    if weak_score == 3:
+        return "threshold_60"
+    return "cash"
+
+
 def _parse_strategy_name(strategy_name: str, max_holdings: int) -> dict[str, Any]:
     if strategy_name.startswith("top30"):
         return {"base_group": "top30", "pending_mode": False, "ttl": None, "revalidate": False, "limit": 30}
@@ -89,6 +157,20 @@ def _parse_strategy_name(strategy_name: str, max_holdings: int) -> dict[str, Any
         return {"base_group": "special_mid", "pending_mode": False, "ttl": None, "revalidate": False, "limit": max_holdings}
     if strategy_name.startswith("tv_volume_momentum_trend"):
         return {"base_group": "tv_volume_momentum_trend", "pending_mode": False, "ttl": None, "revalidate": False, "limit": max_holdings}
+    if strategy_name.startswith("special_strict_quality_v2_score"):
+        return {"base_group": "special_strict_quality_v2_score", "pending_mode": False, "ttl": None, "revalidate": False, "limit": max_holdings}
+    if strategy_name.startswith("special_strict_quality_v2"):
+        return {"base_group": "special_strict_quality_v2", "pending_mode": False, "ttl": None, "revalidate": False, "limit": max_holdings}
+    if strategy_name.startswith("adaptive_regime_v1"):
+        return {"base_group": "adaptive_regime_v1", "pending_mode": False, "ttl": None, "revalidate": False, "limit": max_holdings}
+    if strategy_name.startswith("adaptive_v1_cash_no_buy"):
+        return {"base_group": "adaptive_v1_cash_no_buy", "pending_mode": False, "ttl": None, "revalidate": False, "limit": max_holdings}
+    if strategy_name.startswith("special_strict_score_threshold_50"):
+        return {"base_group": "special_strict_score_threshold_50", "pending_mode": False, "ttl": None, "revalidate": False, "limit": max_holdings}
+    if strategy_name.startswith("special_strict_score_threshold_60"):
+        return {"base_group": "special_strict_score_threshold_60", "pending_mode": False, "ttl": None, "revalidate": False, "limit": max_holdings}
+    if strategy_name.startswith("special_strict_score_threshold"):
+        return {"base_group": "special_strict_score_threshold", "pending_mode": False, "ttl": None, "revalidate": False, "limit": max_holdings}
     pending_mode = "pending" in strategy_name
     revalidate = "revalidate" in strategy_name
     ttl = 3 if "ttl3" in strategy_name else (5 if "ttl5" in strategy_name else None)
@@ -335,6 +417,7 @@ def _enrich_daily_all(daily_all: pd.DataFrame, indicator_map: dict[tuple[str, st
     out["ema20_gt_ema50"] = (out["ema20"] > out["ema50"]).fillna(False)
     out["ema8_gte_ema21"] = (out["ema8"] >= out["ema21"]).fillna(False)
     out["close_gt_ema60"] = (out["close"] > out["ema60"]).fillna(False)
+    out = compute_quality_threshold_score(out)
     return out
 
 
@@ -348,18 +431,143 @@ def _price_on_date(frame: pd.DataFrame | None, date_str: str, column: str) -> fl
     return None if pd.isna(value) else float(value)
 
 
+def _build_market_regime_map(
+    daily_all: pd.DataFrame,
+    summary_df: pd.DataFrame,
+    price_cache: dict[str, pd.DataFrame],
+) -> dict[str, dict[str, Any]]:
+    expected_dates = (
+        summary_df.loc[summary_df["is_expected_trading_day"].astype(bool), "as_of_date"]
+        .astype(str)
+        .tolist()
+    )
+    expected_set = set(expected_dates)
+    breadth_counts: dict[str, list[int]] = {d: [0, 0] for d in expected_dates}
+
+    for symbol, frame in price_cache.items():
+        if symbol in {"XU100", "XUTUM"} or frame.empty:
+            continue
+        f = frame.copy().sort_values("date").reset_index(drop=True)
+        close = pd.to_numeric(f.get("close"), errors="coerce")
+        f["ma20_breadth"] = close.rolling(20, min_periods=20).mean()
+        for _, row in f.loc[f["date_str"].isin(expected_set), ["date_str", "close", "ma20_breadth"]].iterrows():
+            close_val = pd.to_numeric(row["close"], errors="coerce")
+            ma20_val = pd.to_numeric(row["ma20_breadth"], errors="coerce")
+            if pd.isna(close_val) or pd.isna(ma20_val):
+                continue
+            counts = breadth_counts[str(row["date_str"])]
+            counts[1] += 1
+            if float(close_val) > float(ma20_val):
+                counts[0] += 1
+
+    xu100 = price_cache.get("XU100")
+    xu_map: dict[str, dict[str, Any]] = {}
+    if xu100 is not None and not xu100.empty:
+        x = xu100.copy().sort_values("date").reset_index(drop=True)
+        close = pd.to_numeric(x["close"], errors="coerce")
+        x["ma50"] = close.rolling(50, min_periods=50).mean()
+        x["return_20d_pct"] = (close / close.shift(20) - 1.0) * 100.0
+        x["ma50_slope_10d"] = (x["ma50"] / x["ma50"].shift(10) - 1.0) * 100.0
+        for _, row in x.loc[x["date_str"].isin(expected_set)].iterrows():
+            xu_map[str(row["date_str"])] = {
+                "xu100_close": row.get("close"),
+                "xu100_ma50": row.get("ma50"),
+                "xu100_return_20d_pct": row.get("return_20d_pct"),
+                "xu100_ma50_slope_10d": row.get("ma50_slope_10d"),
+            }
+
+    out: dict[str, dict[str, Any]] = {}
+    for as_of_date in expected_dates:
+        above, total = breadth_counts.get(as_of_date, [0, 0])
+        breadth = (above / total * 100.0) if total else _compute_market_breadth(
+            daily_all.loc[daily_all["as_of_date"].astype(str) == as_of_date]
+        )
+        xu = xu_map.get(as_of_date, {})
+        weak_score = _compute_weak_score(
+            xu100_close=xu.get("xu100_close"),
+            xu100_ma50=xu.get("xu100_ma50"),
+            xu100_return_20d_pct=xu.get("xu100_return_20d_pct"),
+            xu100_ma50_slope_10d=xu.get("xu100_ma50_slope_10d"),
+            market_breadth_pct_above_ma20=breadth,
+        )
+        out[as_of_date] = {
+            "weak_score": weak_score,
+            "adaptive_selected_mode": _adaptive_mode_for_weak_score(weak_score),
+            "xu100_close": xu.get("xu100_close"),
+            "xu100_ma50": xu.get("xu100_ma50"),
+            "xu100_return_20d_pct": xu.get("xu100_return_20d_pct"),
+            "xu100_ma50_slope_10d": xu.get("xu100_ma50_slope_10d"),
+            "market_breadth_pct_above_ma20": breadth,
+            "breadth_universe_count": total,
+        }
+    return out
+
+
+def _read_candidate_features_path(path: str | Path) -> pd.DataFrame:
+    feature_path = Path(path)
+    if feature_path.is_file():
+        if feature_path.suffix == ".parquet":
+            return pd.read_parquet(feature_path)
+        return pd.read_csv(feature_path)
+    if not feature_path.exists():
+        raise FileNotFoundError(f"candidate features path missing: {feature_path}")
+    files: list[Path] = []
+    for year_dir in sorted(feature_path.glob("year=*")):
+        parquet = year_dir / "candidate_features.parquet"
+        csv = year_dir / "candidate_features.csv"
+        if parquet.exists():
+            files.append(parquet)
+        elif csv.exists():
+            files.append(csv)
+    if not files:
+        parquet = feature_path / "candidate_features.parquet"
+        csv = feature_path / "candidate_features.csv"
+        if parquet.exists():
+            files.append(parquet)
+        elif csv.exists():
+            files.append(csv)
+    if not files:
+        raise FileNotFoundError(f"candidate features files missing under: {feature_path}")
+    frames: list[pd.DataFrame] = []
+    for item in files:
+        try:
+            frame = pd.read_parquet(item) if item.suffix == ".parquet" else pd.read_csv(item)
+        except Exception:
+            fallback = item.with_suffix(".csv")
+            if item.suffix == ".parquet" and fallback.exists():
+                frame = pd.read_csv(fallback)
+            else:
+                raise
+        frames.append(frame)
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
+def _prepare_features(output_dir: str, candidate_features_path: str | None = None) -> pd.DataFrame:
+    if candidate_features_path:
+        raw = _read_candidate_features_path(candidate_features_path)
+        return APRIL._prepare_base_features_from_df(raw)
+    return APRIL._prepare_base_features(Path(output_dir))
+
+
 def _prepare_inputs(
     output_dir: str,
+    candidate_features_path: str | None,
     db_path: str,
     start_date: str,
     end_date: str | None,
     exclude_stale: bool,
-) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, pd.DataFrame], str]:
-    features = APRIL._prepare_base_features(Path(output_dir))
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, pd.DataFrame], str, dict]:
+    features = _prepare_features(output_dir, candidate_features_path)
     resolved_end = _resolve_end_date(features, end_date)
+    feature_dates = pd.to_datetime(features.get("signal_date"), errors="coerce").dropna()
+    available_min = None if feature_dates.empty else feature_dates.min().strftime("%Y-%m-%d")
+    available_max = None if feature_dates.empty else feature_dates.max().strftime("%Y-%m-%d")
+    actual_start = start_date
+    if available_min and start_date < available_min:
+        actual_start = available_min
     daily_all, summary_df, _life, _perf, _audit = APRIL.build_april_replay(
         features,
-        start_date,
+        actual_start,
         resolved_end,
         db_path=db_path,
         exclude_stale_performance=exclude_stale,
@@ -368,7 +576,18 @@ def _prepare_inputs(
     price_cache = _load_price_cache_full(db_path, symbols)
     indicators = _build_indicator_snapshot(price_cache)
     daily_all = _enrich_daily_all(daily_all, indicators)
-    return daily_all, summary_df, price_cache, resolved_end
+    requested_start_year = int(str(start_date)[:4])
+    end_year = int(str(resolved_end)[:4])
+    tested_years = sorted({int(x[:4]) for x in summary_df.loc[summary_df["is_expected_trading_day"].astype(bool), "as_of_date"].astype(str).tolist()})
+    coverage_summary = {
+        "requested_start_date": start_date,
+        "actual_start_date": actual_start,
+        "available_min_signal_date": available_min,
+        "available_max_signal_date": available_max,
+        "missing_years": [y for y in range(requested_start_year, end_year + 1) if y not in tested_years],
+        "tested_years": tested_years,
+    }
+    return daily_all, summary_df, price_cache, resolved_end, coverage_summary
 
 
 def _select_group(day_df: pd.DataFrame, base_group: str, max_holdings: int) -> pd.DataFrame:
@@ -407,6 +626,69 @@ def _select_group(day_df: pd.DataFrame, base_group: str, max_holdings: int) -> p
             out = out.sort_values(["tv_momentum_score", "volume_ratio_20d", "symbol"], ascending=[False, False, True]).reset_index(drop=True)
         out["selection_rank"] = out.index + 1
         return out
+    if base_group == "special_strict_quality_v2":
+        mask = day_df.get("passes_special_strict_quality_v2", pd.Series(False, index=day_df.index)).fillna(False)
+        out = day_df.loc[mask].copy()
+        for col in ["liquidity_safe_score", "quality_v2_score"]:
+            if col not in out.columns:
+                out[col] = pd.NA
+        out = out.sort_values(["liquidity_safe_score", "quality_v2_score", "symbol"], ascending=[False, False, True]).reset_index(drop=True)
+        out["selection_rank"] = out.index + 1
+        return out
+    if base_group == "special_strict_quality_v2_score":
+        mask = day_df.get("passes_special_strict_quality_v2", pd.Series(False, index=day_df.index)).fillna(False)
+        out = day_df.loc[mask].copy()
+        for col in ["quality_v2_score", "liquidity_safe_score"]:
+            if col not in out.columns:
+                out[col] = pd.NA
+        out = out.sort_values(["quality_v2_score", "liquidity_safe_score", "symbol"], ascending=[False, False, True]).reset_index(drop=True)
+        out["selection_rank"] = out.index + 1
+        return out
+    if base_group == "special_strict_score_threshold":
+        threshold = float(day_df.attrs.get("quality_score_threshold", 50.0))
+        strict_mask = day_df.get("passes_special_strict", pd.Series(False, index=day_df.index)).fillna(False)
+        score = pd.to_numeric(day_df.get("quality_threshold_score"), errors="coerce")
+        out = day_df.loc[strict_mask & (score >= threshold)].copy()
+        out = out.sort_values(["quality_threshold_score", "liquidity_safe_score", "symbol"], ascending=[False, False, True]).reset_index(drop=True)
+        out["selection_rank"] = out.index + 1
+        return out
+    if base_group == "special_strict_score_threshold_50":
+        strict_mask = day_df.get("passes_special_strict", pd.Series(False, index=day_df.index)).fillna(False)
+        score = pd.to_numeric(day_df.get("quality_threshold_score"), errors="coerce")
+        out = day_df.loc[strict_mask & (score >= 50.0)].copy()
+        out = out.sort_values(["quality_threshold_score", "liquidity_safe_score", "symbol"], ascending=[False, False, True]).reset_index(drop=True)
+        out["selection_rank"] = out.index + 1
+        return out
+    if base_group == "special_strict_score_threshold_60":
+        strict_mask = day_df.get("passes_special_strict", pd.Series(False, index=day_df.index)).fillna(False)
+        score = pd.to_numeric(day_df.get("quality_threshold_score"), errors="coerce")
+        out = day_df.loc[strict_mask & (score >= 60.0)].copy()
+        out = out.sort_values(["quality_threshold_score", "liquidity_safe_score", "symbol"], ascending=[False, False, True]).reset_index(drop=True)
+        out["selection_rank"] = out.index + 1
+        return out
+    if base_group in ("adaptive_regime_v1", "adaptive_v1_cash_no_buy"):
+        weak_score = int(day_df.attrs.get("weak_score", 0))
+        mode = _adaptive_mode_for_weak_score(weak_score)
+        if weak_score <= 1:
+            out = day_df.loc[day_df["passes_special_strict"]].copy()
+            out = out.sort_values(["special_score", "liquidity_safe_score", "symbol"], ascending=[False, False, True]).reset_index(drop=True)
+        elif weak_score == 2:
+            strict_mask = day_df.get("passes_special_strict", pd.Series(False, index=day_df.index)).fillna(False)
+            score = pd.to_numeric(day_df.get("quality_threshold_score"), errors="coerce")
+            out = day_df.loc[strict_mask & (score >= 50.0)].copy()
+            out = out.sort_values(["quality_threshold_score", "liquidity_safe_score", "symbol"], ascending=[False, False, True]).reset_index(drop=True)
+        elif weak_score == 3:
+            strict_mask = day_df.get("passes_special_strict", pd.Series(False, index=day_df.index)).fillna(False)
+            score = pd.to_numeric(day_df.get("quality_threshold_score"), errors="coerce")
+            out = day_df.loc[strict_mask & (score >= 60.0)].copy()
+            out = out.sort_values(["quality_threshold_score", "liquidity_safe_score", "symbol"], ascending=[False, False, True]).reset_index(drop=True)
+        else:
+            out = pd.DataFrame()
+        if not out.empty:
+            out["selection_rank"] = out.index + 1
+            out["adaptive_selected_mode"] = mode
+            out["weak_score"] = weak_score
+        return out
     raise ValueError(f"Unknown base_group {base_group}")
 
 
@@ -415,11 +697,15 @@ def _build_daily_group_map(
     summary_df: pd.DataFrame,
     base_group: str,
     max_holdings: int,
+    market_regime_map: dict | None = None,
 ) -> dict[str, pd.DataFrame]:
     expected_dates = summary_df.loc[summary_df["is_expected_trading_day"].astype(bool), "as_of_date"].astype(str).tolist()
     out: dict[str, pd.DataFrame] = {}
     for as_of_date in expected_dates:
         grp = daily_all.loc[daily_all["as_of_date"].astype(str) == as_of_date].copy()
+        if base_group in ("adaptive_regime_v1", "adaptive_v1_cash_no_buy") and market_regime_map is not None:
+            regime = market_regime_map.get(as_of_date, {})
+            grp.attrs["weak_score"] = regime.get("weak_score", 0)
         out[as_of_date] = _select_group(grp, base_group, max_holdings)
     return out
 
@@ -500,13 +786,15 @@ def _buy_position(
     trading_dates: list[str],
     idx_map: dict[str, int],
     holding_days: int,
+    cost_bps: float = 0.0,
 ) -> tuple[float, bool]:
     total_equity, _open_value, _open_cost = _current_equity(cash, positions, price_cache, trade_date)
     position_budget = total_equity / float(max_holdings)
     position_value = min(position_budget, cash)
     if position_value < float(min_position_value) or entry_price <= 0:
         return cash, False
-    shares = position_value / entry_price
+    actual_entry_price = entry_price * (1.0 + cost_bps / 10000.0)
+    shares = position_value / actual_entry_price
     exit_trade_date = _compute_exit_date(trade_date, trading_dates, idx_map, holding_days)
     positions.append(
         {
@@ -535,11 +823,13 @@ def simulate_strategy(
     exclude_stale_new_entries: bool,
     allow_same_day_reentry: bool,
     min_position_value: float,
+    market_regime_map: dict | None = None,
+    cost_bps: float = 0.0,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     if exit_mode != "hold20_close":
         raise ValueError(f"Unsupported exit_mode: {exit_mode}")
     cfg = _parse_strategy_name(strategy_name, max_holdings)
-    daily_map = _build_daily_group_map(daily_all, summary_df, cfg["base_group"], max_holdings)
+    daily_map = _build_daily_group_map(daily_all, summary_df, cfg["base_group"], max_holdings, market_regime_map)
     symbol_map = _build_daily_symbol_map(daily_all, summary_df)
     expected = summary_df.loc[summary_df["is_expected_trading_day"].astype(bool)].copy().sort_values("as_of_date").reset_index(drop=True)
     trading_dates = expected["as_of_date"].astype(str).tolist()
@@ -559,6 +849,7 @@ def simulate_strategy(
         meta = expected.loc[expected["as_of_date"].astype(str) == as_of_date].iloc[0]
         stale_day = bool(meta["stale_data_warning"])
         stale_reason = meta["stale_data_reason"]
+        regime = (market_regime_map or {}).get(as_of_date, {})
         group_df = daily_map.get(as_of_date, pd.DataFrame()).copy()
         day_symbols = symbol_map.get(as_of_date, {})
         sold_today: set[str] = set()
@@ -591,6 +882,7 @@ def simulate_strategy(
                     trading_dates=trading_dates,
                     idx_map=idx_map,
                     holding_days=holding_days,
+                    cost_bps=cost_bps,
                 )
                 if bought:
                     opened_today.add(symbol)
@@ -605,7 +897,8 @@ def simulate_strategy(
             if exit_price is None:
                 remaining_positions.append(pos)
                 continue
-            exit_value = pos["shares"] * exit_price
+            actual_exit_price = exit_price * (1.0 - cost_bps / 10000.0)
+            exit_value = pos["shares"] * actual_exit_price
             pnl = exit_value - pos["entry_value"]
             return_pct = (exit_value / pos["entry_value"] - 1.0) * 100.0 if pos["entry_value"] else None
             cash += exit_value
@@ -720,6 +1013,7 @@ def simulate_strategy(
                     trading_dates=trading_dates,
                     idx_map=idx_map,
                     holding_days=holding_days,
+                    cost_bps=cost_bps,
                 )
                 if bought:
                     opened_today.add(symbol)
@@ -854,6 +1148,12 @@ def simulate_strategy(
                 "pending_expired_count": int(pending_expired_count),
                 "stale_data_warning": stale_day,
                 "stale_data_reason": stale_reason,
+                "weak_score": regime.get("weak_score"),
+                "adaptive_selected_mode": regime.get("adaptive_selected_mode"),
+                "cash_no_buy_day": bool(
+                    cfg["base_group"] in ("adaptive_regime_v1", "adaptive_v1_cash_no_buy")
+                    and regime.get("adaptive_selected_mode") == "cash"
+                ),
             }
         )
         prev_equity = total_equity
@@ -914,7 +1214,10 @@ def _monthly_strategy_metrics(strategy_name: str, daily_df: pd.DataFrame, trades
     rows: list[dict[str, Any]] = []
     daily = daily_df.copy()
     daily["month"] = daily["as_of_date"].astype(str).str.slice(0, 7)
-    closed = trades_df.loc[trades_df["exit_trade_date"].notna()].copy()
+    if not trades_df.empty and "exit_trade_date" in trades_df.columns:
+        closed = trades_df.loc[trades_df["exit_trade_date"].notna()].copy()
+    else:
+        closed = pd.DataFrame()
     if not closed.empty:
         closed["month"] = closed["exit_trade_date"].astype(str).str.slice(0, 7)
     for month, grp in daily.groupby("month", sort=True):
@@ -985,8 +1288,11 @@ def _summarize_strategy(
     eq_series = pd.to_numeric(daily_df["total_equity"], errors="coerce")
     running_max = eq_series.cummax()
     dd = ((eq_series / running_max) - 1.0) * 100.0 if not eq_series.empty else pd.Series(dtype=float)
-    closed = trades_df.loc[trades_df["exit_trade_date"].notna()].copy()
-    trade_returns = pd.to_numeric(closed["return_pct"], errors="coerce").dropna() if not closed.empty else pd.Series(dtype=float)
+    if not trades_df.empty and "exit_trade_date" in trades_df.columns:
+        closed = trades_df.loc[trades_df["exit_trade_date"].notna()].copy()
+    else:
+        closed = pd.DataFrame()
+    trade_returns = pd.to_numeric(closed["return_pct"], errors="coerce").dropna() if not closed.empty and "return_pct" in closed.columns else pd.Series(dtype=float)
     month_returns = pd.to_numeric(monthly_df["month_return_pct"], errors="coerce").dropna() if not monthly_df.empty else pd.Series(dtype=float)
     best_month_idx = month_returns.idxmax() if not month_returns.empty else None
     worst_month_idx = month_returns.idxmin() if not month_returns.empty else None
@@ -1026,6 +1332,7 @@ def _summarize_strategy(
         "pending_bought_count": int((pending_df["event_type"] == "bought_from_queue").sum()) if not pending_df.empty else 0,
         "pending_expired_count": int((pending_df["event_type"] == "expired").sum()) if not pending_df.empty else 0,
         "pending_revalidate_failed_count": int((pending_df["event_type"] == "revalidate_failed").sum()) if not pending_df.empty else 0,
+        "cash_no_buy_day_count": int(daily_df["cash_no_buy_day"].fillna(False).astype(bool).sum()) if not daily_df.empty and "cash_no_buy_day" in daily_df.columns else 0,
     }
 
 
@@ -1033,6 +1340,7 @@ def _daily_new_signal_tables(
     daily_all: pd.DataFrame,
     summary_df: pd.DataFrame,
     max_holdings: int,
+    market_regime_map: dict | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     expected = summary_df.loc[summary_df["is_expected_trading_day"].astype(bool), ["as_of_date", "stale_data_warning", "stale_data_reason"]].copy()
     expected_dates = expected["as_of_date"].astype(str).tolist()
@@ -1045,6 +1353,9 @@ def _daily_new_signal_tables(
         for as_of_date in expected_dates:
             meta = expected.loc[expected["as_of_date"].astype(str) == as_of_date].iloc[0]
             day_df = daily_all.loc[daily_all["as_of_date"].astype(str) == as_of_date].copy()
+            if filter_name in ("adaptive_regime_v1", "adaptive_v1_cash_no_buy") and market_regime_map is not None:
+                regime = market_regime_map.get(as_of_date, {})
+                day_df.attrs["weak_score"] = regime.get("weak_score", 0)
             sel = _select_group(day_df, filter_name, max_holdings)
             symbols = sel["symbol"].astype(str).tolist() if not sel.empty else []
             curr = set(symbols)
@@ -1052,41 +1363,42 @@ def _daily_new_signal_tables(
             new = curr - prev
             dropped = prev - curr
             first_time = [s for s in new if s not in seen]
-            for _, row in sel.loc[sel["symbol"].astype(str).isin(new)].iterrows():
-                sym = str(row["symbol"])
-                new_rows.append(
-                    {
-                        "as_of_date": as_of_date,
-                        "filter_name": filter_name,
-                        "symbol": sym,
-                        "production_rank": row.get("production_rank"),
-                        "special_tier": row.get("special_tier"),
-                        "special_score": row.get("special_score"),
-                        "liquidity_safe_score": row.get("liquidity_safe_score"),
-                        "balanced_score": row.get("balanced_score"),
-                        "momentum_quality_score": row.get("momentum_quality_score"),
-                        "tv_momentum_score": row.get("tv_momentum_score"),
-                        "volume_ratio_20d": row.get("volume_ratio_20d"),
-                        "turnover_ratio_20d": row.get("turnover_ratio_20d"),
-                        "avg_turnover_20d": row.get("avg_turnover_20d"),
-                        "avg_turnover_30d": row.get("avg_turnover_30d"),
-                        "turnover_today": row.get("turnover_today"),
-                        "rsi_14": row.get("rsi_14"),
-                        "macd_hist": row.get("macd_hist"),
-                        "adx_14": row.get("adx_14"),
-                        "adr_pct": row.get("adr_pct"),
-                        "ema8": row.get("ema8"),
-                        "ema21": row.get("ema21"),
-                        "ema20": row.get("ema20"),
-                        "ema50": row.get("ema50"),
-                        "ema60": row.get("ema60"),
-                        "close": row.get("close"),
-                        "close_gt_ema20": row.get("close_gt_ema20"),
-                        "ema20_gt_ema50": row.get("ema20_gt_ema50"),
-                        "ema8_gte_ema21": row.get("ema8_gte_ema21"),
-                        "close_gt_ema60": row.get("close_gt_ema60"),
-                        "perf_3m_pct": row.get("perf_3m_pct"),
-                        "perf_6m_pct": row.get("perf_6m_pct"),
+            if not sel.empty and "symbol" in sel.columns:
+                for _, row in sel.loc[sel["symbol"].astype(str).isin(new)].iterrows():
+                    sym = str(row["symbol"])
+                    new_rows.append(
+                        {
+                            "as_of_date": as_of_date,
+                            "filter_name": filter_name,
+                            "symbol": sym,
+                            "production_rank": row.get("production_rank"),
+                            "special_tier": row.get("special_tier"),
+                            "special_score": row.get("special_score"),
+                            "liquidity_safe_score": row.get("liquidity_safe_score"),
+                            "balanced_score": row.get("balanced_score"),
+                            "momentum_quality_score": row.get("momentum_quality_score"),
+                            "tv_momentum_score": row.get("tv_momentum_score"),
+                            "volume_ratio_20d": row.get("volume_ratio_20d"),
+                            "turnover_ratio_20d": row.get("turnover_ratio_20d"),
+                            "avg_turnover_20d": row.get("avg_turnover_20d"),
+                            "avg_turnover_30d": row.get("avg_turnover_30d"),
+                            "turnover_today": row.get("turnover_today"),
+                            "rsi_14": row.get("rsi_14"),
+                            "macd_hist": row.get("macd_hist"),
+                            "adx_14": row.get("adx_14"),
+                            "adr_pct": row.get("adr_pct"),
+                            "ema8": row.get("ema8"),
+                            "ema21": row.get("ema21"),
+                            "ema20": row.get("ema20"),
+                            "ema50": row.get("ema50"),
+                            "ema60": row.get("ema60"),
+                            "close": row.get("close"),
+                            "close_gt_ema20": row.get("close_gt_ema20"),
+                            "ema20_gt_ema50": row.get("ema20_gt_ema50"),
+                            "ema8_gte_ema21": row.get("ema8_gte_ema21"),
+                            "close_gt_ema60": row.get("close_gt_ema60"),
+                            "perf_3m_pct": row.get("perf_3m_pct"),
+                            "perf_6m_pct": row.get("perf_6m_pct"),
                         "daily_change_pct": row.get("daily_change_pct"),
                         "daily_change_gt_2": row.get("daily_change_gt_2"),
                         "price_above_52w_low_pct": row.get("price_above_52w_low_pct"),
@@ -1137,6 +1449,7 @@ def _forward20_signals(
     price_cache: dict[str, pd.DataFrame],
     signal_decisions: pd.DataFrame,
     max_holdings: int,
+    market_regime_map: dict | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     expected_dates = summary_df.loc[summary_df["is_expected_trading_day"].astype(bool), "as_of_date"].astype(str).tolist()
     idx_map = {d: i for i, d in enumerate(expected_dates)}
@@ -1147,11 +1460,19 @@ def _forward20_signals(
         "special_strict": "special_strict_fresh_only",
         "special_strict_top10": "special_strict_top10_fresh_only",
         "tv_volume_momentum_trend": "tv_volume_momentum_trend_fresh_only",
+        "special_strict_quality_v2": "special_strict_quality_v2_fresh_only",
+        "adaptive_v1_cash_no_buy": "adaptive_v1_cash_no_buy_fresh_only",
+        "special_strict_score_threshold_50": "special_strict_score_threshold_50_fresh_only",
+        "special_strict_score_threshold_60": "special_strict_score_threshold_60_fresh_only",
     }
     rows: list[dict[str, Any]] = []
     for filter_name in FILTER_NAMES:
         for signal_date in expected_dates:
-            sel = _select_group(daily_all.loc[daily_all["as_of_date"].astype(str) == signal_date].copy(), filter_name, max_holdings)
+            day_df = daily_all.loc[daily_all["as_of_date"].astype(str) == signal_date].copy()
+            if filter_name in ("adaptive_regime_v1", "adaptive_v1_cash_no_buy") and market_regime_map is not None:
+                regime = market_regime_map.get(signal_date, {})
+                day_df.attrs["weak_score"] = regime.get("weak_score", 0)
+            sel = _select_group(day_df, filter_name, max_holdings)
             if sel.empty:
                 continue
             idx = idx_map[signal_date]
@@ -1162,7 +1483,7 @@ def _forward20_signals(
                 signal_close = _price_on_date(price_cache.get(symbol), signal_date, "close")
                 exit_close = _price_on_date(price_cache.get(symbol), exit_date, "close") if exit_date else None
                 fwd = ((exit_close / signal_close - 1.0) * 100.0) if signal_close not in (None, 0) and exit_close is not None else None
-                sname = strat_map[filter_name]
+                sname = strat_map.get(filter_name)
                 dec = pd.DataFrame()
                 if sname and not signal_decisions.empty:
                     dec = signal_decisions.loc[
@@ -1229,8 +1550,9 @@ def _forward20_signals(
 
 
 def run_simulation(args: argparse.Namespace) -> dict[str, pd.DataFrame]:
-    daily_all, summary_df, price_cache, resolved_end = _prepare_inputs(
+    daily_all, summary_df, price_cache, resolved_end, coverage_summary = _prepare_inputs(
         args.output_dir,
+        args.candidate_features_path,
         args.db_path,
         args.start_date,
         args.end_date,
@@ -1245,6 +1567,7 @@ def run_simulation(args: argparse.Namespace) -> dict[str, pd.DataFrame]:
     summary_rows: list[dict[str, Any]] = []
     benchmark_monthly = _monthly_benchmark(summary_df, price_cache)
     benchmark_total = _benchmark_total(summary_df, price_cache)
+    market_regime_map = _build_market_regime_map(daily_all, summary_df, price_cache)
 
     for strategy_name in STRATEGY_NAMES:
         daily_df, trades_df, pending_df, signal_df = simulate_strategy(
@@ -1260,6 +1583,7 @@ def run_simulation(args: argparse.Namespace) -> dict[str, pd.DataFrame]:
             exclude_stale_new_entries=bool(args.exclude_stale_new_entries),
             allow_same_day_reentry=bool(args.allow_same_day_reentry),
             min_position_value=float(args.min_position_value),
+            market_regime_map=market_regime_map,
         )
         monthly_df = _monthly_strategy_metrics(strategy_name, daily_df, trades_df, benchmark_monthly)
         all_daily.append(daily_df)
@@ -1269,8 +1593,8 @@ def run_simulation(args: argparse.Namespace) -> dict[str, pd.DataFrame]:
         all_monthly.append(monthly_df)
         for _, row in monthly_df.iterrows():
             m = str(row["month"])
-            c = trades_df.loc[trades_df["entry_trade_date"].astype(str).str.startswith(m)]
-            cc = trades_df.loc[trades_df["exit_trade_date"].astype(str).str.startswith(m)] if "exit_trade_date" in trades_df.columns else pd.DataFrame()
+            c = trades_df.loc[trades_df["entry_trade_date"].astype(str).str.startswith(m)] if not trades_df.empty and "entry_trade_date" in trades_df.columns else pd.DataFrame()
+            cc = trades_df.loc[trades_df["exit_trade_date"].astype(str).str.startswith(m)] if not trades_df.empty and "exit_trade_date" in trades_df.columns else pd.DataFrame()
             monthly_returns_rows.append(
                 {
                     "month": m,
@@ -1298,9 +1622,21 @@ def run_simulation(args: argparse.Namespace) -> dict[str, pd.DataFrame]:
             )
         )
 
-    daily_summary, new_symbols, new_signal_agg = _daily_new_signal_tables(daily_all, summary_df, int(args.max_holdings))
+    daily_summary, new_symbols, new_signal_agg = _daily_new_signal_tables(
+        daily_all,
+        summary_df,
+        int(args.max_holdings),
+        market_regime_map=market_regime_map,
+    )
     signal_decisions = pd.concat(all_signals, ignore_index=True) if all_signals else pd.DataFrame()
-    fwd_detail, fwd_summary = _forward20_signals(daily_all, summary_df, price_cache, signal_decisions, int(args.max_holdings))
+    fwd_detail, fwd_summary = _forward20_signals(
+        daily_all,
+        summary_df,
+        price_cache,
+        signal_decisions,
+        int(args.max_holdings),
+        market_regime_map=market_regime_map,
+    )
 
     return {
         "daily": pd.concat(all_daily, ignore_index=True) if all_daily else pd.DataFrame(),
@@ -1315,6 +1651,9 @@ def run_simulation(args: argparse.Namespace) -> dict[str, pd.DataFrame]:
         "filter_missed_opportunity_summary": fwd_summary,
         "rolling_portfolio_monthly_returns": pd.DataFrame(monthly_returns_rows).sort_values(["month", "filter_name"]).reset_index(drop=True),
         "new_signal_agg": new_signal_agg,
+        "adaptive_regime_summary": pd.DataFrame(
+            [{"date": d, **meta} for d, meta in market_regime_map.items()]
+        ),
     }
 
 
@@ -1328,6 +1667,7 @@ def _console_rolling_summary(summary_df: pd.DataFrame) -> pd.DataFrame:
             "win_rate_pct",
             "avg_trade_return_pct",
             "max_drawdown_pct",
+            "cash_no_buy_day_count",
         ]
     ].copy()
 
@@ -1348,6 +1688,7 @@ def main() -> None:
     results["filter_signal_forward_return_20d"].to_csv(out_root / "filter_signal_forward_return_20d_2026.csv", index=False)
     results["filter_missed_opportunity_summary"].to_csv(out_root / "filter_missed_opportunity_summary_2026.csv", index=False)
     results["rolling_portfolio_monthly_returns"].to_csv(out_root / "rolling_portfolio_monthly_returns_2026.csv", index=False)
+    results["adaptive_regime_summary"].to_csv(out_root / "adaptive_regime_summary_2026.csv", index=False)
 
     print("FILTER_DAILY_NEW_SIGNAL_SUMMARY")
     print(results["new_signal_agg"].to_string(index=False))
