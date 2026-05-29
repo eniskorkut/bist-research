@@ -229,7 +229,7 @@ def _load_price_cache_full(db_path: str, symbols: list[str]) -> dict[str, pd.Dat
                 if col not in frame.columns:
                     frame[col] = frame["close"] if col != "volume" else pd.NA
                 frame[col] = pd.to_numeric(frame[col], errors="coerce")
-            frame["date"] = pd.to_datetime(frame["date"], errors="coerce").dt.tz_localize(None)
+            frame["date"] = pd.to_datetime(frame["date"], format="ISO8601", utc=True).dt.tz_convert("Europe/Istanbul").dt.tz_localize(None)
             frame = frame.dropna(subset=["date", "close"]).sort_values("date").reset_index(drop=True)
             if frame.empty:
                 continue
@@ -900,31 +900,36 @@ def simulate_strategy(
         remaining_positions: list[dict[str, Any]] = []
         for pos in positions:
             scheduled_exit = pos.get("exit_trade_date")
-            # Determine if this position should exit today:
-            # 1. Scheduled exit date matches today
-            # 2. OR exit_trade_date is None (couldn't compute) and position has been
-            #    held for >= holding_days trading days — force-close as fallback
+            entry_trade_date = pos.get("entry_trade_date")
+            entry_idx = idx_map.get(entry_trade_date)
+            current_idx = idx_map.get(as_of_date)
+
+            exit_idx = None
+            if scheduled_exit:
+                exit_idx = idx_map.get(scheduled_exit)
+            elif entry_idx is not None:
+                exit_idx = entry_idx + holding_days - 1
+
             should_exit = False
             force_exit_reason = None
-            if scheduled_exit == as_of_date:
-                should_exit = True
-            elif scheduled_exit is None:
-                entry_idx = idx_map.get(pos.get("entry_trade_date"))
-                current_idx = idx_map.get(as_of_date)
-                if entry_idx is not None and current_idx is not None:
-                    days_held = current_idx - entry_idx
-                    if days_held >= holding_days:
-                        should_exit = True
-                        force_exit_reason = "hold20_close_fallback"
+
+            if current_idx is not None and exit_idx is not None:
+                if current_idx >= exit_idx:
+                    should_exit = True
+                    # If we are strictly past the scheduled exit day, we force-close at entry price if needed
+                    if current_idx > exit_idx:
+                        force_exit_reason = "hold_exceeded_fallback"
 
             if not should_exit:
                 remaining_positions.append(pos)
                 continue
+
             exit_price = _price_on_date(price_cache.get(pos["symbol"]), as_of_date, "close")
             if exit_price is None:
-                # If still no price, try entry price as last resort after holding too long
+                # If still no price, try entry price as last resort after holding too long (past exit date)
                 if force_exit_reason:
                     exit_price = pos["entry_price"]
+                    force_exit_reason = "hold_exceeded_no_price_force"
                 else:
                     remaining_positions.append(pos)
                     continue
@@ -1228,13 +1233,19 @@ def _monthly_benchmark(summary_df: pd.DataFrame, price_cache: dict[str, pd.DataF
     expected["month"] = expected["as_of_date"].astype(str).str.slice(0, 7)
     rows: list[dict[str, Any]] = []
     for month, grp in expected.groupby("month", sort=True):
-        grp = grp.sort_values("as_of_date")
-        entry_date = str(grp.iloc[0]["as_of_date"])
-        exit_date = str(grp.iloc[-1]["as_of_date"])
         row: dict[str, Any] = {"month": month}
         for symbol, prefix in BENCHMARKS:
-            entry = _price_on_date(price_cache.get(symbol), entry_date, "close")
-            exitp = _price_on_date(price_cache.get(symbol), exit_date, "close")
+            df_sym = price_cache.get(symbol)
+            if df_sym is not None and not df_sym.empty:
+                df_month = df_sym[df_sym["date_str"].str.slice(0, 7) == month]
+                if not df_month.empty:
+                    df_month = df_month.sort_values("date")
+                    entry = float(df_month.iloc[0]["close"])
+                    exitp = float(df_month.iloc[-1]["close"])
+                else:
+                    entry, exitp = None, None
+            else:
+                entry, exitp = None, None
             row[f"{prefix}_return_pct"] = ((exitp / entry - 1.0) * 100.0) if entry not in (None, 0) and exitp is not None else None
             row[f"{prefix}_missing"] = bool(entry in (None, 0) or exitp is None)
         rows.append(row)
@@ -1293,12 +1304,19 @@ def _benchmark_total(summary_df: pd.DataFrame, price_cache: dict[str, pd.DataFra
     expected = summary_df.loc[summary_df["is_expected_trading_day"].astype(bool), "as_of_date"].astype(str).tolist()
     if not expected:
         return {"xu100_total_return_pct": None, "xutum_total_return_pct": None}
-    start = expected[0]
-    end = expected[-1]
     out: dict[str, float | None] = {}
     for symbol, prefix in BENCHMARKS:
-        start_close = _price_on_date(price_cache.get(symbol), start, "close")
-        end_close = _price_on_date(price_cache.get(symbol), end, "close")
+        df_sym = price_cache.get(symbol)
+        if df_sym is not None and not df_sym.empty:
+            df_filtered = df_sym[df_sym["date_str"].isin(expected)]
+            if not df_filtered.empty:
+                df_filtered = df_filtered.sort_values("date")
+                start_close = float(df_filtered.iloc[0]["close"])
+                end_close = float(df_filtered.iloc[-1]["close"])
+            else:
+                start_close, end_close = None, None
+        else:
+            start_close, end_close = None, None
         out[f"{prefix}_total_return_pct"] = ((end_close / start_close - 1.0) * 100.0) if start_close not in (None, 0) and end_close is not None else None
     return out
 
@@ -1696,7 +1714,7 @@ def run_simulation(args: argparse.Namespace) -> dict[str, pd.DataFrame]:
     except Exception:
         pass
 
-    num_workers = min(multiprocessing.cpu_count(), len(STRATEGY_NAMES), 10)
+    num_workers = min(multiprocessing.cpu_count(), len(STRATEGY_NAMES))
     print(f"Running simulation for {len(STRATEGY_NAMES)} strategies in parallel using {num_workers} processes...")
 
     strategy_results = []
