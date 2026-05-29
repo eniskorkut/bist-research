@@ -890,13 +890,35 @@ def simulate_strategy(
 
         remaining_positions: list[dict[str, Any]] = []
         for pos in positions:
-            if pos.get("exit_trade_date") != as_of_date:
+            scheduled_exit = pos.get("exit_trade_date")
+            # Determine if this position should exit today:
+            # 1. Scheduled exit date matches today
+            # 2. OR exit_trade_date is None (couldn't compute) and position has been
+            #    held for >= holding_days trading days — force-close as fallback
+            should_exit = False
+            force_exit_reason = None
+            if scheduled_exit == as_of_date:
+                should_exit = True
+            elif scheduled_exit is None:
+                entry_idx = idx_map.get(pos.get("entry_trade_date"))
+                current_idx = idx_map.get(as_of_date)
+                if entry_idx is not None and current_idx is not None:
+                    days_held = current_idx - entry_idx
+                    if days_held >= holding_days:
+                        should_exit = True
+                        force_exit_reason = "hold20_close_fallback"
+
+            if not should_exit:
                 remaining_positions.append(pos)
                 continue
             exit_price = _price_on_date(price_cache.get(pos["symbol"]), as_of_date, "close")
             if exit_price is None:
-                remaining_positions.append(pos)
-                continue
+                # If still no price, try entry price as last resort after holding too long
+                if force_exit_reason:
+                    exit_price = pos["entry_price"]
+                else:
+                    remaining_positions.append(pos)
+                    continue
             actual_exit_price = exit_price * (1.0 - cost_bps / 10000.0)
             exit_value = pos["shares"] * actual_exit_price
             pnl = exit_value - pos["entry_value"]
@@ -919,7 +941,7 @@ def simulate_strategy(
                     "exit_value": float(exit_value),
                     "pnl": float(pnl),
                     "return_pct": float(return_pct) if return_pct is not None else None,
-                    "exit_reason": "hold20_close",
+                    "exit_reason": force_exit_reason or "hold20_close",
                     "production_rank": pos.get("production_rank"),
                     "special_tier": pos.get("special_tier"),
                     "special_score": pos.get("special_score"),
