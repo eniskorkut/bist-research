@@ -1375,6 +1375,16 @@ def _daily_new_signal_tables(
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     expected = summary_df.loc[summary_df["is_expected_trading_day"].astype(bool), ["as_of_date", "stale_data_warning", "stale_data_reason"]].copy()
     expected_dates = expected["as_of_date"].astype(str).tolist()
+
+    # Pre-convert dates to strings once and group/index for O(1) lookups
+    daily_all_str = daily_all.copy()
+    daily_all_str["as_of_date_str"] = daily_all_str["as_of_date"].astype(str).str.slice(0, 10)
+    daily_all_by_date = {d: grp for d, grp in daily_all_str.groupby("as_of_date_str")}
+
+    expected_str = expected.copy()
+    expected_str["as_of_date_str"] = expected_str["as_of_date"].astype(str).str.slice(0, 10)
+    expected_meta_by_date = expected_str.set_index("as_of_date_str").to_dict('index')
+
     summary_rows: list[dict[str, Any]] = []
     new_rows: list[dict[str, Any]] = []
     agg_rows: list[dict[str, Any]] = []
@@ -1382,8 +1392,15 @@ def _daily_new_signal_tables(
         seen: set[str] = set()
         prev: set[str] = set()
         for as_of_date in expected_dates:
-            meta = expected.loc[expected["as_of_date"].astype(str) == as_of_date].iloc[0]
-            day_df = daily_all.loc[daily_all["as_of_date"].astype(str) == as_of_date].copy()
+            meta = expected_meta_by_date.get(as_of_date)
+            if not meta:
+                continue
+            day_df = daily_all_by_date.get(as_of_date)
+            if day_df is None or day_df.empty:
+                day_df = pd.DataFrame()
+            else:
+                day_df = day_df.copy()
+
             if filter_name in ("adaptive_regime_v1", "adaptive_v1_cash_no_buy") and market_regime_map is not None:
                 regime = market_regime_map.get(as_of_date, {})
                 day_df.attrs["weak_score"] = regime.get("weak_score", 0)
@@ -1430,15 +1447,15 @@ def _daily_new_signal_tables(
                             "close_gt_ema60": row.get("close_gt_ema60"),
                             "perf_3m_pct": row.get("perf_3m_pct"),
                             "perf_6m_pct": row.get("perf_6m_pct"),
-                        "daily_change_pct": row.get("daily_change_pct"),
-                        "daily_change_gt_2": row.get("daily_change_gt_2"),
-                        "price_above_52w_low_pct": row.get("price_above_52w_low_pct"),
-                        "price_above_52w_low_gte_70": row.get("price_above_52w_low_gte_70"),
-                        "first_time_seen_in_filter": sym in first_time,
-                        "stale_data_warning": bool(meta["stale_data_warning"]),
-                        "stale_data_reason": meta["stale_data_reason"],
-                    }
-                )
+                            "daily_change_pct": row.get("daily_change_pct"),
+                            "daily_change_gt_2": row.get("daily_change_gt_2"),
+                            "price_above_52w_low_pct": row.get("price_above_52w_low_pct"),
+                            "price_above_52w_low_gte_70": row.get("price_above_52w_low_gte_70"),
+                            "first_time_seen_in_filter": sym in first_time,
+                            "stale_data_warning": bool(meta["stale_data_warning"]),
+                            "stale_data_reason": meta["stale_data_reason"],
+                        }
+                    )
             seen.update(curr)
             total = len(curr)
             new_cnt = len(new)
@@ -1496,10 +1513,28 @@ def _forward20_signals(
         "special_strict_score_threshold_50": "special_strict_score_threshold_50_fresh_only",
         "special_strict_score_threshold_60": "special_strict_score_threshold_60_fresh_only",
     }
+
+    # Pre-convert daily_all as_of_date to string once and group
+    daily_all_str = daily_all.copy()
+    daily_all_str["as_of_date_str"] = daily_all_str["as_of_date"].astype(str).str.slice(0, 10)
+    daily_all_by_date = {d: grp for d, grp in daily_all_str.groupby("as_of_date_str")}
+
+    # Pre-index signal_decisions by strategy_name, signal_date, and symbol for O(1) lookups
+    decisions_map = {}
+    if not signal_decisions.empty:
+        sd = signal_decisions.copy()
+        sd["signal_date_str"] = sd["signal_date"].astype(str).str.slice(0, 10)
+        sd["symbol_str"] = sd["symbol"].astype(str)
+        for (sname, sdate, sym), grp in sd.groupby(["strategy_name", "signal_date_str", "symbol_str"]):
+            decisions_map[(sname, sdate, sym)] = grp
+
     rows: list[dict[str, Any]] = []
     for filter_name in FILTER_NAMES:
         for signal_date in expected_dates:
-            day_df = daily_all.loc[daily_all["as_of_date"].astype(str) == signal_date].copy()
+            day_df = daily_all_by_date.get(signal_date)
+            if day_df is None or day_df.empty:
+                continue
+            day_df = day_df.copy()
             if filter_name in ("adaptive_regime_v1", "adaptive_v1_cash_no_buy") and market_regime_map is not None:
                 regime = market_regime_map.get(signal_date, {})
                 day_df.attrs["weak_score"] = regime.get("weak_score", 0)
@@ -1515,17 +1550,12 @@ def _forward20_signals(
                 exit_close = _price_on_date(price_cache.get(symbol), exit_date, "close") if exit_date else None
                 fwd = ((exit_close / signal_close - 1.0) * 100.0) if signal_close not in (None, 0) and exit_close is not None else None
                 sname = strat_map.get(filter_name)
-                dec = pd.DataFrame()
-                if sname and not signal_decisions.empty:
-                    dec = signal_decisions.loc[
-                        (signal_decisions["strategy_name"] == sname)
-                        & (signal_decisions["signal_date"].astype(str) == signal_date)
-                        & (signal_decisions["symbol"].astype(str) == symbol)
-                    ]
-                was_bought = bool(dec["was_bought_by_portfolio"].any()) if not dec.empty else False
-                skipped_full = bool(dec["was_skipped_due_to_full_slots"].any()) if not dec.empty else False
-                skipped_hold = bool(dec["was_skipped_due_to_already_holding"].any()) if not dec.empty else False
-                skipped_miss = bool(dec["was_skipped_due_to_missing_price"].any()) if not dec.empty else (signal_close is None or (exit_date is not None and exit_close is None))
+
+                dec = decisions_map.get((sname, signal_date, symbol)) if sname else None
+                was_bought = bool(dec["was_bought_by_portfolio"].any()) if dec is not None and not dec.empty else False
+                skipped_full = bool(dec["was_skipped_due_to_full_slots"].any()) if dec is not None and not dec.empty else False
+                skipped_hold = bool(dec["was_skipped_due_to_already_holding"].any()) if dec is not None and not dec.empty else False
+                skipped_miss = bool(dec["was_skipped_due_to_missing_price"].any()) if dec is not None and not dec.empty else (signal_close is None or (exit_date is not None and exit_close is None))
                 rows.append(
                     {
                         "signal_date": signal_date,
