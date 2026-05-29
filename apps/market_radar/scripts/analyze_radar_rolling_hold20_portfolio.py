@@ -295,8 +295,8 @@ def _build_indicator_snapshot(price_cache: dict[str, pd.DataFrame]) -> dict[tupl
             "close_vs_ema20_pct",
             "ema8_vs_ema21_pct",
         ]
-        for _, row in f[cols].iterrows():
-            out[(symbol, str(row["date_str"]))] = row.to_dict()
+        for row_dict in f[cols].to_dict('records'):
+            out[(symbol, str(row_dict["date_str"]))] = row_dict
     return out
 
 
@@ -424,6 +424,14 @@ def _enrich_daily_all(daily_all: pd.DataFrame, indicator_map: dict[tuple[str, st
 def _price_on_date(frame: pd.DataFrame | None, date_str: str, column: str) -> float | None:
     if frame is None or frame.empty or column not in frame.columns:
         return None
+    if frame.index.name == "date_str":
+        try:
+            val = frame.at[date_str, column]
+            if isinstance(val, pd.Series):
+                val = val.iloc[0]
+            return None if pd.isna(val) else float(val)
+        except KeyError:
+            return None
     row = frame.loc[frame["date_str"] == date_str]
     if row.empty:
         return None
@@ -450,12 +458,13 @@ def _build_market_regime_map(
         f = frame.copy().sort_values("date").reset_index(drop=True)
         close = pd.to_numeric(f.get("close"), errors="coerce")
         f["ma20_breadth"] = close.rolling(20, min_periods=20).mean()
-        for _, row in f.loc[f["date_str"].isin(expected_set), ["date_str", "close", "ma20_breadth"]].iterrows():
-            close_val = pd.to_numeric(row["close"], errors="coerce")
-            ma20_val = pd.to_numeric(row["ma20_breadth"], errors="coerce")
+        sel = f.loc[f["date_str"].isin(expected_set), ["date_str", "close", "ma20_breadth"]]
+        for row_dict in sel.to_dict('records'):
+            close_val = row_dict["close"]
+            ma20_val = row_dict["ma20_breadth"]
             if pd.isna(close_val) or pd.isna(ma20_val):
                 continue
-            counts = breadth_counts[str(row["date_str"])]
+            counts = breadth_counts[str(row_dict["date_str"])]
             counts[1] += 1
             if float(close_val) > float(ma20_val):
                 counts[0] += 1
@@ -468,12 +477,12 @@ def _build_market_regime_map(
         x["ma50"] = close.rolling(50, min_periods=50).mean()
         x["return_20d_pct"] = (close / close.shift(20) - 1.0) * 100.0
         x["ma50_slope_10d"] = (x["ma50"] / x["ma50"].shift(10) - 1.0) * 100.0
-        for _, row in x.loc[x["date_str"].isin(expected_set)].iterrows():
-            xu_map[str(row["date_str"])] = {
-                "xu100_close": row.get("close"),
-                "xu100_ma50": row.get("ma50"),
-                "xu100_return_20d_pct": row.get("return_20d_pct"),
-                "xu100_ma50_slope_10d": row.get("ma50_slope_10d"),
+        for row_dict in x.loc[x["date_str"].isin(expected_set)].to_dict('records'):
+            xu_map[str(row_dict["date_str"])] = {
+                "xu100_close": row_dict.get("close"),
+                "xu100_ma50": row_dict.get("ma50"),
+                "xu100_return_20d_pct": row_dict.get("return_20d_pct"),
+                "xu100_ma50_slope_10d": row_dict.get("ma50_slope_10d"),
             }
 
     out: dict[str, dict[str, Any]] = {}
@@ -1571,6 +1580,40 @@ def _forward20_signals(
     return detail, pd.DataFrame(summary_rows).sort_values("filter_name").reset_index(drop=True)
 
 
+def _run_single_strategy(task_args):
+    (
+        strategy_name,
+        daily_all,
+        summary_df,
+        price_cache,
+        initial_capital,
+        max_holdings,
+        holding_days,
+        entry_mode,
+        exit_mode,
+        exclude_stale_new_entries,
+        allow_same_day_reentry,
+        min_position_value,
+        market_regime_map,
+    ) = task_args
+    daily_df, trades_df, pending_df, signal_df = simulate_strategy(
+        strategy_name,
+        daily_all,
+        summary_df,
+        price_cache,
+        initial_capital=initial_capital,
+        max_holdings=max_holdings,
+        holding_days=holding_days,
+        entry_mode=entry_mode,
+        exit_mode=exit_mode,
+        exclude_stale_new_entries=exclude_stale_new_entries,
+        allow_same_day_reentry=allow_same_day_reentry,
+        min_position_value=min_position_value,
+        market_regime_map=market_regime_map,
+    )
+    return strategy_name, daily_df, trades_df, pending_df, signal_df
+
+
 def run_simulation(args: argparse.Namespace) -> dict[str, pd.DataFrame]:
     daily_all, summary_df, price_cache, resolved_end, coverage_summary = _prepare_inputs(
         args.output_dir,
@@ -1580,6 +1623,11 @@ def run_simulation(args: argparse.Namespace) -> dict[str, pd.DataFrame]:
         args.end_date,
         args.exclude_stale_new_entries,
     )
+
+    # Pre-index price_cache by date_str for fast O(1) lookups during simulation
+    for symbol in price_cache:
+        price_cache[symbol] = price_cache[symbol].set_index("date_str", drop=False)
+
     all_daily: list[pd.DataFrame] = []
     all_trades: list[pd.DataFrame] = []
     all_pending: list[pd.DataFrame] = []
@@ -1591,22 +1639,47 @@ def run_simulation(args: argparse.Namespace) -> dict[str, pd.DataFrame]:
     benchmark_total = _benchmark_total(summary_df, price_cache)
     market_regime_map = _build_market_regime_map(daily_all, summary_df, price_cache)
 
+    # Parallel strategy execution setup
+    from concurrent.futures import ProcessPoolExecutor
+    import multiprocessing
+
+    tasks = []
     for strategy_name in STRATEGY_NAMES:
-        daily_df, trades_df, pending_df, signal_df = simulate_strategy(
+        tasks.append((
             strategy_name,
             daily_all,
             summary_df,
             price_cache,
-            initial_capital=float(args.initial_capital),
-            max_holdings=int(args.max_holdings),
-            holding_days=int(args.holding_days),
-            entry_mode=args.entry_mode,
-            exit_mode=args.exit_mode,
-            exclude_stale_new_entries=bool(args.exclude_stale_new_entries),
-            allow_same_day_reentry=bool(args.allow_same_day_reentry),
-            min_position_value=float(args.min_position_value),
-            market_regime_map=market_regime_map,
-        )
+            float(args.initial_capital),
+            int(args.max_holdings),
+            int(args.holding_days),
+            args.entry_mode,
+            args.exit_mode,
+            bool(args.exclude_stale_new_entries),
+            bool(args.allow_same_day_reentry),
+            float(args.min_position_value),
+            market_regime_map,
+        ))
+
+    try:
+        multiprocessing.set_start_method('fork', force=True)
+    except Exception:
+        pass
+
+    num_workers = min(multiprocessing.cpu_count(), len(STRATEGY_NAMES), 10)
+    print(f"Running simulation for {len(STRATEGY_NAMES)} strategies in parallel using {num_workers} processes...")
+
+    strategy_results = []
+    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        futures = [executor.submit(_run_single_strategy, t) for t in tasks]
+        for fut in futures:
+            strategy_results.append(fut.result())
+
+    # Map back results in original order
+    results_map = {res[0]: res[1:] for res in strategy_results}
+
+    for strategy_name in STRATEGY_NAMES:
+        daily_df, trades_df, pending_df, signal_df = results_map[strategy_name]
         monthly_df = _monthly_strategy_metrics(strategy_name, daily_df, trades_df, benchmark_monthly)
         all_daily.append(daily_df)
         all_trades.append(trades_df)
