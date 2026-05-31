@@ -8,3 +8,4 @@ data/
 *.sqlite
 *.db
 backtest_outputs/
+logs/

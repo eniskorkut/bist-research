@@ -3,8 +3,12 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import selectors
+import shlex
 import sqlite3
+import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +25,7 @@ DEFAULT_OUTPUT_DIR = "data/backtest_outputs/period_runs_volume_spike_quality_202
 DEFAULT_OUT_ROOT = "data/backtest_outputs/radar_rolling_hold20_portfolio_2026"
 DEFAULT_DB_PATH = "data/market_radar_cache.sqlite"
 DEFAULT_START_DATE = "2026-01-01"
+DEFAULT_LIVE_PILOT_DIR = "data/backtest_outputs/market_radar_live_pilot"
 DEFAULT_INITIAL_CAPITAL = 10000.0
 DEFAULT_MAX_HOLDINGS = 10
 DEFAULT_HOLDING_DAYS = 20
@@ -58,6 +63,21 @@ STRATEGY_NAMES = [
     "special_strict_top10_pending_ttl5_revalidate",
     "tv_volume_momentum_trend_fresh_only",
 ]
+KAP_COLUMNS = [
+    "kap_event_count_7d",
+    "kap_latest_date",
+    "kap_event_types",
+    "kap_summary_short",
+    "kap_sentiment_label",
+    "kap_risk_flags",
+    "manual_review_note",
+]
+KAP_BREAKER_TERMS = [
+    "devre kesici",
+    "bistech",
+    "pay bazında devre kesici",
+    "pay bazinda devre kesici",
+]
 
 
 def _load_april_module():
@@ -90,6 +110,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--allow-same-day-reentry", action=argparse.BooleanOptionalAction, default=False)
     p.add_argument("--min-position-value", type=float, default=DEFAULT_MIN_POSITION_VALUE)
     p.add_argument("--quality-score-thresholds", default="40,50,60,70")
+    p.add_argument("--cost-bps", type=float, default=0.0)
+    p.add_argument("--kap-source", choices=["none", "file", "mcp"], default="none")
+    p.add_argument("--kap-events-path")
+    p.add_argument("--kap-lookback-days", type=int, default=7)
+    p.add_argument("--kap-mcp-command", default="docker compose run --rm -T borsa-mcp borsa-mcp")
+    p.add_argument("--live-pilot-dir", default=DEFAULT_LIVE_PILOT_DIR)
     return p.parse_args()
 
 
@@ -148,6 +174,472 @@ def _adaptive_mode_for_weak_score(weak_score: int) -> str:
     if weak_score == 3:
         return "threshold_60"
     return "cash"
+
+
+def _date_yyyy_mm_dd(value: Any) -> str:
+    if value is None or pd.isna(value):
+        return ""
+    month_map = {
+        "Oca": "Jan",
+        "Şub": "Feb",
+        "Sub": "Feb",
+        "Mar": "Mar",
+        "Nis": "Apr",
+        "May": "May",
+        "Haz": "Jun",
+        "Tem": "Jul",
+        "Ağu": "Aug",
+        "Agu": "Aug",
+        "Eyl": "Sep",
+        "Eki": "Oct",
+        "Kas": "Nov",
+        "Ara": "Dec",
+    }
+    raw = str(value)
+    for tr_month, en_month in month_map.items():
+        raw = raw.replace(tr_month, en_month)
+    try:
+        ts = pd.to_datetime(raw)
+    except Exception:
+        return str(value)[:10]
+    if pd.isna(ts):
+        return ""
+    return str(ts.date())
+
+
+def _normalize_kap_event(event: dict[str, Any]) -> dict[str, Any]:
+    date_value = (
+        event.get("date")
+        or event.get("publish_date")
+        or event.get("published_at")
+        or event.get("disclosure_date")
+        or event.get("kap_date")
+        or event.get("created_at")
+    )
+    event_type = event.get("event_type") or event.get("type") or event.get("category") or event.get("subject") or ""
+    title = event.get("title") or event.get("headline") or event.get("summary") or event.get("text") or ""
+    summary = event.get("summary") or event.get("description") or event.get("text") or title
+    return {
+        "symbol": str(event.get("symbol") or event.get("ticker") or event.get("code") or "").upper().strip(),
+        "date": _date_yyyy_mm_dd(date_value),
+        "event_type": str(event_type).strip(),
+        "title": str(title).strip(),
+        "summary": str(summary).strip(),
+        "news_id": event.get("news_id") or event.get("id") or "",
+    }
+
+
+def _load_kap_events(path: str | Path | None) -> dict[str, list[dict[str, Any]]]:
+    if not path:
+        return {}
+    event_path = Path(path)
+    if not event_path.exists():
+        raise FileNotFoundError(f"KAP events path missing: {event_path}")
+    if event_path.suffix.lower() == ".csv":
+        raw_events: Any = pd.read_csv(event_path).to_dict("records")
+    else:
+        with event_path.open("r", encoding="utf-8") as fh:
+            raw_events = json.load(fh)
+    if isinstance(raw_events, dict):
+        expanded: list[dict[str, Any]] = []
+        for symbol, events in raw_events.items():
+            for event in events or []:
+                if isinstance(event, dict):
+                    expanded.append({"symbol": symbol, **event})
+        raw_events = expanded
+    out: dict[str, list[dict[str, Any]]] = {}
+    for event in raw_events or []:
+        if not isinstance(event, dict):
+            continue
+        normalized = _normalize_kap_event(event)
+        symbol = normalized.get("symbol")
+        if not symbol:
+            continue
+        out.setdefault(symbol, []).append(normalized)
+    for symbol in out:
+        out[symbol].sort(key=lambda item: item.get("date") or "", reverse=True)
+    return out
+
+
+class BorsaMcpKapFetcher:
+    def __init__(self, command: str, timeout_seconds: int = 25) -> None:
+        self.command = shlex.split(command)
+        self.timeout_seconds = int(timeout_seconds)
+        self._next_id = 1
+        self._proc = subprocess.Popen(
+            self.command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            bufsize=0,
+        )
+        self._selector = selectors.DefaultSelector()
+        assert self._proc.stdout is not None
+        self._selector.register(self._proc.stdout, selectors.EVENT_READ)
+        self._request(
+            "initialize",
+            {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "market-radar-kap", "version": "0.1"},
+            },
+        )
+        self._notify("notifications/initialized", {})
+
+    def close(self) -> None:
+        try:
+            self._proc.terminate()
+        except Exception:
+            pass
+
+    def _notify(self, method: str, params: dict[str, Any]) -> None:
+        if self._proc.stdin is None:
+            return
+        self._proc.stdin.write(json.dumps({"jsonrpc": "2.0", "method": method, "params": params}) + "\n")
+        self._proc.stdin.flush()
+
+    def _request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        request_id = self._next_id
+        self._next_id += 1
+        if self._proc.stdin is None:
+            raise RuntimeError("borsa-mcp stdin is closed")
+        self._proc.stdin.write(json.dumps({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}) + "\n")
+        self._proc.stdin.flush()
+        deadline = time.time() + self.timeout_seconds
+        while time.time() < deadline:
+            for key, _ in self._selector.select(timeout=min(1.0, max(0.0, deadline - time.time()))):
+                line = key.fileobj.readline()
+                if not line:
+                    continue
+                try:
+                    payload = json.loads(line)
+                except Exception:
+                    continue
+                if payload.get("id") == request_id:
+                    if payload.get("error"):
+                        raise RuntimeError(payload["error"])
+                    return payload
+        raise TimeoutError(f"borsa-mcp request timed out: {method}")
+
+    def __call__(self, symbol: str, as_of_date: str, lookback_days: int) -> list[dict[str, Any]]:
+        limit = min(50, max(10, int(lookback_days) * 4))
+        response = self._request(
+            "tools/call",
+            {"name": "get_news", "arguments": {"symbol": str(symbol).upper(), "limit": limit}},
+        )
+        result = response.get("result", {})
+        content = result.get("structuredContent")
+        if not content:
+            text_payload = ""
+            for item in result.get("content", []) or []:
+                if isinstance(item, dict) and item.get("type") == "text":
+                    text_payload = item.get("text") or ""
+                    break
+            if text_payload:
+                try:
+                    content = json.loads(text_payload)
+                except Exception:
+                    content = {}
+        news_items = (content or {}).get("news", [])
+        events: list[dict[str, Any]] = []
+        for item in news_items:
+            if not isinstance(item, dict):
+                continue
+            events.append(
+                {
+                    "symbol": symbol,
+                    "date": item.get("published_date") or item.get("date"),
+                    "event_type": item.get("source") or item.get("event_type") or "KAP",
+                    "title": item.get("title") or "",
+                    "summary": item.get("summary") or item.get("title") or "",
+                    "news_id": item.get("id") or item.get("url") or "",
+                }
+            )
+        return events
+
+
+def _recent_kap_events(events: list[dict[str, Any]], as_of_date: str, lookback_days: int) -> list[dict[str, Any]]:
+    as_of = pd.to_datetime(as_of_date)
+    start = as_of - pd.Timedelta(days=int(lookback_days))
+    recent: list[dict[str, Any]] = []
+    for event in events:
+        event_date = pd.to_datetime(event.get("date"), errors="coerce")
+        if pd.isna(event_date):
+            continue
+        if start <= event_date <= as_of:
+            recent.append(event)
+    recent.sort(key=lambda item: item.get("date") or "", reverse=True)
+    return recent
+
+
+def _is_breaker_kap_event(event: dict[str, Any]) -> bool:
+    text = (
+        str(event.get("event_type", ""))
+        + " "
+        + str(event.get("title", ""))
+        + " "
+        + str(event.get("summary", ""))
+    ).casefold()
+    return any(term in text for term in KAP_BREAKER_TERMS)
+
+
+def _kap_sentiment_and_flags(events: list[dict[str, Any]]) -> tuple[str, str]:
+    if not events:
+        return "unknown", "recent_kap_none"
+    caution_terms = {
+        "ceza",
+        "dava",
+        "tedbir",
+        "uyarı",
+        "uyari",
+        "zarar",
+        "temerrüt",
+        "temerrut",
+        "haciz",
+        "soruşturma",
+        "sorusturma",
+        "pay satış",
+        "pay satis",
+        "lawsuit",
+        "penalty",
+        "sanction",
+        "default",
+    }
+    positive_terms = {
+        "temettü",
+        "temettu",
+        "kar payı",
+        "kar payi",
+        "geri alım",
+        "geri alim",
+        "ihale",
+        "sözleşme",
+        "sozlesme",
+        "yatırım",
+        "yatirim",
+        "sipariş",
+        "siparis",
+        "bedelsiz",
+        "buyback",
+        "dividend",
+        "contract",
+        "investment",
+    }
+    text = " ".join(
+        str(event.get("event_type", "")) + " " + str(event.get("title", "")) + " " + str(event.get("summary", ""))
+        for event in events
+    ).casefold()
+    cautions = sorted(term for term in caution_terms if term in text)
+    if cautions:
+        return "caution", ",".join(cautions)
+    positives = sorted(term for term in positive_terms if term in text)
+    if positives:
+        return "positive", ",".join(positives)
+    return "neutral", ""
+
+
+def _summarize_kap_events(
+    events: list[dict[str, Any]],
+    as_of_date: str,
+    lookback_days: int,
+) -> dict[str, Any]:
+    recent = _recent_kap_events(events, as_of_date, lookback_days)
+    recent = [event for event in recent if not _is_breaker_kap_event(event)]
+    if not recent:
+        return {
+            "kap_event_count_7d": 0,
+            "kap_latest_date": "",
+            "kap_event_types": "",
+            "kap_summary_short": "recent_kap_none",
+            "kap_sentiment_label": "unknown",
+            "kap_risk_flags": "recent_kap_none",
+            "manual_review_note": "recent_kap_none",
+        }
+    event_types = sorted({str(event.get("event_type") or "unknown").strip() for event in recent if str(event.get("event_type") or "").strip()})
+    summary_parts = []
+    for event in recent[:3]:
+        label = str(event.get("event_type") or "KAP").strip()
+        title = str(event.get("title") or event.get("summary") or "").strip()
+        summary_parts.append(f"{event.get('date')}: {label} - {title}".strip(" -"))
+    sentiment, flags = _kap_sentiment_and_flags(recent)
+    short = " | ".join(summary_parts)
+    if len(short) > 320:
+        short = short[:317] + "..."
+    return {
+        "kap_event_count_7d": int(len(recent)),
+        "kap_latest_date": recent[0].get("date") or "",
+        "kap_event_types": ",".join(event_types),
+        "kap_summary_short": short,
+        "kap_sentiment_label": sentiment,
+        "kap_risk_flags": flags,
+        "manual_review_note": "manual_kap_review_required",
+    }
+
+
+def _fetch_recent_kap_summary(
+    symbol: str,
+    as_of_date: str,
+    lookback_days: int,
+    events_by_symbol: dict[str, list[dict[str, Any]]] | None = None,
+    kap_fetcher: Any | None = None,
+) -> dict[str, Any]:
+    events: list[dict[str, Any]] = []
+    if kap_fetcher is not None:
+        try:
+            fetched = kap_fetcher(symbol, as_of_date, lookback_days) or []
+            events.extend(_normalize_kap_event({**event, "symbol": symbol}) for event in fetched if isinstance(event, dict))
+        except Exception as exc:
+            return {
+                "kap_event_count_7d": 0,
+                "kap_latest_date": "",
+                "kap_event_types": "",
+                "kap_summary_short": "kap_fetch_failed",
+                "kap_sentiment_label": "unknown",
+                "kap_risk_flags": "kap_fetch_failed",
+                "manual_review_note": f"kap_fetch_failed: {exc}",
+            }
+    if events_by_symbol is not None:
+        events.extend(events_by_symbol.get(str(symbol).upper(), []))
+    return _summarize_kap_events(events, as_of_date, lookback_days)
+
+
+def _enrich_top30_with_kap(
+    top30: pd.DataFrame,
+    as_of_date: str,
+    lookback_days: int = 7,
+    events_by_symbol: dict[str, list[dict[str, Any]]] | None = None,
+    kap_fetcher: Any | None = None,
+) -> pd.DataFrame:
+    out = top30.copy().reset_index(drop=True)
+    summaries = [
+        _fetch_recent_kap_summary(str(row.get("symbol")), as_of_date, lookback_days, events_by_symbol, kap_fetcher)
+        for _, row in out.iterrows()
+    ]
+    summary_df = pd.DataFrame(summaries, columns=KAP_COLUMNS)
+    return pd.concat([out.reset_index(drop=True), summary_df.reset_index(drop=True)], axis=1)
+
+
+def _live_pilot_action(row: pd.Series, weak_score: int, selected_mode: str) -> tuple[str, str]:
+    if weak_score >= 4 or selected_mode == "cash":
+        return "NO_BUY_MARKET_WEAK", "adaptive_cash_mode_weak_score_4"
+    strict = bool(row.get("passes_special_strict", False))
+    score = pd.to_numeric(pd.Series([row.get("quality_threshold_score")]), errors="coerce").iloc[0]
+    if selected_mode == "special_strict":
+        if strict:
+            return "BUY_CANDIDATE", "passes_special_strict"
+        return "WATCH_ONLY", "top30_reference_not_special_strict"
+    if selected_mode == "threshold_50":
+        if strict and pd.notna(score) and float(score) >= 50.0:
+            return "BUY_CANDIDATE", "passes_special_strict_and_threshold_50"
+        return "WATCH_ONLY", "top30_reference_below_threshold_50"
+    if selected_mode == "threshold_60":
+        if strict and pd.notna(score) and float(score) >= 60.0:
+            return "BUY_CANDIDATE", "passes_special_strict_and_threshold_60"
+        return "WATCH_ONLY", "top30_reference_below_threshold_60"
+    return "WATCH_ONLY", "top30_reference"
+
+
+def _build_live_pilot_daily_radar(
+    daily_all: pd.DataFrame,
+    market_regime_map: dict[str, dict[str, Any]] | None,
+    as_of_date: str | None = None,
+    kap_lookback_days: int = 7,
+    events_by_symbol: dict[str, list[dict[str, Any]]] | None = None,
+    kap_fetcher: Any | None = None,
+) -> pd.DataFrame:
+    base_columns = [
+        "signal_date",
+        "symbol",
+        "close",
+        "volume",
+        "quality_threshold_score",
+        "liquidity_safe_score",
+        "balanced_score",
+        "momentum_quality_score",
+        "regime_label",
+        "weak_score",
+        "selected_strategy",
+        "passes_special_strict",
+        "passes_threshold_50",
+        "passes_threshold_60",
+        "action",
+        "reason",
+    ]
+    if daily_all.empty or "as_of_date" not in daily_all.columns:
+        return pd.DataFrame(columns=base_columns + KAP_COLUMNS)
+    all_dates = sorted(daily_all["as_of_date"].astype(str).str.slice(0, 10).dropna().unique().tolist())
+    signal_date = str(as_of_date or all_dates[-1])[:10]
+    day_df = daily_all.loc[daily_all["as_of_date"].astype(str).str.slice(0, 10) == signal_date].copy()
+    regime = (market_regime_map or {}).get(signal_date, {})
+    weak_score = int(regime.get("weak_score", 0) or 0)
+    selected_mode = str(regime.get("adaptive_selected_mode") or _adaptive_mode_for_weak_score(weak_score))
+    day_df.attrs["weak_score"] = weak_score
+    top30 = _select_group(day_df, "top30", 30)
+    if top30.empty:
+        return pd.DataFrame(columns=base_columns + KAP_COLUMNS)
+    top30 = top30.copy()
+    top30["signal_date"] = signal_date
+    top30["weak_score"] = weak_score
+    top30["selected_strategy"] = selected_mode
+    top30["regime_label"] = f"weak_score_{weak_score}_{selected_mode}"
+    score = pd.to_numeric(top30.get("quality_threshold_score"), errors="coerce")
+    strict_series = top30["passes_special_strict"].astype(bool) if "passes_special_strict" in top30.columns else pd.Series(False, index=top30.index)
+    top30["passes_threshold_50"] = strict_series & (score >= 50.0)
+    top30["passes_threshold_60"] = strict_series & (score >= 60.0)
+    actions = top30.apply(lambda row: _live_pilot_action(row, weak_score, selected_mode), axis=1)
+    top30["action"] = [item[0] for item in actions]
+    top30["reason"] = [item[1] for item in actions]
+    enriched = _enrich_top30_with_kap(
+        top30,
+        signal_date,
+        lookback_days=kap_lookback_days,
+        events_by_symbol=events_by_symbol,
+        kap_fetcher=kap_fetcher,
+    )
+    for col in ["quality_threshold_score", "liquidity_safe_score", "production_rank"]:
+        if col not in enriched.columns:
+            enriched[col] = pd.NA
+    enriched = enriched.sort_values(
+        ["quality_threshold_score", "liquidity_safe_score", "production_rank", "symbol"],
+        ascending=[False, False, True, True],
+        na_position="last",
+    ).reset_index(drop=True)
+    for col in base_columns + KAP_COLUMNS:
+        if col not in enriched.columns:
+            enriched[col] = pd.NA
+    return enriched[base_columns + KAP_COLUMNS + [c for c in enriched.columns if c not in base_columns + KAP_COLUMNS]]
+
+
+def _write_live_pilot_markdown(frame: pd.DataFrame, path: Path) -> None:
+    cols = [
+        "signal_date",
+        "symbol",
+        "production_rank",
+        "quality_threshold_score",
+        "weak_score",
+        "selected_strategy",
+        "action",
+        "kap_event_count_7d",
+        "kap_sentiment_label",
+        "kap_risk_flags",
+        "manual_review_note",
+    ]
+    visible = frame[[c for c in cols if c in frame.columns]].copy()
+    text = [
+        "# Daily Radar Final",
+        "",
+        "KAP layer is manual decision support only. It does not change ranking or generate automatic orders.",
+        "",
+    ]
+    if visible.empty:
+        text.append("No rows.")
+    else:
+        try:
+            text.append(visible.to_markdown(index=False))
+        except Exception:
+            text.append(visible.to_csv(index=False))
+    path.write_text("\n".join(text) + "\n", encoding="utf-8")
 
 
 def _parse_strategy_name(strategy_name: str, max_holdings: int) -> dict[str, Any]:
@@ -1642,6 +2134,7 @@ def _run_single_strategy(task_args):
         exclude_stale_new_entries,
         allow_same_day_reentry,
         min_position_value,
+        cost_bps,
         market_regime_map,
     ) = task_args
     daily_df, trades_df, pending_df, signal_df = simulate_strategy(
@@ -1657,6 +2150,7 @@ def _run_single_strategy(task_args):
         exclude_stale_new_entries=exclude_stale_new_entries,
         allow_same_day_reentry=allow_same_day_reentry,
         min_position_value=min_position_value,
+        cost_bps=cost_bps,
         market_regime_map=market_regime_map,
     )
     return strategy_name, daily_df, trades_df, pending_df, signal_df
@@ -1686,6 +2180,20 @@ def run_simulation(args: argparse.Namespace) -> dict[str, pd.DataFrame]:
     benchmark_monthly = _monthly_benchmark(summary_df, price_cache)
     benchmark_total = _benchmark_total(summary_df, price_cache)
     market_regime_map = _build_market_regime_map(daily_all, summary_df, price_cache)
+    kap_source = getattr(args, "kap_source", "none")
+    kap_events_by_symbol = _load_kap_events(getattr(args, "kap_events_path", None)) if kap_source in ("file", "mcp") or getattr(args, "kap_events_path", None) else {}
+    kap_fetcher = BorsaMcpKapFetcher(getattr(args, "kap_mcp_command")) if kap_source == "mcp" else None
+    try:
+        live_pilot_daily_radar = _build_live_pilot_daily_radar(
+            daily_all,
+            market_regime_map,
+            kap_lookback_days=int(getattr(args, "kap_lookback_days", 7)),
+            events_by_symbol=kap_events_by_symbol,
+            kap_fetcher=kap_fetcher,
+        )
+    finally:
+        if kap_fetcher is not None:
+            kap_fetcher.close()
 
     # Parallel strategy execution setup
     from concurrent.futures import ProcessPoolExecutor
@@ -1706,6 +2214,7 @@ def run_simulation(args: argparse.Namespace) -> dict[str, pd.DataFrame]:
             bool(args.exclude_stale_new_entries),
             bool(args.allow_same_day_reentry),
             float(args.min_position_value),
+            float(args.cost_bps),
             market_regime_map,
         ))
 
@@ -1797,6 +2306,7 @@ def run_simulation(args: argparse.Namespace) -> dict[str, pd.DataFrame]:
         "adaptive_regime_summary": pd.DataFrame(
             [{"date": d, **meta} for d, meta in market_regime_map.items()]
         ),
+        "live_pilot_daily_radar": live_pilot_daily_radar,
     }
 
 
@@ -1832,6 +2342,18 @@ def main() -> None:
     results["filter_missed_opportunity_summary"].to_csv(out_root / "filter_missed_opportunity_summary_2026.csv", index=False)
     results["rolling_portfolio_monthly_returns"].to_csv(out_root / "rolling_portfolio_monthly_returns_2026.csv", index=False)
     results["adaptive_regime_summary"].to_csv(out_root / "adaptive_regime_summary_2026.csv", index=False)
+    live_pilot_dir = Path(args.live_pilot_dir)
+    live_pilot_dir.mkdir(parents=True, exist_ok=True)
+    live_pilot = results.get("live_pilot_daily_radar", pd.DataFrame())
+    live_signal_date = (
+        str(live_pilot["signal_date"].dropna().astype(str).iloc[0])
+        if not live_pilot.empty and "signal_date" in live_pilot.columns and not live_pilot["signal_date"].dropna().empty
+        else "latest"
+    )
+    live_csv = live_pilot_dir / f"daily_radar_final_{live_signal_date}.csv"
+    live_md = live_pilot_dir / f"daily_radar_final_{live_signal_date}.md"
+    live_pilot.to_csv(live_csv, index=False)
+    _write_live_pilot_markdown(live_pilot, live_md)
 
     print("FILTER_DAILY_NEW_SIGNAL_SUMMARY")
     print(results["new_signal_agg"].to_string(index=False))

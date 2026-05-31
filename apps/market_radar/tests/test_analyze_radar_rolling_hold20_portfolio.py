@@ -353,6 +353,104 @@ def test_top30_logic_unchanged() -> None:
     assert out["symbol"].tolist() == [f"S{i:02d}" for i in range(30)]
 
 
+def test_live_pilot_kap_no_news_fallback_sorts_by_quality_score() -> None:
+    m = _load_module()
+    daily_all = pd.DataFrame(
+        [
+            {**_row("2026-01-02", "BBB", production_rank=1, passes_strict=True), "quality_threshold_score": 40.0},
+            {**_row("2026-01-02", "AAA", production_rank=2, passes_strict=True), "quality_threshold_score": 70.0},
+        ]
+    )
+    regime = {"2026-01-02": {"weak_score": 1, "adaptive_selected_mode": "special_strict"}}
+
+    out = m._build_live_pilot_daily_radar(daily_all, regime, as_of_date="2026-01-02", events_by_symbol={})
+
+    assert out["symbol"].tolist() == ["AAA", "BBB"]
+    assert out["kap_summary_short"].tolist() == ["recent_kap_none", "recent_kap_none"]
+    assert out["kap_sentiment_label"].tolist() == ["unknown", "unknown"]
+
+
+def test_live_pilot_kap_multiple_events_are_summarized() -> None:
+    m = _load_module()
+    daily_all = pd.DataFrame([_row("2026-01-08", "AAA", production_rank=1, passes_strict=True)])
+    regime = {"2026-01-08": {"weak_score": 2, "adaptive_selected_mode": "threshold_50"}}
+    events_by_symbol = {
+        "AAA": [
+            {"date": "2026-01-07", "event_type": "Ozel Durum", "title": "Yeni sozlesme imzalandi"},
+            {"date": "2026-01-05", "event_type": "Temettu", "title": "Temettu karari"},
+            {"date": "2025-12-01", "event_type": "Eski", "title": "Eski haber"},
+        ]
+    }
+
+    out = m._build_live_pilot_daily_radar(
+        daily_all,
+        regime,
+        as_of_date="2026-01-08",
+        kap_lookback_days=7,
+        events_by_symbol=events_by_symbol,
+    )
+
+    row = out.iloc[0]
+    assert int(row["kap_event_count_7d"]) == 2
+    assert row["kap_latest_date"] == "2026-01-07"
+    assert "Ozel Durum" in row["kap_event_types"]
+    assert "Temettu" in row["kap_event_types"]
+    assert row["kap_sentiment_label"] == "positive"
+    assert row["manual_review_note"] == "manual_kap_review_required"
+
+
+def test_live_pilot_kap_breaker_events_are_filtered_out() -> None:
+    m = _load_module()
+    daily_all = pd.DataFrame([_row("2026-01-08", "AAA", production_rank=1, passes_strict=True)])
+    regime = {"2026-01-08": {"weak_score": 2, "adaptive_selected_mode": "threshold_50"}}
+    events_by_symbol = {
+        "AAA": [
+            {
+                "date": "2026-01-07",
+                "event_type": "KAP",
+                "title": "BORSA ISTANBUL BISTECH DEVRE KESICI UYGULAMASI",
+                "summary": "Pay bazinda devre kesici bildirimi",
+            }
+        ]
+    }
+
+    out = m._build_live_pilot_daily_radar(
+        daily_all,
+        regime,
+        as_of_date="2026-01-08",
+        kap_lookback_days=7,
+        events_by_symbol=events_by_symbol,
+    )
+
+    row = out.iloc[0]
+    assert int(row["kap_event_count_7d"]) == 0
+    assert row["kap_summary_short"] == "recent_kap_none"
+    assert row["kap_sentiment_label"] == "unknown"
+
+
+def test_live_pilot_kap_layer_does_not_change_actions_or_quality_order() -> None:
+    m = _load_module()
+    daily_all = pd.DataFrame(
+        [
+            {**_row("2026-01-08", "CCC", production_rank=1, passes_strict=True), "quality_threshold_score": 35.0},
+            {**_row("2026-01-08", "AAA", production_rank=2, passes_strict=True), "quality_threshold_score": 65.0},
+        ]
+    )
+    regime = {"2026-01-08": {"weak_score": 3, "adaptive_selected_mode": "threshold_60"}}
+
+    base = m._build_live_pilot_daily_radar(daily_all, regime, as_of_date="2026-01-08", events_by_symbol={})
+    with_kap = m._build_live_pilot_daily_radar(
+        daily_all,
+        regime,
+        as_of_date="2026-01-08",
+        events_by_symbol={"AAA": [{"date": "2026-01-07", "event_type": "Ceza", "title": "Idari para cezasi"}]},
+    )
+
+    assert with_kap["symbol"].tolist() == ["AAA", "CCC"]
+    assert with_kap["action"].tolist() == base["action"].tolist()
+    assert with_kap.loc[with_kap["symbol"] == "AAA", "kap_sentiment_label"].iloc[0] == "caution"
+
+
 def test_tv_filter_and_diagnostics_not_hard_filtered() -> None:
     m = _load_module()
     day_df = pd.DataFrame(

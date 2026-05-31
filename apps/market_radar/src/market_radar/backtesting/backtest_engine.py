@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 import json
 from pathlib import Path
 from typing import Any
@@ -36,6 +36,7 @@ class BacktestResult:
     signals: list[dict[str, Any]]
     failed_symbols: list[dict[str, Any]]
     scan_summary: dict[str, Any]
+    symbol_metrics: dict[str, dict[str, int]] = None
 
 
 def _safe_return(entry: float | None, exit_: float | None) -> float | None:
@@ -90,10 +91,14 @@ def _run_symbol_backtest(
     *,
     benchmark_symbol: str = "XU100",
     cooldown_days: int = 15,
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
     rows: list[dict[str, Any]] = []
+    stats = {
+        "raw_ohlcv_rows": len(history),
+        "indicator_ready_rows": 0,
+    }
     if history.empty or benchmark.empty or len(history) < 50:
-        return rows
+        return rows, stats
 
     hist = history.copy().sort_index()
     bench = benchmark.copy().sort_index()
@@ -105,6 +110,8 @@ def _run_symbol_backtest(
         metrics = _series_metrics_for_date(symbol, hist, bench, i)
         if not metrics:
             continue
+        
+        stats["indicator_ready_rows"] += 1
 
         entry_idx = _next_trading_index(hist, t_date + pd.Timedelta(days=1))
         if entry_idx is None:
@@ -190,7 +197,7 @@ def _run_symbol_backtest(
                     "near_20d_high_pct": metrics.get("near_20d_high_pct"),
                 }
             )
-    return rows
+    return rows, stats
 
 
 def run_backtest(config: BacktestConfig, client: BorsapyMarketDataClient | None = None) -> BacktestResult:
@@ -222,8 +229,9 @@ def run_backtest(config: BacktestConfig, client: BorsapyMarketDataClient | None 
 
     signals: list[dict[str, Any]] = []
     failed: list[dict[str, Any]] = []
+    symbol_metrics: dict[str, dict[str, int]] = {}
 
-    def _worker(sym: str) -> tuple[str, list[dict[str, Any]] | None, str | None]:
+    def _worker(sym: str) -> tuple[str, list[dict[str, Any]] | None, str | None, dict[str, int] | None]:
         try:
             hist = radar_client.load_history(
                 sym,
@@ -234,9 +242,9 @@ def run_backtest(config: BacktestConfig, client: BorsapyMarketDataClient | None 
             )
             if hist is None or hist.empty:
                 if config.cache_only:
-                    return sym, None, "missing cached OHLCV"
-                return sym, None, "empty_history"
-            rows = _run_symbol_backtest(
+                    return sym, None, "missing cached OHLCV", {"raw_ohlcv_rows": 0, "indicator_ready_rows": 0}
+                return sym, None, "empty_history", {"raw_ohlcv_rows": 0, "indicator_ready_rows": 0}
+            rows, stats = _run_symbol_backtest(
                 sym,
                 hist,
                 benchmark,
@@ -244,14 +252,16 @@ def run_backtest(config: BacktestConfig, client: BorsapyMarketDataClient | None 
                 benchmark_symbol=benchmark_symbol,
                 cooldown_days=max(0, int(config.cooldown_days)),
             )
-            return sym, rows, None
+            return sym, rows, None, stats
         except Exception as exc:  # noqa: BLE001
-            return sym, None, str(exc)
+            return sym, None, str(exc), None
 
     with ThreadPoolExecutor(max_workers=max(1, int(config.max_workers))) as ex:
         futures = {ex.submit(_worker, s): s for s in symbols}
         for fut in as_completed(futures):
-            sym, rows, err = fut.result()
+            sym, rows, err, stats = fut.result()
+            if stats:
+                symbol_metrics[sym] = stats
             if err is not None:
                 failed.append({"symbol": sym, "error": err})
                 continue
@@ -269,7 +279,7 @@ def run_backtest(config: BacktestConfig, client: BorsapyMarketDataClient | None 
         "failed_symbol_count": len(failed),
         "elapsed_seconds": round(elapsed, 3),
     }
-    return BacktestResult(signals=signals, failed_symbols=failed, scan_summary=summary)
+    return BacktestResult(signals=signals, failed_symbols=failed, scan_summary=summary, symbol_metrics=symbol_metrics)
 
 
 def write_backtest_outputs(result: BacktestResult, config: BacktestConfig) -> dict[str, str]:
@@ -315,3 +325,4 @@ def write_backtest_outputs(result: BacktestResult, config: BacktestConfig) -> di
         "yearly_summary.csv": str(yearly_path),
         "backtest_config.json": str(config_path),
     }
+UTC = timezone.utc

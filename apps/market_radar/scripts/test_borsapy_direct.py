@@ -1,5 +1,8 @@
+import ssl
+ssl._create_default_https_context = ssl._create_unverified_context
 import datetime
 import borsapy as bp
+
 
 for sym in ["XU100", "THYAO"]:
     ticker = bp.Ticker(sym)

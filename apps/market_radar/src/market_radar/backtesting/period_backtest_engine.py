@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
-from datetime import UTC, date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 import hashlib
 import json
 from pathlib import Path
@@ -1410,3 +1410,4 @@ def write_period_outputs(result: PeriodBacktestResult, config: PeriodBacktestCon
     if result.regime_config_comparison is not None:
         outputs["regime_config_comparison.csv"] = str(comparison_path)
     return outputs
+UTC = timezone.utc

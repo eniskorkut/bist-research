@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import json
 import math
 import sqlite3
@@ -18,6 +18,7 @@ from market_radar.symbols import normalize_bist_symbol
 DB_PATH = "/data/market_radar_cache.sqlite"
 DEFAULT_BIST_UNIVERSE_INDEX = "XUTUM"
 ISTANBUL_TZ = ZoneInfo("Europe/Istanbul")
+UTC = timezone.utc
 
 
 @dataclass

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field, replace
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 import hashlib
 import json
 import time
@@ -1408,3 +1408,4 @@ def scan_symbols(
         )
 
     return scan
+UTC = timezone.utc
